@@ -96,13 +96,26 @@ function buildBrowserContext(): DetectionContext | null {
   };
 }
 
-/** Pure detection logic — exported for testing without a DOM. */
+/**
+ * Pure detection logic — exported for testing without a DOM.
+ *
+ * Returns true if rendering the probe string against ANY of the three
+ * generic fallbacks (serif, sans-serif, monospace) with the target font
+ * listed first produces a different width than the bare generic. We use
+ * "some" rather than "every" because some platform defaults make a
+ * generic family literally identical to a real installed font — for
+ * example on macOS the `monospace` generic resolves to Menlo, so
+ * measure("'Menlo', monospace") === measure("monospace"). Requiring all
+ * three to differ would then falsely report Menlo as missing. A truly
+ * uninstalled font falls through to each generic in turn and matches
+ * all three, so "some" still correctly returns false for those.
+ */
 export function detectInstalledWithContext(
   family: string,
   ctx: DetectionContext,
 ): boolean {
   if (KNOWN_BUNDLED_FAMILIES.has(family)) return true;
-  return FALLBACK_FAMILIES.every((fb) => {
+  return FALLBACK_FAMILIES.some((fb) => {
     const baseWidth = ctx.measureText(`72px ${fb}`, TEST_STRING);
     const targetWidth = ctx.measureText(`72px "${family}", ${fb}`, TEST_STRING);
     return baseWidth !== targetWidth;

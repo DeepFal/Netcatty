@@ -74,6 +74,39 @@ describe('detectInstalledWithContext (canvas fallback)', () => {
     assert.equal(detectInstalledWithContext('JetBrains Mono', ctx), true);
     assert.equal(detectInstalledWithContext('Sarasa Mono SC', ctx), true);
   });
+
+  it('treats a font as installed when it matches one generic but differs from the others', () => {
+    // Regression guard for codex P2 review on PR #940: on macOS the
+    // `monospace` generic resolves to Menlo, so measure(`"Menlo", monospace`)
+    // equals measure(`monospace`). The detector must NOT report Menlo
+    // as uninstalled just because of that single collision — it should
+    // recognize installation via the other two generic baselines.
+    const ctx = {
+      measureText: (font: string): number => {
+        // "Menlo", X → Menlo's metrics (always 100, regardless of fallback)
+        if (font.includes('"Menlo"')) return 100;
+        // Generic baselines
+        if (font === '72px serif') return 50;
+        if (font === '72px sans-serif') return 80;
+        if (font === '72px monospace') return 100; // identical to Menlo
+        // Unknown family followed by a generic → falls to that generic
+        const tail = font.split(',').pop()?.trim() ?? '';
+        if (tail === 'serif') return 50;
+        if (tail === 'sans-serif') return 80;
+        if (tail === 'monospace') return 100;
+        return 0;
+      },
+    };
+    assert.equal(detectInstalledWithContext('Menlo', ctx), true);
+  });
+
+  it('still reports a clearly-uninstalled font as missing even with the looser rule', () => {
+    // "Some" semantics must not introduce false positives for fonts
+    // that genuinely aren't installed — those fall through to each
+    // generic and match all three baselines.
+    const ctx = makeContextWithInstalledFamilies(new Set(['Menlo']));
+    assert.equal(detectInstalledWithContext('Definitely Not Installed', ctx), false);
+  });
 });
 
 describe('isFontInstalled with authoritative system data', () => {
