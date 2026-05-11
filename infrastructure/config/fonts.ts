@@ -53,10 +53,10 @@ const BASE_TERMINAL_FONTS: TerminalFont[] = [
   // variable widths and whose CJK glyphs don't fit a terminal's 2x cell
   // grid. Picking one as the primary font produced visibly bloated
   // spacing for ASCII characters in #931.
-  { id: 'sarasa-mono-sc',   name: 'Sarasa Mono SC',   family: '"Sarasa Mono SC", monospace',   description: 'Iosevka + Source Han Sans 简体，等宽完美对齐', category: 'monospace' },
-  { id: 'sarasa-mono-tc',   name: 'Sarasa Mono TC',   family: '"Sarasa Mono TC", monospace',   description: 'Iosevka + Source Han Sans 繁體', category: 'monospace' },
-  { id: 'maple-mono-cn',    name: 'Maple Mono CN',    family: '"Maple Mono CN", monospace',    description: 'Maple Mono 中英文等宽合一字体', category: 'monospace' },
-  { id: 'lxgw-wenkai-mono', name: 'LXGW WenKai Mono', family: '"LXGW WenKai Mono", monospace', description: '霞鹜文楷等宽，源自 Klee One 教科书楷体', category: 'monospace' },
+  { id: 'sarasa-mono-sc',   name: 'Sarasa Mono SC',   family: '"Sarasa Mono SC", monospace',   description: 'Iosevka + Source Han Sans (Simplified Chinese), 2:1 monospace', category: 'monospace' },
+  { id: 'sarasa-mono-tc',   name: 'Sarasa Mono TC',   family: '"Sarasa Mono TC", monospace',   description: 'Iosevka + Source Han Sans (Traditional Chinese), 2:1 monospace', category: 'monospace' },
+  { id: 'maple-mono-cn',    name: 'Maple Mono CN',    family: '"Maple Mono CN", monospace',    description: 'Maple Mono with unified Latin + Simplified Chinese metrics', category: 'monospace' },
+  { id: 'lxgw-wenkai-mono', name: 'LXGW WenKai Mono', family: '"LXGW WenKai Mono", monospace', description: 'Monospace Kaishu (regular-script) derived from Fontworks Klee One', category: 'monospace' },
 ];
 
 export const TERMINAL_FONTS: TerminalFont[] = BASE_TERMINAL_FONTS;
