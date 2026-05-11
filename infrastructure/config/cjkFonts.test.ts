@@ -21,12 +21,12 @@ describe('composeFontFamilyStack', () => {
   it('inserts user fallback right after primary when provided', () => {
     const stack = composeFontFamilyStack({
       primaryFamily: '"Fira Code", monospace',
-      userFallback: 'PingFang SC',
+      userFallback: 'Sarasa Mono SC',
       latinFontId: 'fira-code',
       platform: 'darwin',
     });
     const firaIdx = stack.indexOf('Fira Code');
-    const userIdx = stack.indexOf('PingFang SC');
+    const userIdx = stack.indexOf('Sarasa Mono SC');
     assert.ok(firaIdx >= 0 && userIdx > firaIdx, 'user fallback after primary');
   });
 
@@ -37,7 +37,8 @@ describe('composeFontFamilyStack', () => {
       latinFontId: 'cascadia-code',
       platform: 'win32',
     });
-    assert.match(stack, /Microsoft YaHei UI/);
+    // Cascadia Code now recommends Sarasa Mono SC (true monospace).
+    assert.match(stack, /Sarasa Mono SC/);
   });
 
   it('falls back to OS default when Latin font has no recommendation', () => {
@@ -47,27 +48,30 @@ describe('composeFontFamilyStack', () => {
       latinFontId: 'unknown',
       platform: 'darwin',
     });
-    assert.match(stack, /PingFang SC/);
+    // macOS no-recommendation default is now Sarasa Mono SC (bundled).
+    assert.match(stack, /Sarasa Mono SC/);
   });
 
   it('quotes multi-word user fallback names', () => {
     const stack = composeFontFamilyStack({
       primaryFamily: 'Menlo, monospace',
-      userFallback: 'Source Han Sans CN',
+      userFallback: 'Source Han Mono SC',
       latinFontId: 'menlo',
       platform: 'linux',
     });
-    assert.match(stack, /"Source Han Sans CN"/);
+    assert.match(stack, /"Source Han Mono SC"/);
   });
 
   it('does not duplicate identical fallback entries', () => {
+    // User explicitly picks the same font the per-font pairing would,
+    // and that font also lives in the system stack — should appear once.
     const stack = composeFontFamilyStack({
       primaryFamily: '"Cascadia Code", monospace',
-      userFallback: 'Microsoft YaHei UI',
+      userFallback: 'Sarasa Mono SC',
       latinFontId: 'cascadia-code',
       platform: 'win32',
     });
-    const matches = stack.match(/Microsoft YaHei UI/g) || [];
+    const matches = stack.match(/Sarasa Mono SC/g) || [];
     assert.equal(matches.length, 1);
   });
 
@@ -84,15 +88,14 @@ describe('composeFontFamilyStack', () => {
   it('explicit user fallback overrides the per-font recommendation', () => {
     const stack = composeFontFamilyStack({
       primaryFamily: '"JetBrains Mono", monospace',
-      userFallback: 'PingFang SC',
+      userFallback: 'LXGW WenKai Mono',
       latinFontId: 'jetbrains-mono',
       platform: 'darwin',
     });
-    // user choice (PingFang SC) should come before the recommendation
-    // (Sarasa Mono SC); since recommendation is suppressed when user
-    // fallback is set, Sarasa should still be present only in the system
-    // fallback stack, AFTER PingFang.
-    const userIdx = stack.indexOf('PingFang SC');
+    // User chose LXGW WenKai Mono; the JetBrains Mono recommendation
+    // (Sarasa Mono SC) should be suppressed, so Sarasa only shows up
+    // later in the system fallback stack, AFTER the user choice.
+    const userIdx = stack.indexOf('LXGW WenKai Mono');
     const sarasaIdx = stack.indexOf('Sarasa Mono SC');
     assert.ok(userIdx >= 0);
     assert.ok(sarasaIdx > userIdx, 'system Sarasa appears after explicit user choice');
@@ -100,14 +103,21 @@ describe('composeFontFamilyStack', () => {
 });
 
 describe('getDefaultCjkFallback', () => {
-  it('returns Microsoft YaHei UI on Windows', () => {
-    assert.equal(getDefaultCjkFallback('win32'), 'Microsoft YaHei UI');
+  it('returns SimSun on Windows (always installed, monospace)', () => {
+    assert.equal(getDefaultCjkFallback('win32'), 'SimSun');
   });
-  it('returns PingFang SC on macOS', () => {
-    assert.equal(getDefaultCjkFallback('darwin'), 'PingFang SC');
+  it('returns Sarasa Mono SC on macOS (bundled by app)', () => {
+    assert.equal(getDefaultCjkFallback('darwin'), 'Sarasa Mono SC');
   });
   it('returns Noto Sans Mono CJK SC on Linux', () => {
     assert.equal(getDefaultCjkFallback('linux'), 'Noto Sans Mono CJK SC');
+  });
+  it('never returns a known proportional font', () => {
+    const proportional = ['PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Hiragino Sans GB'];
+    for (const platform of ['darwin', 'win32', 'linux'] as const) {
+      const v = getDefaultCjkFallback(platform);
+      assert.ok(!proportional.includes(v), `${platform} default ${v} must not be proportional`);
+    }
   });
 });
 
@@ -122,9 +132,15 @@ describe('getRecommendedCjkFor', () => {
 });
 
 describe('CJK_SYSTEM_FALLBACK_STACK', () => {
-  it('contains common Windows + macOS + Linux CJK fonts', () => {
-    assert.match(CJK_SYSTEM_FALLBACK_STACK, /PingFang SC/);
-    assert.match(CJK_SYSTEM_FALLBACK_STACK, /Microsoft YaHei/);
+  it('contains true-monospace CJK fonts only', () => {
+    assert.match(CJK_SYSTEM_FALLBACK_STACK, /Sarasa Mono SC/);
     assert.match(CJK_SYSTEM_FALLBACK_STACK, /Noto Sans Mono CJK SC/);
+    assert.match(CJK_SYSTEM_FALLBACK_STACK, /SimSun/);
+  });
+
+  it('does not include known proportional CJK fonts', () => {
+    assert.doesNotMatch(CJK_SYSTEM_FALLBACK_STACK, /PingFang SC/);
+    assert.doesNotMatch(CJK_SYSTEM_FALLBACK_STACK, /Microsoft YaHei UI/);
+    assert.doesNotMatch(CJK_SYSTEM_FALLBACK_STACK, /Hiragino Sans GB/);
   });
 });

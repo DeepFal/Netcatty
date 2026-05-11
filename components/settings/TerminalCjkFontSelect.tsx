@@ -11,6 +11,10 @@ interface CjkFontOption {
   label: string;
 }
 
+// Only true monospace CJK fonts. Proportional CJK fonts (PingFang SC,
+// Microsoft YaHei UI, Hiragino Sans GB) render at non-2x widths and
+// break terminal grid alignment — they are deliberately excluded here
+// even though they are the OS defaults.
 const OPTIONS: CjkFontOption[] = [
   { value: '',                       label: 'Auto · 按主字体智能搭配' },
   { value: 'Sarasa Mono SC',         label: 'Sarasa Mono SC （更纱黑体 简）' },
@@ -19,9 +23,6 @@ const OPTIONS: CjkFontOption[] = [
   { value: 'Source Han Mono SC',     label: 'Source Han Mono SC （思源等宽）' },
   { value: 'Noto Sans Mono CJK SC',  label: 'Noto Sans Mono CJK SC' },
   { value: 'LXGW WenKai Mono',       label: 'LXGW WenKai Mono （霞鹜文楷等宽）' },
-  { value: 'PingFang SC',            label: 'PingFang SC （苹方）' },
-  { value: 'Hiragino Sans GB',       label: 'Hiragino Sans GB （冬青黑体）' },
-  { value: 'Microsoft YaHei UI',     label: 'Microsoft YaHei UI （微软雅黑）' },
   { value: 'SimSun',                 label: 'SimSun （宋体）' },
 ];
 
@@ -45,16 +46,21 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
   // "Auto" is always present; concrete fonts only appear when installed;
   // the currently-selected value (if any) is also always shown so users
   // can see and clear their setting even on a machine without the font.
-  const visibleOptions = useMemo(
-    () =>
-      OPTIONS.filter(
-        (opt) =>
-          opt.value === '' ||
-          opt.value === value ||
-          isFontInstalled(opt.value),
-      ),
-    [value],
-  );
+  // Legacy selections (e.g. "PingFang SC" saved before we dropped
+  // proportional fonts) are appended as a synthetic option with a
+  // "not recommended" label so the user can see them and re-pick.
+  const visibleOptions = useMemo(() => {
+    const filtered = OPTIONS.filter(
+      (opt) =>
+        opt.value === '' ||
+        opt.value === value ||
+        isFontInstalled(opt.value),
+    );
+    if (value && !OPTIONS.some((o) => o.value === value)) {
+      filtered.push({ value, label: `${value} · 不推荐（非等宽字体）` });
+    }
+    return filtered;
+  }, [value]);
 
   return (
     <SelectPrimitive.Root

@@ -1,13 +1,17 @@
 export type SupportedPlatform = 'darwin' | 'win32' | 'linux' | (string & {});
 
+// True monospace CJK fonts only. Proportional fonts (PingFang SC,
+// Microsoft YaHei UI, Hiragino Sans GB) render at non-2x widths in a
+// terminal grid — including them here visibly broke alignment for users
+// whose primary font lacked CJK glyphs. They are intentionally absent.
 const CJK_SYSTEM_FALLBACK_FONTS = [
   '"Sarasa Mono SC"',
+  '"Sarasa Mono TC"',
+  '"Maple Mono CN"',
+  '"LXGW WenKai Mono"',
   '"Noto Sans Mono CJK SC"',
   '"Source Han Mono SC"',
-  '"PingFang SC"',
-  '"Hiragino Sans GB"',
-  '"Microsoft YaHei UI"',
-  '"Microsoft YaHei"',
+  '"NSimSun"',
   '"SimSun"',
 ];
 
@@ -18,27 +22,36 @@ const NERD_FONT_FALLBACK_FONTS = [
   '"Symbols Nerd Font"',
 ];
 
+// Per-OS default CJK font when user hasn't explicitly set fallbackFont
+// AND the current Latin font has no recommended pairing.
+// All choices are TRUE monospace fonts that keep the terminal grid
+// aligned. macOS has no system-installed monospace CJK font, so we
+// reference Sarasa Mono SC which netcatty bundles as a webfont.
 export function getDefaultCjkFallback(platform: SupportedPlatform): string {
-  if (platform === 'win32') return 'Microsoft YaHei UI';
-  if (platform === 'darwin') return 'PingFang SC';
+  if (platform === 'win32') return 'SimSun';
+  if (platform === 'darwin') return 'Sarasa Mono SC';
   return 'Noto Sans Mono CJK SC';
 }
 
+// Every entry must point at a TRUE monospace CJK font. Sarasa Mono SC
+// is the safest universal choice because netcatty bundles it via
+// @font-face, so it works even on machines without other CJK monospace
+// fonts installed.
 const PER_FONT_CJK_PAIRING: Record<string, string> = {
   'fira-code':       'Sarasa Mono SC',
   'fira-mono':       'Sarasa Mono SC',
   'jetbrains-mono':  'Sarasa Mono SC',
-  'cascadia-code':   'Microsoft YaHei UI',
-  'cascadia-mono':   'Microsoft YaHei UI',
+  'cascadia-code':   'Sarasa Mono SC',
+  'cascadia-mono':   'Sarasa Mono SC',
   'source-code-pro': 'Source Han Mono SC',
-  'ibm-plex-mono':   'IBM Plex Sans JP',
+  'ibm-plex-mono':   'Sarasa Mono SC',
   'iosevka':         'Sarasa Mono SC',
   'ioskeley-mono':   'Sarasa Mono SC',
   'mononoki':        'Sarasa Mono SC',
-  'menlo':           'PingFang SC',
-  'monaco':          'PingFang SC',
-  'consolas':        'Microsoft YaHei UI',
-  'courier-new':     'Microsoft YaHei',
+  'menlo':           'Sarasa Mono SC',
+  'monaco':          'Sarasa Mono SC',
+  'consolas':        'Sarasa Mono SC',
+  'courier-new':     'Sarasa Mono SC',
   'dejavu-sans-mono':'Noto Sans Mono CJK SC',
   'liberation-mono': 'Noto Sans Mono CJK SC',
   'inconsolata':     'Noto Sans Mono CJK SC',
