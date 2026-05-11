@@ -19,6 +19,8 @@
  *      generic fallbacks (serif, sans-serif, monospace).
  */
 
+import { splitFontFamilyList } from '../infrastructure/config/cjkFonts';
+
 const KNOWN_BUNDLED_FAMILIES = new Set<string>([
   'JetBrains Mono',     // @fontsource/jetbrains-mono (regular, 500, 600)
   'Sarasa Mono SC',     // public/fonts/SarasaMonoSC-Regular.woff2 (OFL)
@@ -28,9 +30,13 @@ let systemFamilies: Set<string> | null = null;
 let availabilityVersion = 0;
 const listeners = new Set<() => void>();
 
-/** "Fira Code", monospace → Fira Code   |  Menlo, monospace → Menlo */
+/**
+ * "Fira Code", monospace → Fira Code   |   Menlo, monospace → Menlo.
+ * Quote-aware so a single family name containing commas (CSS permits
+ * `"Foo, Inc. Mono"`) survives intact instead of being truncated.
+ */
 export function extractPrimaryFamily(familyCssString: string): string {
-  const first = familyCssString.split(',')[0]?.trim() ?? '';
+  const first = splitFontFamilyList(familyCssString)[0] ?? '';
   return first.replace(/^["']|["']$/g, '');
 }
 

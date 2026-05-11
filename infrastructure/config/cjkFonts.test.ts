@@ -4,6 +4,7 @@ import {
   composeFontFamilyStack,
   getDefaultCjkFallback,
   getRecommendedCjkFor,
+  splitFontFamilyList,
   CJK_SYSTEM_FALLBACK_STACK,
 } from './cjkFonts';
 
@@ -110,6 +111,27 @@ describe('composeFontFamilyStack', () => {
     assert.ok(jbIdx < simSunIdx, 'JetBrains Mono before SimSun system fallback');
   });
 
+  it('preserves a quoted primary family name that contains a comma', () => {
+    // Regression guard for codex P2 review on PR #940: when the primary
+    // family is something like `"Foo, Inc. Mono"`, the composed stack
+    // must keep that token intact rather than splitting on the internal
+    // comma and emitting fragmented pieces.
+    const stack = composeFontFamilyStack({
+      primaryFamily: '"Foo, Inc. Mono", monospace',
+      userFallback: '',
+      latinFontId: 'foo-inc-mono',
+      platform: 'darwin',
+    });
+    assert.ok(
+      stack.includes('"Foo, Inc. Mono"'),
+      'quoted family with comma stays a single token',
+    );
+    assert.ok(
+      !stack.includes('"Foo,') || stack.includes('"Foo, Inc. Mono"'),
+      'must not produce a dangling `"Foo,` fragment',
+    );
+  });
+
   it('user-chosen CJK fallback precedes generic monospace', () => {
     // Regression guard for codex P1 review on PR #940 (second round):
     // generic `monospace` on macOS Chrome resolves Chinese glyphs to
@@ -173,6 +195,42 @@ describe('getRecommendedCjkFor', () => {
   it('returns a non-empty string for known fonts', () => {
     const v = getRecommendedCjkFor('jetbrains-mono', 'darwin');
     assert.ok(v && v.length > 0);
+  });
+});
+
+describe('splitFontFamilyList', () => {
+  it('splits a simple comma-separated list', () => {
+    assert.deepEqual(
+      splitFontFamilyList('Menlo, monospace'),
+      ['Menlo', 'monospace'],
+    );
+  });
+
+  it('keeps quoted family names with commas intact', () => {
+    // Regression guard for codex P2 review on PR #940: a font family
+    // name like `"Foo, Inc. Mono"` is a single token in CSS, not two.
+    assert.deepEqual(
+      splitFontFamilyList('"Foo, Inc. Mono", monospace'),
+      ['"Foo, Inc. Mono"', 'monospace'],
+    );
+  });
+
+  it('handles a single unquoted name', () => {
+    assert.deepEqual(splitFontFamilyList('Iosevka'), ['Iosevka']);
+  });
+
+  it('handles single quotes too', () => {
+    assert.deepEqual(
+      splitFontFamilyList("'Foo, Inc.', serif"),
+      ["'Foo, Inc.'", 'serif'],
+    );
+  });
+
+  it('drops empty segments produced by double commas', () => {
+    assert.deepEqual(
+      splitFontFamilyList('Menlo,, monospace'),
+      ['Menlo', 'monospace'],
+    );
   });
 });
 

@@ -71,6 +71,43 @@ export function getRecommendedCjkFor(
   return PER_FONT_CJK_PAIRING[latinFontId] ?? null;
 }
 
+/**
+ * Split a CSS font-family list on commas that are OUTSIDE quoted family
+ * names. CSS permits commas inside quoted family names (e.g.
+ * `"Foo, Inc. Mono"`); a naive `string.split(',')` would tokenize that
+ * into broken pieces like `"Foo` and `Inc. Mono"`. Exported so other
+ * font-parsing call sites (extractPrimaryFamily, etc.) share the same
+ * rules.
+ */
+export function splitFontFamilyList(css: string): string[] {
+  const tokens: string[] = [];
+  let buf = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < css.length; i++) {
+    const c = css[i];
+    if (quote) {
+      buf += c;
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      buf += c;
+      quote = c;
+      continue;
+    }
+    if (c === ',') {
+      const trimmed = buf.trim();
+      if (trimmed) tokens.push(trimmed);
+      buf = '';
+      continue;
+    }
+    buf += c;
+  }
+  const tail = buf.trim();
+  if (tail) tokens.push(tail);
+  return tokens;
+}
+
 function quoteIfNeeded(family: string): string {
   const trimmed = family.trim();
   if (!trimmed) return '';
@@ -108,7 +145,9 @@ export function composeFontFamilyStack(args: ComposeArgs): string {
     pieces.push(item);
   };
 
-  for (const p of primaryFamily.split(',').map((s) => s.trim()).filter(Boolean)) {
+  // Quote-aware split so a family name like `"Foo, Inc. Mono"` keeps
+  // its comma intact instead of being shredded into `"Foo` / `Inc. Mono"`.
+  for (const p of splitFontFamilyList(primaryFamily)) {
     if (p.toLowerCase() === 'monospace') continue;
     push(p);
   }
