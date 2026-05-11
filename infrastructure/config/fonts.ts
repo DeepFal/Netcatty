@@ -48,15 +48,16 @@ const BASE_TERMINAL_FONTS: TerminalFont[] = [
   { id: 'overpass-mono',    name: 'Overpass Mono',    family: '"Overpass Mono", monospace',      description: 'Open source monospace with good coverage', category: 'monospace' },
   { id: 'comic-sans-ms',    name: 'Comic Sans MS',    family: '"Comic Sans MS", monospace',      description: 'Casual, non-traditional terminal font', category: 'monospace' },
 
-  // CJK-coverage monospace fonts. If the user has these installed, picking
-  // one as primary yields unified Latin+CJK rendering. If not installed,
-  // CSS font fallback skips them transparently.
-  { id: 'sarasa-mono-sc',   name: 'Sarasa Mono SC',     family: '"Sarasa Mono SC", monospace',     description: 'Iosevka + Source Han Sans 简体，等宽完美对齐', category: 'monospace' },
-  { id: 'sarasa-mono-tc',   name: 'Sarasa Mono TC',     family: '"Sarasa Mono TC", monospace',     description: 'Iosevka + Source Han Sans 繁體', category: 'monospace' },
-  { id: 'maple-mono-cn',    name: 'Maple Mono CN',      family: '"Maple Mono CN", monospace',      description: 'Maple Mono 中英文等宽合一字体', category: 'monospace' },
-  { id: 'lxgw-wenkai-mono', name: 'LXGW WenKai Mono',   family: '"LXGW WenKai Mono", monospace',   description: '霞鹜文楷等宽，源自 Klee One 教科书楷体', category: 'monospace' },
-  { id: 'microsoft-yahei',  name: 'Microsoft YaHei UI', family: '"Microsoft YaHei UI", monospace', description: 'Windows 系统中文等宽字体', category: 'monospace' },
-  { id: 'pingfang-sc',      name: 'PingFang SC',        family: '"PingFang SC", monospace',        description: 'macOS 系统中文字体', category: 'monospace' },
+  // True monospace CJK-coverage fonts only. PingFang SC and Microsoft
+  // YaHei UI (the OS system fonts) are deliberately omitted — they are
+  // proportional sans-serif designs whose Latin glyphs render with
+  // variable widths and whose CJK glyphs don't fit a terminal's 2x cell
+  // grid. Picking one as the primary font produced visibly bloated
+  // spacing for ASCII characters in #931.
+  { id: 'sarasa-mono-sc',   name: 'Sarasa Mono SC',   family: '"Sarasa Mono SC", monospace',   description: 'Iosevka + Source Han Sans 简体，等宽完美对齐', category: 'monospace' },
+  { id: 'sarasa-mono-tc',   name: 'Sarasa Mono TC',   family: '"Sarasa Mono TC", monospace',   description: 'Iosevka + Source Han Sans 繁體', category: 'monospace' },
+  { id: 'maple-mono-cn',    name: 'Maple Mono CN',    family: '"Maple Mono CN", monospace',    description: 'Maple Mono 中英文等宽合一字体', category: 'monospace' },
+  { id: 'lxgw-wenkai-mono', name: 'LXGW WenKai Mono', family: '"LXGW WenKai Mono", monospace', description: '霞鹜文楷等宽，源自 Klee One 教科书楷体', category: 'monospace' },
 ];
 
 export const TERMINAL_FONTS: TerminalFont[] = BASE_TERMINAL_FONTS;
@@ -64,6 +65,19 @@ export const TERMINAL_FONTS: TerminalFont[] = BASE_TERMINAL_FONTS;
 export const DEFAULT_FONT_SIZE = 14;
 export const MIN_FONT_SIZE = 10;
 export const MAX_FONT_SIZE = 32;
+
+// Font ids that earlier versions of netcatty exposed in the primary font
+// dropdown but that are proportional (non-monospace) and produce broken
+// cell-grid alignment when used as a terminal font. Reads should migrate
+// these to a sane default.
+const DEPRECATED_PRIMARY_FONT_IDS = new Set<string>([
+  'pingfang-sc',
+  'microsoft-yahei',
+]);
+
+export function isDeprecatedPrimaryFontId(fontId: string | null | undefined): boolean {
+  return !!fontId && DEPRECATED_PRIMARY_FONT_IDS.has(fontId);
+}
 
 export function getRawFontFamily(fontId: string): string {
   return (TERMINAL_FONTS.find((f) => f.id === fontId) || TERMINAL_FONTS[0]).family;

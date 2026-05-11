@@ -51,7 +51,7 @@ import {
 } from '../../domain/customKeyBindings';
 import { applyCustomAccentToTerminalTheme, getTerminalThemeForUiTheme } from '../../domain/terminalAppearance';
 import { customThemeStore, useCustomThemes } from '../state/customThemeStore';
-import { DEFAULT_FONT_SIZE } from '../../infrastructure/config/fonts';
+import { DEFAULT_FONT_SIZE, isDeprecatedPrimaryFontId } from '../../infrastructure/config/fonts';
 import { DARK_UI_THEMES, LIGHT_UI_THEMES, UiThemeTokens, getUiThemeById } from '../../infrastructure/config/uiThemes';
 import { UI_FONTS, DEFAULT_UI_FONT_ID } from '../../infrastructure/config/uiFonts';
 import { uiFontStore, useUIFontsLoaded } from './uiFontStore';
@@ -232,7 +232,19 @@ export const useSettingsState = () => {
     const isUpgrade = !!localStorageAdapter.readString(STORAGE_KEY_TERM_THEME);
     return !isUpgrade;
   });
-  const [terminalFontFamilyId, setTerminalFontFamilyId] = useState<string>(() => localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_FAMILY) || DEFAULT_FONT_FAMILY);
+  const [terminalFontFamilyId, setTerminalFontFamilyId] = useState<string>(() => {
+    // Migrate legacy proportional CJK font ids (pingfang-sc /
+    // microsoft-yahei) that earlier versions exposed in the primary
+    // dropdown — they produce broken cell-grid alignment as a terminal
+    // font. Rewrite the bad value to the safe default so subsequent
+    // loads, host overrides, and cloud-sync uploads stop carrying it.
+    const stored = localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_FAMILY);
+    if (isDeprecatedPrimaryFontId(stored)) {
+      localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, DEFAULT_FONT_FAMILY);
+      return DEFAULT_FONT_FAMILY;
+    }
+    return stored || DEFAULT_FONT_FAMILY;
+  });
   const [terminalFontSize, setTerminalFontSize] = useState<number>(() => localStorageAdapter.readNumber(STORAGE_KEY_TERM_FONT_SIZE) || DEFAULT_FONT_SIZE);
   const [uiLanguage, setUiLanguage] = useState<UILanguage>(() => {
     const stored = readStoredString(STORAGE_KEY_UI_LANGUAGE);
