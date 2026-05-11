@@ -71,6 +71,28 @@ const DEFAULT_ACCENT_MODE: 'theme' | 'custom' = 'theme';
 const DEFAULT_CUSTOM_ACCENT = '221.2 83.2% 53.3%';
 const DEFAULT_TERMINAL_THEME = 'netcatty-dark';
 const DEFAULT_FONT_FAMILY = 'menlo';
+
+/**
+ * Migrate any terminal font id arriving from storage / IPC / sync to a
+ * safe value. If `raw` is a deprecated proportional id (pingfang-sc,
+ * microsoft-yahei, comic-sans-ms), persist the rewrite back to
+ * localStorage so subsequent ingest paths and cloud-sync uploads stop
+ * carrying it. Used by every place that reads STORAGE_KEY_TERM_FONT_FAMILY
+ * — initial useState init, rehydrateAllFromStorage, IPC notifySettings
+ * change listener, and cross-window storage event listener — so a
+ * single point of truth keeps deprecated ids from re-entering state.
+ *
+ * Returns null when there's nothing to apply (raw is empty); callers
+ * fall back to DEFAULT_FONT_FAMILY in that case.
+ */
+function migrateIncomingTerminalFontId(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  if (isDeprecatedPrimaryFontId(raw)) {
+    localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, DEFAULT_FONT_FAMILY);
+    return DEFAULT_FONT_FAMILY;
+  }
+  return raw;
+}
 // Auto-detect default hotkey scheme based on platform
 const DEFAULT_HOTKEY_SCHEME: HotkeyScheme =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/i.test(navigator.platform)
@@ -233,17 +255,8 @@ export const useSettingsState = () => {
     return !isUpgrade;
   });
   const [terminalFontFamilyId, setTerminalFontFamilyId] = useState<string>(() => {
-    // Migrate legacy proportional CJK font ids (pingfang-sc /
-    // microsoft-yahei) that earlier versions exposed in the primary
-    // dropdown — they produce broken cell-grid alignment as a terminal
-    // font. Rewrite the bad value to the safe default so subsequent
-    // loads, host overrides, and cloud-sync uploads stop carrying it.
     const stored = localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_FAMILY);
-    if (isDeprecatedPrimaryFontId(stored)) {
-      localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, DEFAULT_FONT_FAMILY);
-      return DEFAULT_FONT_FAMILY;
-    }
-    return stored || DEFAULT_FONT_FAMILY;
+    return migrateIncomingTerminalFontId(stored) ?? DEFAULT_FONT_FAMILY;
   });
   const [terminalFontSize, setTerminalFontSize] = useState<number>(() => localStorageAdapter.readNumber(STORAGE_KEY_TERM_FONT_SIZE) || DEFAULT_FONT_SIZE);
   const [uiLanguage, setUiLanguage] = useState<UILanguage>(() => {
@@ -524,7 +537,8 @@ export const useSettingsState = () => {
     const storedTermTheme = readStoredString(STORAGE_KEY_TERM_THEME);
     if (storedTermTheme) setTerminalThemeId(storedTermTheme);
     const storedTermFont = readStoredString(STORAGE_KEY_TERM_FONT_FAMILY);
-    if (storedTermFont) setTerminalFontFamilyId(storedTermFont);
+    const migratedTermFont = migrateIncomingTerminalFontId(storedTermFont);
+    if (migratedTermFont) setTerminalFontFamilyId(migratedTermFont);
     const storedTermSize = localStorageAdapter.readNumber(STORAGE_KEY_TERM_FONT_SIZE);
     if (storedTermSize != null) setTerminalFontSize(storedTermSize);
     const storedTermSettings = readStoredString(STORAGE_KEY_TERM_SETTINGS);
@@ -660,7 +674,8 @@ export const useSettingsState = () => {
         setFollowAppTerminalThemeState((prev) => (prev === next ? prev : next));
       }
       if (key === STORAGE_KEY_TERM_FONT_FAMILY && typeof value === 'string') {
-        setTerminalFontFamilyId(value);
+        const migrated = migrateIncomingTerminalFontId(value);
+        if (migrated) setTerminalFontFamilyId(migrated);
       }
       if (key === STORAGE_KEY_TERM_FONT_SIZE && typeof value === 'number') {
         setTerminalFontSize(value);
@@ -856,8 +871,9 @@ export const useSettingsState = () => {
       }
       // Sync terminal font family from other windows
       if (e.key === STORAGE_KEY_TERM_FONT_FAMILY && e.newValue) {
-        if (e.newValue !== s.terminalFontFamilyId) {
-          setTerminalFontFamilyId(e.newValue);
+        const migrated = migrateIncomingTerminalFontId(e.newValue);
+        if (migrated && migrated !== s.terminalFontFamilyId) {
+          setTerminalFontFamilyId(migrated);
         }
       }
       // Sync terminal font size from other windows
