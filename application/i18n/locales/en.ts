@@ -273,6 +273,8 @@ const en: Messages = {
   'settings.terminal.section.keywordHighlight': 'Keyword highlighting',
   'settings.terminal.font.family': 'Font',
   'settings.terminal.font.family.desc': 'Terminal font family',
+  'settings.terminal.font.cjk': 'CJK font',
+  'settings.terminal.font.cjk.desc': 'Font used for Chinese / Japanese / Korean characters; "Auto" picks one based on the primary font',
   'settings.terminal.font.size': 'Font size',
   'settings.terminal.font.size.desc': 'Terminal text size',
   'settings.terminal.font.weight': 'Font weight',

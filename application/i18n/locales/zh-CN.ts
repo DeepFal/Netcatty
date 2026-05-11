@@ -1402,6 +1402,8 @@ const zhCN: Messages = {
   'settings.terminal.section.keywordHighlight': '关键字高亮',
   'settings.terminal.font.family': '字体',
   'settings.terminal.font.family.desc': '终端字体',
+  'settings.terminal.font.cjk': '中文 / CJK 字体',
+  'settings.terminal.font.cjk.desc': '用于渲染中 / 日 / 韩字符的字体；"Auto" 会按主字体智能搭配',
   'settings.terminal.font.size': '字体大小',
   'settings.terminal.font.size.desc': '终端文字大小',
   'settings.terminal.font.weight': '字重',
