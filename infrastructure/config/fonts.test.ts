@@ -8,10 +8,9 @@ import { TERMINAL_FONTS } from './fonts';
  * xterm.js samples cell width from a single probe glyph, and a font with
  * variable-width Latin glyphs renders other characters with inconsistent
  * widths around (or beyond) that cell.
- *
- * This list mirrors the proportional-font ban list in cjkFonts.ts.
  */
-const KNOWN_PROPORTIONAL_CJK_FONTS = [
+const KNOWN_PROPORTIONAL_FONTS = [
+  // CJK system fonts — proportional sans-serif designed for body text.
   'PingFang SC',
   'PingFang TC',
   'PingFang HK',
@@ -21,11 +20,24 @@ const KNOWN_PROPORTIONAL_CJK_FONTS = [
   'Hiragino Sans',
   'Heiti SC',
   'Heiti TC',
+  // Latin proportional fonts that get mistakenly listed as "terminal
+  // fonts". Comic Sans MS was historically in this dropdown labeled
+  // "non-traditional terminal font" — picking it produced bloated cell
+  // widths because Comic Sans is a handwriting-style proportional face.
+  'Comic Sans MS',
+  'Arial',
+  'Helvetica',
+  'Times New Roman',
+  'Times',
+  'Georgia',
+  'Verdana',
+  'Trebuchet MS',
+  'Tahoma',
 ];
 
 describe('TERMINAL_FONTS dropdown contents', () => {
-  it('does not list any known proportional CJK font as a primary choice', () => {
-    for (const banned of KNOWN_PROPORTIONAL_CJK_FONTS) {
+  it('does not list any known proportional font as a primary choice', () => {
+    for (const banned of KNOWN_PROPORTIONAL_FONTS) {
       const matches = TERMINAL_FONTS.filter((f) =>
         f.name === banned ||
         f.family.includes(`"${banned}"`) ||

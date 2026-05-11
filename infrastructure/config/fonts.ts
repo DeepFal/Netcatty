@@ -46,7 +46,6 @@ const BASE_TERMINAL_FONTS: TerminalFont[] = [
   { id: 'mononoki',         name: 'Mononoki',         family: 'Mononoki, monospace',             description: 'Crisp and clear monospace with ligatures', category: 'monospace' },
   { id: 'go-mono',          name: 'Go Mono',          family: '"Go Mono", monospace',            description: "Google Go's monospace font", category: 'monospace' },
   { id: 'overpass-mono',    name: 'Overpass Mono',    family: '"Overpass Mono", monospace',      description: 'Open source monospace with good coverage', category: 'monospace' },
-  { id: 'comic-sans-ms',    name: 'Comic Sans MS',    family: '"Comic Sans MS", monospace',      description: 'Casual, non-traditional terminal font', category: 'monospace' },
 
   // True monospace CJK-coverage fonts only. PingFang SC and Microsoft
   // YaHei UI (the OS system fonts) are deliberately omitted — they are
@@ -73,6 +72,7 @@ export const MAX_FONT_SIZE = 32;
 const DEPRECATED_PRIMARY_FONT_IDS = new Set<string>([
   'pingfang-sc',
   'microsoft-yahei',
+  'comic-sans-ms',
 ]);
 
 export function isDeprecatedPrimaryFontId(fontId: string | null | undefined): boolean {
