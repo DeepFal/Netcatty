@@ -95,23 +95,41 @@ function isMonospaceFont(familyName: string): boolean {
 // fontAvailability.ts read.
 let allSystemFamiliesCache: Set<string> | null = null;
 
-async function queryAllSystemFontsOnce(): Promise<LocalFontData[]> {
-    if (typeof window === "undefined" || !("queryLocalFonts" in window)) {
-        return [];
-    }
-    try {
-        const queryLocalFonts = (window as unknown as {
-            queryLocalFonts: () => Promise<LocalFontData[]>;
-        }).queryLocalFonts;
-        const fonts = await queryLocalFonts();
-        allSystemFamiliesCache = new Set(
-            fonts.map((f) => f.family.toLowerCase()),
-        );
-        return fonts;
-    } catch (error) {
-        console.warn('Failed to query local fonts:', error);
-        return [];
-    }
+// In-flight promise dedup: when fontStore.initialize() runs
+// getMonospaceFonts() and getAllSystemFontFamilies() in parallel, both
+// would otherwise hit queryLocalFonts() before the cache is populated,
+// causing two redundant Local Font Access API calls and potential
+// permission-handling races. Caching the promise itself means
+// concurrent callers await the same single invocation.
+let queryPromise: Promise<LocalFontData[]> | null = null;
+
+/** Test-only: clears in-flight promise and cached set so each test gets a fresh module state. */
+export function __resetLocalFontsCacheForTesting(): void {
+    queryPromise = null;
+    allSystemFamiliesCache = null;
+}
+
+function queryAllSystemFontsOnce(): Promise<LocalFontData[]> {
+    if (queryPromise) return queryPromise;
+    queryPromise = (async () => {
+        if (typeof window === "undefined" || !("queryLocalFonts" in window)) {
+            return [];
+        }
+        try {
+            const queryLocalFonts = (window as unknown as {
+                queryLocalFonts: () => Promise<LocalFontData[]>;
+            }).queryLocalFonts;
+            const fonts = await queryLocalFonts();
+            allSystemFamiliesCache = new Set(
+                fonts.map((f) => f.family.toLowerCase()),
+            );
+            return fonts;
+        } catch (error) {
+            console.warn('Failed to query local fonts:', error);
+            return [];
+        }
+    })();
+    return queryPromise;
 }
 
 /**
