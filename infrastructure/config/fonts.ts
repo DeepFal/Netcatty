@@ -79,6 +79,28 @@ export function isDeprecatedPrimaryFontId(fontId: string | null | undefined): bo
   return !!fontId && DEPRECATED_PRIMARY_FONT_IDS.has(fontId);
 }
 
+/**
+ * In-place migration for any object carrying `fontFamily` /
+ * `fontFamilyOverride` (Host, GroupConfig). When the saved id is one
+ * we've since removed from TERMINAL_FONTS, drop the override so the
+ * record inherits the global default rather than silently rendering
+ * "fallback to fonts[0]" while still claiming an override is active.
+ *
+ * Returns the (possibly new) value to assign back. Caller decides
+ * whether to mutate or copy; both are safe with this shape.
+ */
+export function migrateDeprecatedFontOverride<
+  T extends { fontFamily?: string; fontFamilyOverride?: boolean },
+>(record: T): T {
+  if (!isDeprecatedPrimaryFontId(record.fontFamily)) return record;
+  const next = { ...record };
+  delete next.fontFamily;
+  if (next.fontFamilyOverride === true) {
+    next.fontFamilyOverride = false;
+  }
+  return next;
+}
+
 export function getRawFontFamily(fontId: string): string {
   return (TERMINAL_FONTS.find((f) => f.id === fontId) || TERMINAL_FONTS[0]).family;
 }

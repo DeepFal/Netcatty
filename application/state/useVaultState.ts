@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { normalizeDistroId, sanitizeHost } from "../../domain/host";
+import { sanitizeGroupConfig } from "../../domain/groupConfig";
 import {
   ConnectionLog,
   GroupConfig,
@@ -528,8 +529,9 @@ export const useVaultState = () => {
           const gcVer = ++groupConfigsWriteVersion.current;
           const decryptedGC = await decryptGroupConfigs(savedGroupConfigs);
           if (gcVer === groupConfigsWriteVersion.current) {
-            setGroupConfigs(decryptedGC);
-            encryptGroupConfigs(decryptedGC).then((enc) => {
+            const sanitizedGC = decryptedGC.map(sanitizeGroupConfig);
+            setGroupConfigs(sanitizedGC);
+            encryptGroupConfigs(sanitizedGC).then((enc) => {
               if (gcVer === groupConfigsWriteVersion.current)
                 localStorageAdapter.write(STORAGE_KEY_GROUP_CONFIGS, enc);
             });
@@ -659,7 +661,7 @@ export const useVaultState = () => {
         const writeAtStart = groupConfigsWriteVersion.current;
         decryptGroupConfigs(next).then((dec) => {
           if (seq === groupConfigsReadSeq.current && writeAtStart === groupConfigsWriteVersion.current)
-            setGroupConfigs(dec);
+            setGroupConfigs(dec.map(sanitizeGroupConfig));
         });
         return;
       }

@@ -2,6 +2,7 @@ import React, { useMemo, useSyncExternalStore } from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { useI18n } from '../../application/i18n/I18nProvider';
 import {
   getFontAvailabilityVersion,
   isFontInstalled,
@@ -12,7 +13,8 @@ const AUTO_SENTINEL = '__auto__';
 
 interface CjkFontOption {
   value: string;
-  label: string;
+  /** i18n key looked up via t(). Use '' for the Auto sentinel. */
+  labelKey: string;
 }
 
 // Only true monospace CJK fonts. Proportional CJK fonts (PingFang SC,
@@ -20,14 +22,14 @@ interface CjkFontOption {
 // break terminal grid alignment — they are deliberately excluded here
 // even though they are the OS defaults.
 const OPTIONS: CjkFontOption[] = [
-  { value: '',                       label: 'Auto · 按主字体智能搭配' },
-  { value: 'Sarasa Mono SC',         label: 'Sarasa Mono SC （更纱黑体 简）' },
-  { value: 'Sarasa Mono TC',         label: 'Sarasa Mono TC （更纱黑体 繁）' },
-  { value: 'Maple Mono CN',          label: 'Maple Mono CN' },
-  { value: 'Source Han Mono SC',     label: 'Source Han Mono SC （思源等宽）' },
-  { value: 'Noto Sans Mono CJK SC',  label: 'Noto Sans Mono CJK SC' },
-  { value: 'LXGW WenKai Mono',       label: 'LXGW WenKai Mono （霞鹜文楷等宽）' },
-  { value: 'SimSun',                 label: 'SimSun （宋体）' },
+  { value: '',                       labelKey: 'settings.terminal.font.cjk.option.auto' },
+  { value: 'Sarasa Mono SC',         labelKey: 'settings.terminal.font.cjk.option.sarasaSC' },
+  { value: 'Sarasa Mono TC',         labelKey: 'settings.terminal.font.cjk.option.sarasaTC' },
+  { value: 'Maple Mono CN',          labelKey: 'settings.terminal.font.cjk.option.mapleCN' },
+  { value: 'Source Han Mono SC',     labelKey: 'settings.terminal.font.cjk.option.sourceHan' },
+  { value: 'Noto Sans Mono CJK SC',  labelKey: 'settings.terminal.font.cjk.option.notoCJK' },
+  { value: 'LXGW WenKai Mono',       labelKey: 'settings.terminal.font.cjk.option.lxgwWenkai' },
+  { value: 'SimSun',                 labelKey: 'settings.terminal.font.cjk.option.simSun' },
 ];
 
 interface Props {
@@ -43,9 +45,14 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
   className,
   disabled,
 }) => {
+  const { t } = useI18n();
   const matchedOption = OPTIONS.find((o) => o.value === value);
   const radixValue = value === '' ? AUTO_SENTINEL : (matchedOption?.value ?? value);
-  const triggerLabel = matchedOption?.label ?? value;
+  const triggerLabel = matchedOption
+    ? t(matchedOption.labelKey)
+    : value
+      ? t('settings.terminal.font.cjk.option.legacy', { font: value })
+      : value;
 
   // Subscribe to font availability so the filter re-evaluates after the
   // Local Font Access API populates the authoritative install set
@@ -69,17 +76,20 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
     // setSystemFamilies bumps it (isFontInstalled below reads module
     // state, so we need an explicit signal).
     void availabilityVersion;
-    const filtered = OPTIONS.filter(
+    const filtered: Array<{ value: string; label: string }> = OPTIONS.filter(
       (opt) =>
         opt.value === '' ||
         opt.value === value ||
         isFontInstalled(opt.value),
-    );
+    ).map((opt) => ({ value: opt.value, label: t(opt.labelKey) }));
     if (value && !OPTIONS.some((o) => o.value === value)) {
-      filtered.push({ value, label: `${value} · 不推荐（非等宽字体）` });
+      filtered.push({
+        value,
+        label: t('settings.terminal.font.cjk.option.legacy', { font: value }),
+      });
     }
     return filtered;
-  }, [value, availabilityVersion]);
+  }, [value, availabilityVersion, t]);
 
   return (
     <SelectPrimitive.Root
