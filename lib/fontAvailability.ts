@@ -1,20 +1,22 @@
 /**
- * Detects whether a CSS font-family is actually rendered (system-installed
+ * Decides whether a CSS font-family is actually rendered (system-installed
  * or loaded via @font-face) on the current machine. Used to filter the
- * terminal font dropdowns so users can't pick a font that won't display.
+ * terminal font dropdowns.
  *
- * Strategy (in order):
- *   1. Bundled-via-@fontsource fonts: hard-coded short list (always true).
- *   2. document.fonts.check(): catches both @font-face and system-loaded
- *      fonts in Chromium-based renderers (Electron).
- *   3. Canvas width measurement against 3 generic fallbacks (serif,
- *      sans-serif, monospace). A font is considered installed only if its
- *      measured width differs from ALL three fallbacks for the test
- *      string — this avoids false positives when the target happens to
- *      have identical metrics to one fallback.
+ * Why not document.fonts.check(): in Chromium it returns true for any
+ * syntactically-valid family name regardless of whether that font is
+ * actually installed (a deliberate fingerprinting-mitigation choice), so
+ * it produces massive false positives. We rely instead on:
  *
- * Cached after first measurement; call clearFontAvailabilityCache() to
- * re-detect (e.g. after the user installs new fonts).
+ *   1. KNOWN_BUNDLED_FAMILIES — fonts we ship via @font-face / @fontsource.
+ *      Always true.
+ *   2. setSystemFamilies() — an authoritative Set populated by fontStore
+ *      after Local Font Access API returns. Membership lookup. When
+ *      populated, this is the only signal needed for system fonts.
+ *   3. Canvas width fallback — used only before setSystemFamilies() runs
+ *      or when the Font Access API is unavailable / denied. A font counts
+ *      as installed only when its rendered width differs from ALL three
+ *      generic fallbacks (serif, sans-serif, monospace).
  */
 
 const KNOWN_BUNDLED_FAMILIES = new Set<string>([
@@ -22,18 +24,33 @@ const KNOWN_BUNDLED_FAMILIES = new Set<string>([
   'Sarasa Mono SC',     // public/fonts/SarasaMonoSC-Regular.woff2 (OFL)
 ]);
 
+let systemFamilies: Set<string> | null = null;
+
 /** "Fira Code", monospace → Fira Code   |  Menlo, monospace → Menlo */
 export function extractPrimaryFamily(familyCssString: string): string {
   const first = familyCssString.split(',')[0]?.trim() ?? '';
   return first.replace(/^["']|["']$/g, '');
 }
 
+/**
+ * Called by fontStore once Local Font Access API has returned the full
+ * list of installed family names (lower-cased). After this runs,
+ * isFontInstalled answers from this authoritative set rather than from
+ * canvas measurement.
+ */
+export function setSystemFamilies(families: Set<string> | null): void {
+  systemFamilies = families;
+}
+
+/** True when authoritative system data is available; canvas fallback skipped. */
+export function hasAuthoritativeData(): boolean {
+  return systemFamilies !== null;
+}
+
 const cache = new Map<string, boolean>();
 
 interface DetectionContext {
   measureText: (font: string, text: string) => number;
-  hasDocumentFontsApi: boolean;
-  documentFontsCheck?: (spec: string) => boolean;
 }
 
 const TEST_STRING = 'mmmmmmmmmmlli';
@@ -49,16 +66,6 @@ function buildBrowserContext(): DetectionContext | null {
       ctx.font = font;
       return ctx.measureText(text).width;
     },
-    hasDocumentFontsApi:
-      typeof document.fonts !== 'undefined' &&
-      typeof document.fonts.check === 'function',
-    documentFontsCheck: (spec) => {
-      try {
-        return document.fonts.check(spec);
-      } catch {
-        return false;
-      }
-    },
   };
 }
 
@@ -68,11 +75,6 @@ export function detectInstalledWithContext(
   ctx: DetectionContext,
 ): boolean {
   if (KNOWN_BUNDLED_FAMILIES.has(family)) return true;
-
-  if (ctx.hasDocumentFontsApi && ctx.documentFontsCheck) {
-    if (ctx.documentFontsCheck(`16px "${family}"`)) return true;
-  }
-
   return FALLBACK_FAMILIES.every((fb) => {
     const baseWidth = ctx.measureText(`72px ${fb}`, TEST_STRING);
     const targetWidth = ctx.measureText(`72px "${family}", ${fb}`, TEST_STRING);
@@ -83,12 +85,19 @@ export function detectInstalledWithContext(
 export function isFontInstalled(family: string): boolean {
   if (KNOWN_BUNDLED_FAMILIES.has(family)) return true;
 
+  // Authoritative path: Local Font Access API enumeration.
+  if (systemFamilies) {
+    return systemFamilies.has(family.toLowerCase());
+  }
+
+  // Fallback path: canvas measurement, cached per family. Only used
+  // before setSystemFamilies has run, or when the API is denied.
   const cached = cache.get(family);
   if (cached !== undefined) return cached;
 
   const ctx = buildBrowserContext();
-  // Without a DOM (SSR, tests) treat non-bundled fonts as unknown ≈ available
-  // so we don't aggressively hide everything in non-renderer contexts.
+  // No DOM (SSR / tests) and no authoritative data → treat as available
+  // so we don't aggressively hide everything.
   if (!ctx) {
     cache.set(family, true);
     return true;
@@ -101,4 +110,5 @@ export function isFontInstalled(family: string): boolean {
 
 export function clearFontAvailabilityCache(): void {
   cache.clear();
+  systemFamilies = null;
 }

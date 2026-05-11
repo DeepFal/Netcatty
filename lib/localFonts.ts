@@ -89,47 +89,77 @@ function isMonospaceFont(familyName: string): boolean {
     });
 }
 
+// Cached unfiltered system family list so we don't hit the Local Font
+// Access API more than once per session. Populated as a side effect of
+// queryAllSystemFontsOnce(), which both getMonospaceFonts() and
+// fontAvailability.ts read.
+let allSystemFamiliesCache: Set<string> | null = null;
+
+async function queryAllSystemFontsOnce(): Promise<LocalFontData[]> {
+    if (typeof window === "undefined" || !("queryLocalFonts" in window)) {
+        return [];
+    }
+    try {
+        const queryLocalFonts = (window as unknown as {
+            queryLocalFonts: () => Promise<LocalFontData[]>;
+        }).queryLocalFonts;
+        const fonts = await queryLocalFonts();
+        allSystemFamiliesCache = new Set(
+            fonts.map((f) => f.family.toLowerCase()),
+        );
+        return fonts;
+    } catch (error) {
+        console.warn('Failed to query local fonts:', error);
+        return [];
+    }
+}
+
+/**
+ * Returns the case-insensitive set of every font family installed on the
+ * system, as reported by the Local Font Access API. Used by
+ * fontAvailability.ts to decide which built-in font choices to show in
+ * the dropdown.
+ *
+ * Returns null when the API is unavailable or permission has been
+ * denied — callers should treat that as "no authoritative data" and
+ * fall back to canvas-width detection.
+ */
+export async function getAllSystemFontFamilies(): Promise<Set<string> | null> {
+    if (allSystemFamiliesCache) return allSystemFamiliesCache;
+    await queryAllSystemFontsOnce();
+    return allSystemFamiliesCache;
+}
+
 /**
  * Queries local monospace fonts from the system using the Font Access API.
  * Returns an empty array if the API is not available or permission is denied.
  */
 export async function getMonospaceFonts(): Promise<TerminalFont[]> {
-    // Check if the Font Access API is available
-    if (typeof window === "undefined" || !("queryLocalFonts" in window)) {
-        return [];
-    }
+    const fonts = await queryAllSystemFontsOnce();
+    if (fonts.length === 0) return [];
 
-    try {
-        const queryLocalFonts = (window as unknown as { queryLocalFonts: () => Promise<LocalFontData[]> }).queryLocalFonts;
-        const fonts = await queryLocalFonts();
+    // Filter monospace fonts using robust word boundary matching
+    const monoFonts = fonts.filter(f => isMonospaceFont(f.family));
 
-        // Filter monospace fonts using robust word boundary matching
-        const monoFonts = fonts.filter(f => isMonospaceFont(f.family));
+    // Deduplicate by family name, case-insensitive (API may return multiple entries per family)
+    const uniqueFamilies = new Set<string>();
+    const dedupedFonts = monoFonts.filter(f => {
+        const key = f.family.toLowerCase();
+        if (uniqueFamilies.has(key)) return false;
+        uniqueFamilies.add(key);
+        return true;
+    });
 
-        // Deduplicate by family name, case-insensitive (API may return multiple entries per family)
-        const uniqueFamilies = new Set<string>();
-        const dedupedFonts = monoFonts.filter(f => {
-            const key = f.family.toLowerCase();
-            if (uniqueFamilies.has(key)) return false;
-            uniqueFamilies.add(key);
-            return true;
-        });
-
-        // Raw Latin family only; CJK fallback is composed at runtime by
-        // composeFontFamilyStack() in cjkFonts.ts.
-        return dedupedFonts.map(f => {
-            const quoted = /\s/.test(f.family) ? `"${f.family}"` : f.family;
-            return {
-                id: f.family,
-                name: f.family,
-                family: `${quoted}, monospace`,
-                description: `Local font: ${f.family}`,
-                category: 'monospace' as const,
-            };
-        });
-    } catch (error) {
-        // Handle permission denied or other errors gracefully
-        console.warn('Failed to query local fonts:', error);
-        return [];
-    }
+    // Raw Latin family only; CJK fallback is composed at runtime by
+    // composeFontFamilyStack() in cjkFonts.ts.
+    return dedupedFonts.map(f => {
+        const quoted = /\s/.test(f.family) ? `"${f.family}"` : f.family;
+        return {
+            id: f.family,
+            name: f.family,
+            family: `${quoted}, monospace`,
+            description: `Local font: ${f.family}`,
+            category: 'monospace' as const,
+        };
+    });
 }

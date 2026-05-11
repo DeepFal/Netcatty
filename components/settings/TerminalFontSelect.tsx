@@ -2,7 +2,7 @@ import React, { useMemo } from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { extractPrimaryFamily, isFontInstalled } from '../../lib/fontAvailability';
+import { extractPrimaryFamily, hasAuthoritativeData, isFontInstalled } from '../../lib/fontAvailability';
 import type { TerminalFont } from '../../infrastructure/config/fonts';
 
 interface TerminalFontSelectProps {
@@ -24,15 +24,20 @@ export const TerminalFontSelect: React.FC<TerminalFontSelectProps> = ({
 
   // Hide fonts that aren't actually rendered on this machine so users
   // don't pick a font and then see no visible change. The currently
-  // selected font is always shown (so the user can read their setting),
-  // and if filtering would leave fewer than 4 fonts we fall back to
-  // the full list — better to be slightly noisy than nearly empty if
+  // selected font is always shown so the user can read their setting.
+  //
+  // When the Local Font Access API has populated authoritative data,
+  // trust it: an empty or near-empty result means the user really has
+  // few monospace fonts (Layer 3 still gives at least one option via
+  // bundled Sarasa Mono SC). When canvas-only fallback is in play,
+  // we keep a safety net at length>=1 to avoid an empty dropdown if
   // detection misfires.
   const visibleFonts = useMemo(() => {
     const filtered = fonts.filter(
       (f) => f.id === value || isFontInstalled(extractPrimaryFamily(f.family)),
     );
-    return filtered.length >= 4 ? filtered : fonts;
+    if (hasAuthoritativeData()) return filtered;
+    return filtered.length >= 1 ? filtered : fonts;
   }, [fonts, value]);
 
   return (
