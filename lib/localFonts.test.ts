@@ -81,4 +81,25 @@ describe('queryLocalFonts deduplication', () => {
     const result = await getAllSystemFontFamilies();
     assert.equal(result, null);
   });
+
+  it('retries on the next call after a transient failure (does not sticky-cache empty result)', async () => {
+    // Regression guard for codex P2 review on PR #940: queryLocalFonts
+    // failure should NOT poison the cache for the rest of the session.
+    let callCount = 0;
+    installMockWindow(async () => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error('transient failure (e.g. LFA permission not ready)');
+      }
+      return [{ family: 'Menlo' }, { family: 'Fira Code' }];
+    });
+
+    const first = await getAllSystemFontFamilies();
+    assert.equal(first, null, 'first failure returns null authoritative set');
+
+    // Same module, second invocation: must retry queryLocalFonts.
+    const second = await getAllSystemFontFamilies();
+    assert.equal(callCount, 2, 'queryLocalFonts retried on next call');
+    assert.equal(second?.has('menlo'), true, 'second call sees the fonts');
+  });
 });

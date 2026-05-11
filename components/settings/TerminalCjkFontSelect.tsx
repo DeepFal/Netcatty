@@ -1,8 +1,12 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useSyncExternalStore } from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { isFontInstalled } from '../../lib/fontAvailability';
+import {
+  getFontAvailabilityVersion,
+  isFontInstalled,
+  subscribeFontAvailability,
+} from '../../lib/fontAvailability';
 
 const AUTO_SENTINEL = '__auto__';
 
@@ -43,6 +47,16 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
   const radixValue = value === '' ? AUTO_SENTINEL : (matchedOption?.value ?? value);
   const triggerLabel = matchedOption?.label ?? value;
 
+  // Subscribe to font availability so the filter re-evaluates after the
+  // Local Font Access API populates the authoritative install set
+  // asynchronously (otherwise the dropdown would show stale availability
+  // until the user manually changed `value`).
+  const availabilityVersion = useSyncExternalStore(
+    subscribeFontAvailability,
+    getFontAvailabilityVersion,
+    getFontAvailabilityVersion,
+  );
+
   // "Auto" is always present; concrete fonts only appear when installed;
   // the currently-selected value (if any) is also always shown so users
   // can see and clear their setting even on a machine without the font.
@@ -50,6 +64,11 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
   // proportional fonts) are appended as a synthetic option with a
   // "not recommended" label so the user can see them and re-pick.
   const visibleOptions = useMemo(() => {
+    // The version is read here only so eslint-react-hooks sees it
+    // used; in practice we depend on it to invalidate this memo when
+    // setSystemFamilies bumps it (isFontInstalled below reads module
+    // state, so we need an explicit signal).
+    void availabilityVersion;
     const filtered = OPTIONS.filter(
       (opt) =>
         opt.value === '' ||
@@ -60,7 +79,7 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
       filtered.push({ value, label: `${value} · 不推荐（非等宽字体）` });
     }
     return filtered;
-  }, [value]);
+  }, [value, availabilityVersion]);
 
   return (
     <SelectPrimitive.Root

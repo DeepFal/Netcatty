@@ -25,6 +25,8 @@ const KNOWN_BUNDLED_FAMILIES = new Set<string>([
 ]);
 
 let systemFamilies: Set<string> | null = null;
+let availabilityVersion = 0;
+const listeners = new Set<() => void>();
 
 /** "Fira Code", monospace → Fira Code   |  Menlo, monospace → Menlo */
 export function extractPrimaryFamily(familyCssString: string): string {
@@ -37,14 +39,39 @@ export function extractPrimaryFamily(familyCssString: string): string {
  * list of installed family names (lower-cased). After this runs,
  * isFontInstalled answers from this authoritative set rather than from
  * canvas measurement.
+ *
+ * Notifies subscribers so React components memoizing on availability
+ * can recompute (e.g. dropdown filters that called isFontInstalled
+ * before authoritative data arrived).
  */
 export function setSystemFamilies(families: Set<string> | null): void {
   systemFamilies = families;
+  availabilityVersion += 1;
+  for (const listener of listeners) listener();
 }
 
 /** True when authoritative system data is available; canvas fallback skipped. */
 export function hasAuthoritativeData(): boolean {
   return systemFamilies !== null;
+}
+
+/**
+ * Subscribe to changes in font availability. Returns an unsubscribe fn.
+ * Used together with getFontAvailabilityVersion() and
+ * useSyncExternalStore in React components that filter on
+ * isFontInstalled() — so their useMemo dependencies invalidate when
+ * the authoritative install set is populated or cleared.
+ */
+export function subscribeFontAvailability(callback: () => void): () => void {
+  listeners.add(callback);
+  return () => {
+    listeners.delete(callback);
+  };
+}
+
+/** Monotonically increasing version, bumped on every setSystemFamilies. */
+export function getFontAvailabilityVersion(): number {
+  return availabilityVersion;
 }
 
 const cache = new Map<string, boolean>();
@@ -111,4 +138,6 @@ export function isFontInstalled(family: string): boolean {
 export function clearFontAvailabilityCache(): void {
   cache.clear();
   systemFamilies = null;
+  availabilityVersion += 1;
+  for (const listener of listeners) listener();
 }

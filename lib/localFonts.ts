@@ -125,7 +125,13 @@ function queryAllSystemFontsOnce(): Promise<LocalFontData[]> {
             );
             return fonts;
         } catch (error) {
+            // Don't sticky-cache a transient failure (e.g. LFA permission
+            // not ready yet at app boot, AbortError, etc.). Clearing the
+            // module-level promise lets the very next caller retry the
+            // API. Successful calls keep their cached promise as before,
+            // so this only retries when something actually went wrong.
             console.warn('Failed to query local fonts:', error);
+            queryPromise = null;
             return [];
         }
     })();

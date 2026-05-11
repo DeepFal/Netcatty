@@ -7,6 +7,8 @@ import {
   setSystemFamilies,
   hasAuthoritativeData,
   clearFontAvailabilityCache,
+  subscribeFontAvailability,
+  getFontAvailabilityVersion,
 } from './fontAvailability';
 
 describe('extractPrimaryFamily', () => {
@@ -111,5 +113,58 @@ describe('isFontInstalled with authoritative system data', () => {
     assert.equal(hasAuthoritativeData(), true);
     setSystemFamilies(null);
     assert.equal(hasAuthoritativeData(), false);
+  });
+});
+
+describe('font availability subscription', () => {
+  beforeEach(() => {
+    clearFontAvailabilityCache();
+  });
+
+  it('notifies subscribers when setSystemFamilies is called', () => {
+    // Regression guard for codex P2 review on PR #940:
+    // TerminalCjkFontSelect memoizes visibleOptions on [value] but the
+    // filter calls isFontInstalled which depends on systemFamilies.
+    // Subscribers wired via useSyncExternalStore must fire so memos
+    // recompute when authoritative data arrives.
+    let calls = 0;
+    const unsubscribe = subscribeFontAvailability(() => {
+      calls += 1;
+    });
+
+    setSystemFamilies(new Set(['menlo']));
+    assert.equal(calls, 1);
+
+    setSystemFamilies(new Set(['menlo', 'fira code']));
+    assert.equal(calls, 2);
+
+    setSystemFamilies(null);
+    assert.equal(calls, 3);
+
+    unsubscribe();
+    setSystemFamilies(new Set(['menlo']));
+    assert.equal(calls, 3, 'unsubscribe stops notifications');
+  });
+
+  it('version monotonically increases on each setSystemFamilies call', () => {
+    const v0 = getFontAvailabilityVersion();
+    setSystemFamilies(new Set(['menlo']));
+    const v1 = getFontAvailabilityVersion();
+    setSystemFamilies(new Set(['menlo', 'fira code']));
+    const v2 = getFontAvailabilityVersion();
+
+    assert.ok(v1 > v0, 'first call bumps version');
+    assert.ok(v2 > v1, 'second call bumps version');
+  });
+
+  it('clearFontAvailabilityCache also notifies subscribers', () => {
+    let calls = 0;
+    subscribeFontAvailability(() => {
+      calls += 1;
+    });
+    setSystemFamilies(new Set(['menlo']));
+    const after = calls;
+    clearFontAvailabilityCache();
+    assert.ok(calls > after, 'clear notifies too');
   });
 });

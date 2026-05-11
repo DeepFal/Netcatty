@@ -1,8 +1,14 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useSyncExternalStore } from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { extractPrimaryFamily, hasAuthoritativeData, isFontInstalled } from '../../lib/fontAvailability';
+import {
+  extractPrimaryFamily,
+  getFontAvailabilityVersion,
+  hasAuthoritativeData,
+  isFontInstalled,
+  subscribeFontAvailability,
+} from '../../lib/fontAvailability';
 import type { TerminalFont } from '../../infrastructure/config/fonts';
 
 interface TerminalFontSelectProps {
@@ -22,6 +28,15 @@ export const TerminalFontSelect: React.FC<TerminalFontSelectProps> = ({
 }) => {
   const selectedFont = fonts.find(f => f.id === value);
 
+  // Subscribe to font availability so the filter re-evaluates after the
+  // Local Font Access API populates the authoritative install set
+  // asynchronously, even if the `fonts` prop ref hasn't changed.
+  const availabilityVersion = useSyncExternalStore(
+    subscribeFontAvailability,
+    getFontAvailabilityVersion,
+    getFontAvailabilityVersion,
+  );
+
   // Hide fonts that aren't actually rendered on this machine so users
   // don't pick a font and then see no visible change. The currently
   // selected font is always shown so the user can read their setting.
@@ -33,12 +48,16 @@ export const TerminalFontSelect: React.FC<TerminalFontSelectProps> = ({
   // we keep a safety net at length>=1 to avoid an empty dropdown if
   // detection misfires.
   const visibleFonts = useMemo(() => {
+    // Referenced so eslint-react-hooks sees the dep used; the real
+    // purpose is to invalidate this memo when setSystemFamilies bumps
+    // the version (isFontInstalled reads module state).
+    void availabilityVersion;
     const filtered = fonts.filter(
       (f) => f.id === value || isFontInstalled(extractPrimaryFamily(f.family)),
     );
     if (hasAuthoritativeData()) return filtered;
     return filtered.length >= 1 ? filtered : fonts;
-  }, [fonts, value]);
+  }, [fonts, value, availabilityVersion]);
 
   return (
     <SelectPrimitive.Root value={value} onValueChange={onChange} disabled={disabled}>
