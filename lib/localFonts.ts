@@ -1,4 +1,4 @@
-import { TerminalFont, withCjkFallback } from "../infrastructure/config/fonts"
+import { TerminalFont } from "../infrastructure/config/fonts"
 
 /**
  * Type definition for Local Font Access API
@@ -115,14 +115,18 @@ export async function getMonospaceFonts(): Promise<TerminalFont[]> {
             return true;
         });
 
-        // Map to TerminalFont structure with CJK fallback applied
-        return dedupedFonts.map(f => ({
-            id: f.family,
-            name: f.family,
-            family: withCjkFallback(f.family + ', monospace'),
-            description: `Local font: ${f.family}`,
-            category: 'monospace' as const,
-        }));
+        // Raw Latin family only; CJK fallback is composed at runtime by
+        // composeFontFamilyStack() in cjkFonts.ts.
+        return dedupedFonts.map(f => {
+            const quoted = /\s/.test(f.family) ? `"${f.family}"` : f.family;
+            return {
+                id: f.family,
+                name: f.family,
+                family: `${quoted}, monospace`,
+                description: `Local font: ${f.family}`,
+                category: 'monospace' as const,
+            };
+        });
     } catch (error) {
         // Handle permission denied or other errors gracefully
         console.warn('Failed to query local fonts:', error);
