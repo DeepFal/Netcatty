@@ -113,12 +113,25 @@ export function composeFontFamilyStack(args: ComposeArgs): string {
     push(p);
   }
 
+  // Guarantee Latin glyphs land on a monospace face when the primary
+  // font isn't installed. CSS resolves per-glyph, so:
+  //   - Latin chars: primary (if installed) → monospace generic. Cell
+  //     width stays consistent for xterm's grid.
+  //   - CJK chars: primary (no) → monospace generic (no Chinese glyphs)
+  //     → keeps walking into the CJK fallbacks below.
+  //   - Nerd PUA glyphs: similar — fall past primary/monospace/CJK to
+  //     the Nerd Font stack.
+  // Putting CJK fonts AHEAD of monospace was a regression flagged by
+  // review on PR #940: a CJK font's full-width Latin glyphs would
+  // render before monospace was ever consulted, breaking cell
+  // alignment when the primary font wasn't installed.
+  push('monospace');
+
   push(userFallbackQuoted);
   push(recommendedQuoted);
 
   for (const sys of CJK_SYSTEM_FALLBACK_FONTS) push(sys);
   for (const nerd of NERD_FONT_FALLBACK_FONTS) push(nerd);
 
-  pieces.push('monospace');
   return pieces.join(', ');
 }

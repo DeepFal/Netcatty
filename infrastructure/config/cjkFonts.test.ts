@@ -75,14 +75,47 @@ describe('composeFontFamilyStack', () => {
     assert.equal(matches.length, 1);
   });
 
-  it('always terminates with generic monospace', () => {
+  it('places generic monospace right after the primary family', () => {
     const stack = composeFontFamilyStack({
       primaryFamily: 'Menlo',
       userFallback: '',
       latinFontId: 'menlo',
       platform: 'darwin',
     });
-    assert.ok(stack.trim().endsWith('monospace'));
+    // Primary first, then "monospace" — before any concrete CJK family.
+    const families = stack.split(',').map((s) => s.trim().replace(/^"|"$/g, ''));
+    assert.equal(families[0], 'Menlo');
+    assert.equal(families[1], 'monospace');
+  });
+
+  it('keeps monospace ahead of every CJK fallback family', () => {
+    // Regression guard for codex P1 review on PR #940: if the primary
+    // font is missing, Latin glyphs must fall back to a monospace
+    // generic — NOT a CJK font's full-width Latin variant — to keep
+    // xterm's fixed cell grid aligned.
+    const stack = composeFontFamilyStack({
+      primaryFamily: '"Fira Code", monospace',
+      userFallback: 'LXGW WenKai Mono',
+      latinFontId: 'fira-code',
+      platform: 'darwin',
+    });
+    const monoIdx = stack.indexOf(' monospace');
+    const sarasaIdx = stack.indexOf('Sarasa Mono SC');
+    const userFallbackIdx = stack.indexOf('LXGW WenKai Mono');
+    const simSunIdx = stack.indexOf('SimSun');
+    assert.ok(monoIdx > 0, 'monospace must appear in the stack');
+    assert.ok(
+      monoIdx < userFallbackIdx,
+      'monospace must come before the user-chosen CJK fallback',
+    );
+    assert.ok(
+      monoIdx < sarasaIdx,
+      'monospace must come before the system Sarasa fallback',
+    );
+    assert.ok(
+      monoIdx < simSunIdx,
+      'monospace must come before the system SimSun fallback',
+    );
   });
 
   it('explicit user fallback overrides the per-font recommendation', () => {
