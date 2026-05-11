@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { isFontInstalled } from '../../lib/fontAvailability';
 
 const AUTO_SENTINEL = '__auto__';
 
@@ -41,6 +42,20 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
   const radixValue = value === '' ? AUTO_SENTINEL : (matchedOption?.value ?? value);
   const triggerLabel = matchedOption?.label ?? value;
 
+  // "Auto" is always present; concrete fonts only appear when installed;
+  // the currently-selected value (if any) is also always shown so users
+  // can see and clear their setting even on a machine without the font.
+  const visibleOptions = useMemo(
+    () =>
+      OPTIONS.filter(
+        (opt) =>
+          opt.value === '' ||
+          opt.value === value ||
+          isFontInstalled(opt.value),
+      ),
+    [value],
+  );
+
   return (
     <SelectPrimitive.Root
       value={radixValue}
@@ -72,7 +87,7 @@ export const TerminalCjkFontSelect: React.FC<Props> = ({
             <ChevronUp className="h-4 w-4" />
           </SelectPrimitive.ScrollUpButton>
           <SelectPrimitive.Viewport className="p-1 h-[var(--radix-select-trigger-height)] w-full min-w-[var(--radix-select-trigger-width)]">
-            {OPTIONS.map((opt) => (
+            {visibleOptions.map((opt) => (
               <SelectPrimitive.Item
                 key={opt.value || AUTO_SENTINEL}
                 value={opt.value || AUTO_SENTINEL}

@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { extractPrimaryFamily, isFontInstalled } from '../../lib/fontAvailability';
 import type { TerminalFont } from '../../infrastructure/config/fonts';
 
 interface TerminalFontSelectProps {
@@ -20,6 +21,19 @@ export const TerminalFontSelect: React.FC<TerminalFontSelectProps> = ({
   disabled,
 }) => {
   const selectedFont = fonts.find(f => f.id === value);
+
+  // Hide fonts that aren't actually rendered on this machine so users
+  // don't pick a font and then see no visible change. The currently
+  // selected font is always shown (so the user can read their setting),
+  // and if filtering would leave fewer than 4 fonts we fall back to
+  // the full list — better to be slightly noisy than nearly empty if
+  // detection misfires.
+  const visibleFonts = useMemo(() => {
+    const filtered = fonts.filter(
+      (f) => f.id === value || isFontInstalled(extractPrimaryFamily(f.family)),
+    );
+    return filtered.length >= 4 ? filtered : fonts;
+  }, [fonts, value]);
 
   return (
     <SelectPrimitive.Root value={value} onValueChange={onChange} disabled={disabled}>
@@ -48,7 +62,7 @@ export const TerminalFontSelect: React.FC<TerminalFontSelectProps> = ({
             <ChevronUp className="h-4 w-4" />
           </SelectPrimitive.ScrollUpButton>
           <SelectPrimitive.Viewport className="p-1 h-[var(--radix-select-trigger-height)] w-full min-w-[var(--radix-select-trigger-width)]">
-            {fonts.map((font) => (
+            {visibleFonts.map((font) => (
               <SelectPrimitive.Item
                 key={font.id}
                 value={font.id}
