@@ -18,7 +18,8 @@
  */
 
 const KNOWN_BUNDLED_FAMILIES = new Set<string>([
-  'JetBrains Mono',
+  'JetBrains Mono',     // @fontsource/jetbrains-mono (regular, 500, 600)
+  'Sarasa Mono SC',     // public/fonts/SarasaMonoSC-Regular.woff2 (OFL)
 ]);
 
 /** "Fira Code", monospace → Fira Code   |  Menlo, monospace → Menlo */
