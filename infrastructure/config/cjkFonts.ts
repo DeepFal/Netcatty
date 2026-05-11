@@ -113,25 +113,32 @@ export function composeFontFamilyStack(args: ComposeArgs): string {
     push(p);
   }
 
-  // Guarantee Latin glyphs land on a monospace face when the primary
-  // font isn't installed. CSS resolves per-glyph, so:
-  //   - Latin chars: primary (if installed) → monospace generic. Cell
-  //     width stays consistent for xterm's grid.
-  //   - CJK chars: primary (no) → monospace generic (no Chinese glyphs)
-  //     → keeps walking into the CJK fallbacks below.
-  //   - Nerd PUA glyphs: similar — fall past primary/monospace/CJK to
-  //     the Nerd Font stack.
-  // Putting CJK fonts AHEAD of monospace was a regression flagged by
-  // review on PR #940: a CJK font's full-width Latin glyphs would
-  // render before monospace was ever consulted, breaking cell
-  // alignment when the primary font wasn't installed.
-  push('monospace');
+  // Latin-only fallback (bundled via @fontsource/jetbrains-mono in
+  // index.tsx). Catches Latin glyphs when the primary font isn't
+  // installed without intercepting CJK glyphs the way the bare
+  // `monospace` generic would on macOS Chrome (where the generic
+  // monospace pulls in PingFang via system CJK fallback, masking the
+  // user's CJK font choice).
+  //
+  // Per-glyph CSS fallback then behaves as intended:
+  //   - Latin chars: primary (if installed) → JetBrains Mono. Cells
+  //     stay aligned because JetBrains Mono is true monospace.
+  //   - CJK chars: primary (no) → JetBrains Mono (no CJK glyphs) →
+  //     user-chosen CJK font (or per-Latin-font recommendation) →
+  //     system CJK stack.
+  //   - Nerd PUA: all of the above (none have PUA) → Nerd Font stack.
+  push('"JetBrains Mono"');
 
   push(userFallbackQuoted);
   push(recommendedQuoted);
 
   for (const sys of CJK_SYSTEM_FALLBACK_FONTS) push(sys);
   for (const nerd of NERD_FONT_FALLBACK_FONTS) push(nerd);
+
+  // Final safety net only — should rarely be reached because JetBrains
+  // Mono covers Latin and the CJK stack covers Chinese glyphs. Kept
+  // for the edge case where bundled fonts fail to load.
+  push('monospace');
 
   return pieces.join(', ');
 }
