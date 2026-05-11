@@ -241,9 +241,15 @@ export const useVaultState = () => {
   }, []);
 
   const updateGroupConfigs = useCallback((data: GroupConfig[]) => {
-    setGroupConfigs(data);
+    // Sanitize on the write path too — applySyncPayload / importVaultData
+    // route legacy payloads through here, and without this step a saved
+    // pingfang-sc / comic-sans-ms override from an older client would
+    // sit in memory and re-persist with `fontFamilyOverride: true` until
+    // the next reload. Mirrors updateHosts → sanitizeHost.
+    const cleaned = data.map(sanitizeGroupConfig);
+    setGroupConfigs(cleaned);
     const ver = ++groupConfigsWriteVersion.current;
-    return encryptGroupConfigs(data).then((enc) => {
+    return encryptGroupConfigs(cleaned).then((enc) => {
       if (ver === groupConfigsWriteVersion.current)
         localStorageAdapter.write(STORAGE_KEY_GROUP_CONFIGS, enc);
     });
