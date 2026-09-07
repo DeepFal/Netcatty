@@ -1,6 +1,8 @@
 import type { Terminal as XTerm } from "@xterm/xterm";
 import type { CompletionSuggestion } from "./completionEngine";
+import type { PromptDetectionResult } from "./promptDetector";
 import type { SubDirPanel } from "./useTerminalAutocomplete";
+import { stringCellWidth } from "./terminalStringCellWidth";
 import { getXTermCellDimensions } from "./xtermUtils";
 
 export function resolveAutocompleteCwd(
@@ -9,39 +11,50 @@ export function resolveAutocompleteCwd(
   fallbackCwd: string | undefined,
   os: "linux" | "windows" | "macos",
 ): string | undefined {
-  if (os === "windows") return fallbackCwd;
+  return resolveAutocompleteCwdWithSource(promptText, currentWord, fallbackCwd, os).cwd;
+}
+
+export type AutocompleteCwdSource = "prompt" | "fallback" | "none";
+
+export function resolveAutocompleteCwdWithSource(
+  promptText: string,
+  currentWord: string,
+  fallbackCwd: string | undefined,
+  os: "linux" | "windows" | "macos",
+): { cwd: string | undefined; source: AutocompleteCwdSource } {
+  if (os === "windows") return { cwd: fallbackCwd, source: fallbackCwd ? "fallback" : "none" };
 
   const normalizedWord = currentWord.trim().replace(/^['"]/, "");
 
   // Absolute or home-relative paths don't depend on cwd
   if (normalizedWord.startsWith("/") || normalizedWord.startsWith("~/")) {
-    return fallbackCwd;
+    return { cwd: fallbackCwd, source: fallbackCwd ? "fallback" : "none" };
   }
 
   // For empty word (e.g. "cd ") and relative paths, try prompt-based cwd
   // extraction which reflects the current visible prompt — more up-to-date
   // than fallbackCwd when OSC 7 is not supported.
   const promptCwd = extractPosixCwdFromPrompt(promptText);
-  return chooseAutocompleteCwd(promptCwd, fallbackCwd);
+  return chooseAutocompleteCwdWithSource(promptCwd, fallbackCwd);
 }
 
-function chooseAutocompleteCwd(
+function chooseAutocompleteCwdWithSource(
   promptCwd: string | undefined,
   fallbackCwd: string | undefined,
-): string | undefined {
-  if (!promptCwd) return fallbackCwd;
-  if (!fallbackCwd) return promptCwd;
+): { cwd: string | undefined; source: AutocompleteCwdSource } {
+  if (!promptCwd) return { cwd: fallbackCwd, source: fallbackCwd ? "fallback" : "none" };
+  if (!fallbackCwd) return { cwd: promptCwd, source: "prompt" };
 
   // Prompt cwd is extracted from the currently visible prompt, so it tracks
   // directory changes even when OSC 7 is not supported. Prefer it over
   // fallbackCwd (which may be stale from initial connection) whenever it
   // looks like a usable path.
   if (promptCwd.startsWith("/") || promptCwd === "~" || promptCwd.startsWith("~/")) {
-    return promptCwd;
+    return { cwd: promptCwd, source: "prompt" };
   }
 
   // Bare directory name (e.g. "xunlong") can't be used as a path — fallback
-  return fallbackCwd;
+  return { cwd: fallbackCwd, source: fallbackCwd ? "fallback" : "none" };
 }
 
 function extractPosixCwdFromPrompt(promptText: string): string | undefined {
@@ -100,6 +113,34 @@ export function areSuggestionsEqual(
   return true;
 }
 
+/**
+ * Keep a popup highlight across a same-query list refresh (e.g. late path
+ * suggestions). Match the previously selected row by stable identity; if a
+ * late path replaces a same-text history/plugin entry, fall back to text.
+ */
+export function resolvePreservedSuggestionIndex(
+  previousSuggestions: CompletionSuggestion[],
+  previousSelectedIndex: number,
+  nextSuggestions: CompletionSuggestion[],
+): number {
+  if (previousSelectedIndex < 0 || previousSelectedIndex >= previousSuggestions.length) {
+    return -1;
+  }
+  const selected = previousSuggestions[previousSelectedIndex];
+  if (!selected) return -1;
+
+  const exactIndex = nextSuggestions.findIndex(
+    (candidate) =>
+      candidate.text === selected.text &&
+      candidate.source === selected.source &&
+      candidate.displayText === selected.displayText &&
+      candidate.fileType === selected.fileType,
+  );
+  if (exactIndex >= 0) return exactIndex;
+
+  return nextSuggestions.findIndex((candidate) => candidate.text === selected.text);
+}
+
 export function areSubDirPanelsEqual(left: SubDirPanel[], right: SubDirPanel[]): boolean {
   if (left.length !== right.length) return false;
   for (let i = 0; i < left.length; i++) {
@@ -116,6 +157,13 @@ export function areSubDirPanelsEqual(left: SubDirPanel[], right: SubDirPanel[]):
   return true;
 }
 
+export interface PopupClampViewport {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 export interface PopupPlacementInput {
   /** Anchor (current input line) top edge, in viewport coordinates. */
   anchorTop: number;
@@ -125,6 +173,11 @@ export interface PopupPlacementInput {
   anchorLeft: number;
   viewportWidth: number;
   viewportHeight: number;
+  /**
+   * Optional clamp region in viewport coordinates. Defaults to the rectangle
+   * `(0, 0, viewportWidth, viewportHeight)`.
+   */
+  clampViewport?: PopupClampViewport;
   /** Natural height the popup wants if unconstrained (main list or detail). */
   desiredHeight: number;
   /**
@@ -133,6 +186,12 @@ export interface PopupPlacementInput {
    * inside the viewport, not just the main list.
    */
   totalWidth: number;
+  /**
+   * Width budget for horizontal clamping. Defaults to `totalWidth`. The detail
+   * tooltip is rendered beside the list and can extend left on its own, so
+   * callers may pass a smaller width to keep the primary list near the cursor.
+   */
+  clampWidth?: number;
   /** Hard cap on rendered height (matches the list's maxHeight prop). */
   maxHeight: number;
   /** Gap between the anchor line and the popup. */
@@ -144,6 +203,12 @@ export interface PopupPlacementInput {
    * ties when neither side can fully fit the desired height.
    */
   expandUpwardHint: boolean;
+  /**
+   * When true, keep rendering above the supplied anchor even if there is a
+   * full fit below. Used after a wrap pins the anchor to the command start
+   * so placement cannot flip down over the continuation rows (#3061).
+   */
+  forceExpandUpward?: boolean;
 }
 
 export interface PopupPlacement {
@@ -155,6 +220,48 @@ export interface PopupPlacement {
   left: number;
   /** Height budget for the rendered content (drives scrolling). */
   maxHeight: number;
+}
+
+export interface PopupGeometryClampInput {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  clampViewport: PopupClampViewport;
+  viewportPadding: number;
+}
+
+export interface PopupGeometry {
+  top: number;
+  left: number;
+}
+
+function clampCoordinate(value: number, min: number, max: number): number {
+  if (max <= min) return min;
+  return Math.max(min, Math.min(value, max));
+}
+
+/**
+ * Final guardrail using the rendered popup's actual DOM size. The placement
+ * pass uses estimated list/detail/panel sizes so it can decide before render;
+ * this pass prevents any estimate mismatch or delayed xterm cursor refresh
+ * from letting the fixed-position portal escape the terminal/app bounds.
+ */
+export function clampAutocompletePopupGeometry(
+  input: PopupGeometryClampInput,
+): PopupGeometry {
+  const { left, top, width, height, clampViewport, viewportPadding } = input;
+  const safeWidth = Number.isFinite(width) ? Math.max(0, width) : 0;
+  const safeHeight = Number.isFinite(height) ? Math.max(0, height) : 0;
+  const minLeft = clampViewport.left + viewportPadding;
+  const minTop = clampViewport.top + viewportPadding;
+  const maxLeft = clampViewport.left + clampViewport.width - viewportPadding - safeWidth;
+  const maxTop = clampViewport.top + clampViewport.height - viewportPadding - safeHeight;
+
+  return {
+    left: clampCoordinate(left, minLeft, Math.max(minLeft, maxLeft)),
+    top: clampCoordinate(top, minTop, Math.max(minTop, maxTop)),
+  };
 }
 
 /**
@@ -188,87 +295,316 @@ export function computeAutocompletePopupPlacement(
     anchorGap,
     viewportPadding,
     expandUpwardHint,
+    forceExpandUpward = false,
+    clampViewport,
+    clampWidth,
   } = input;
 
+  const bounds: PopupClampViewport = clampViewport ?? {
+    left: 0,
+    top: 0,
+    width: viewportWidth,
+    height: viewportHeight,
+  };
+  const boundsRight = bounds.left + bounds.width;
+  const boundsBottom = bounds.top + bounds.height;
+  const horizontalClampWidth = clampWidth ?? totalWidth;
+
   const cappedDesiredHeight = Math.min(maxHeight, Math.max(0, desiredHeight));
-  const spaceAbove = Math.max(0, anchorTop - viewportPadding - anchorGap);
-  const spaceBelow = Math.max(0, viewportHeight - anchorBottom - viewportPadding - anchorGap);
+  const spaceAbove = Math.max(0, anchorTop - bounds.top - viewportPadding - anchorGap);
+  const spaceBelow = Math.max(0, boundsBottom - anchorBottom - viewportPadding - anchorGap);
   const canFullyRenderAbove = spaceAbove >= cappedDesiredHeight;
   const canFullyRenderBelow = spaceBelow >= cappedDesiredHeight;
-  const renderUpward = canFullyRenderBelow
-    ? false
-    : canFullyRenderAbove
-      ? true
-      : expandUpwardHint
-        ? spaceAbove >= Math.min(spaceBelow, 80)
-        : spaceAbove > spaceBelow;
+  const renderUpward = forceExpandUpward && spaceAbove > 0
+    ? true
+    : canFullyRenderBelow
+      ? false
+      : canFullyRenderAbove
+        ? true
+        : expandUpwardHint
+          ? spaceAbove >= Math.min(spaceBelow, 80)
+          : spaceAbove > spaceBelow;
 
   const availableVerticalSpace = renderUpward ? spaceAbove : spaceBelow;
-  const effectiveMaxHeight = Math.max(0, Math.min(maxHeight, availableVerticalSpace));
+  const availableViewportHeight = Math.max(0, bounds.height - viewportPadding * 2);
+  const effectiveMaxHeight = Math.max(
+    0,
+    Math.min(maxHeight, availableVerticalSpace, availableViewportHeight),
+  );
   const contentHeightForPlacement = Math.min(effectiveMaxHeight, cappedDesiredHeight);
-  const top = renderUpward
-    ? Math.max(viewportPadding, anchorTop - anchorGap - contentHeightForPlacement)
+  const unclampedTop = renderUpward
+    ? Math.max(bounds.top + viewportPadding, anchorTop - anchorGap - contentHeightForPlacement)
     : Math.min(
         anchorBottom + anchorGap,
-        viewportHeight - viewportPadding - contentHeightForPlacement,
+        boundsBottom - viewportPadding - contentHeightForPlacement,
       );
+  const minTop = bounds.top + viewportPadding;
+  const maxTop = Math.max(minTop, boundsBottom - viewportPadding - contentHeightForPlacement);
+  const top = Math.max(minTop, Math.min(unclampedTop, maxTop));
 
-  // Right edge that keeps the whole assembly inside the viewport. When the
-  // assembly is wider than the available room this goes below viewportPadding,
+  // Right edge that keeps the clamped assembly inside the bounds. When the
+  // assembly is wider than the available room this goes below the left padding,
   // so the final clamp pins the popup to the left padding (primary list wins).
-  const maxLeft = viewportWidth - viewportPadding - Math.max(0, totalWidth);
-  const left = Math.max(viewportPadding, Math.min(anchorLeft, maxLeft));
+  const maxLeft = boundsRight - viewportPadding - Math.max(0, horizontalClampWidth);
+  const left = Math.max(bounds.left + viewportPadding, Math.min(anchorLeft, maxLeft));
 
   return { renderUpward, top, left, maxHeight: effectiveMaxHeight };
 }
 
-/**
- * Calculate popup position based on terminal cursor.
- */
-export function calculatePopupPosition(
-  term: XTerm,
-  itemCount: number,
-): {
-  position: { x: number; y: number };
-  cursorLineTop: number;
-  cursorLineBottom: number;
+export interface AutocompleteViewportAnchor {
+  anchorLeft: number;
+  anchorTop: number;
+  anchorBottom: number;
   expandUpward: boolean;
-} {
-  const termElement = term.element;
-  if (!termElement) {
-    return {
-      position: { x: 0, y: 0 },
-      cursorLineTop: 0,
-      cursorLineBottom: 0,
-      expandUpward: false,
-    };
+}
+
+const ESTIMATED_ROW_HEIGHT_PX = 28;
+const POPUP_CHROME_PADDING_PX = 8;
+
+function estimatePopupHeight(itemCount: number): number {
+  return itemCount * ESTIMATED_ROW_HEIGHT_PX + POPUP_CHROME_PADDING_PX;
+}
+
+function shouldExpandAutocompleteUpward(
+  cursorY: number,
+  spaceBelowPx: number,
+  spaceAbovePx: number,
+  estimatedPopupHeight: number,
+): boolean {
+  if (spaceBelowPx >= estimatedPopupHeight) return false;
+  if (spaceAbovePx >= estimatedPopupHeight) return true;
+  return cursorY > 2 && spaceAbovePx >= spaceBelowPx;
+}
+
+/** Predicted cursor cell for popup anchoring (column within the row + row). */
+export type AutocompleteCursorCell = {
+  column: number;
+  row: number;
+};
+
+function clampAutocompleteViewportRow(row: number, termRows: number): number {
+  if (Number.isFinite(termRows) && termRows > 0) {
+    return Math.max(0, Math.min(row, termRows - 1));
+  }
+  return Math.max(0, row);
+}
+
+/** Absolute buffer index of the first physical row of the current wrapped line. */
+function resolveWrappedCommandStartAbsY(term: XTerm): number {
+  const buffer = term.buffer.active;
+  let startAbsY = buffer.cursorY + buffer.baseY;
+  let startLine = buffer.getLine(startAbsY);
+  while (startLine?.isWrapped && startAbsY > 0) {
+    startAbsY -= 1;
+    startLine = buffer.getLine(startAbsY);
+  }
+  return startAbsY;
+}
+
+/**
+ * Viewport row of the command start (prompt / first physical line). After a
+ * wrap at the bottom, xterm keeps the cursor on `term.rows - 1` and scrolls;
+ * this row moves up with the wrapped command so the popup cannot cover it.
+ */
+export function resolveAutocompleteCommandStartRow(term: XTerm): number {
+  const buffer = term.buffer.active;
+  const startAbsY = resolveWrappedCommandStartAbsY(term);
+  const viewportOrigin = Number.isFinite(buffer.viewportY) ? buffer.viewportY : buffer.baseY;
+  return clampAutocompleteViewportRow(startAbsY - viewportOrigin, Number(term.rows));
+}
+
+/**
+ * Best-effort cursor cell for popup anchoring. xterm's helper textarea and
+ * buffer.cursorX can lag behind the keystroke that triggered completion, so
+ * derive the column from the aligned prompt and wrap onto following rows when
+ * unechoed wide input crosses `term.cols`.
+ *
+ * When the live cursor already sits on a soft-wrapped continuation row,
+ * measure from the logical line start so a still-unechoed `userInput` suffix
+ * advances past the partial wrap instead of anchoring at the lagged cell.
+ *
+ * A wrap past the last visible row scrolls the buffer; xterm keeps the cursor
+ * on `term.rows - 1`. Clamp the predicted row so a completion that resolves
+ * before that scroll does not place the popup one cell below the grid.
+ */
+export function resolveAutocompleteCursorCell(
+  term: XTerm,
+  prompt: Pick<PromptDetectionResult, "promptText" | "userInput">,
+): AutocompleteCursorCell {
+  const buffer = term.buffer.active;
+  const cols = Math.max(1, Number(term.cols) || 80);
+  const termRows = Number(term.rows);
+  const absY = buffer.cursorY + buffer.baseY;
+
+  const startAbsY = resolveWrappedCommandStartAbsY(term);
+  const startRowY = startAbsY - buffer.baseY;
+
+  let fromLine = (buffer.cursorY - startRowY) * cols + buffer.cursorX;
+  const cursorLine = buffer.getLine(absY);
+  if (cursorLine) {
+    const lineText = cursorLine.translateToString(false);
+    const tail = lineText.substring(buffer.cursorX).trimEnd();
+    if (tail.length === 0) {
+      const endCol = Math.max(buffer.cursorX, lineText.trimEnd().length);
+      fromLine = (buffer.cursorY - startRowY) * cols + endCol;
+    }
   }
 
-  const dims = getXTermCellDimensions(term);
-  const buffer = term.buffer.active;
-  const cursorX = buffer.cursorX;
-  const cursorY = buffer.cursorY;
-  const cursorLineTop = cursorY * dims.height;
-  const cursorLineBottom = (cursorY + 1) * dims.height;
+  // Use xterm's active Unicode width so CJK / emoji / fullwidth glyphs in
+  // the synthetic pre-echo userInput advance the popup with the same cell
+  // count as the real cursor (#2813).
+  const fromPrompt =
+    stringCellWidth(prompt.promptText, term) + stringCellWidth(prompt.userInput, term);
+  const rawColumn = Math.max(fromLine, fromPrompt);
+  const predictedRow = Math.max(0, startRowY + Math.floor(rawColumn / cols));
+  // Only clamp when the terminal reports a real viewport height; missing
+  // `rows` (tests/mocks) must not collapse every wrap onto row 0.
+  return {
+    column: rawColumn % cols,
+    row: clampAutocompleteViewportRow(predictedRow, termRows),
+  };
+}
 
-  const estimatedPopupHeight = itemCount * 28 + 8;
-  const totalRows = term.rows;
-  const spaceBelow = (totalRows - cursorY - 1) * dims.height;
-  const expandUpward = spaceBelow < estimatedPopupHeight && cursorY > 2;
+/** Column-only helper for callers that do not need the predicted wrap row. */
+export function resolveAutocompleteCursorColumn(
+  term: XTerm,
+  prompt: Pick<PromptDetectionResult, "promptText" | "userInput">,
+): number {
+  return resolveAutocompleteCursorCell(term, prompt).column;
+}
 
-  if (expandUpward) {
+/** Clamp autocomplete popups to the active terminal screen in split workspaces.
+ *
+ * Uses the visible `.xterm-screen` rect as the clamp boundary so the popup
+ * never overflows the *actual* rendered terminal grid. The `.xterm-container`
+ * can be a few pixels taller than the screen (rounding/padding), so falling
+ * back to its rect produced a false positive `spaceBelow` at the bottom row
+ * and caused short suggestion lists to flip downward below the visible area
+ * (see issue #1710).
+ */
+export function resolveAutocompleteClampViewport(container: HTMLElement | null): PopupClampViewport {
+  const pane = container?.closest<HTMLElement>('[data-section="terminal-split-pane"]');
+  const screen = container?.querySelector<HTMLElement>(".xterm-screen")
+    ?? null;
+  // Clamp to the rendered screen so the popup cannot spill past the visible
+  // terminal rows. If the screen is not mounted yet, fall back to the split
+  // pane/container rect or the full viewport.
+  const rect = screen?.getBoundingClientRect()
+    ?? pane?.getBoundingClientRect()
+    ?? container?.getBoundingClientRect();
+  if (rect && rect.width > 0 && rect.height > 0) {
     return {
-      position: { x: cursorX * dims.width, y: cursorY * dims.height },
-      cursorLineTop,
-      cursorLineBottom,
-      expandUpward: true,
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
     };
   }
 
   return {
-    position: { x: cursorX * dims.width, y: (cursorY + 1) * dims.height + 4 },
-    cursorLineTop,
-    cursorLineBottom,
+    left: 0,
+    top: 0,
+    width: typeof window !== "undefined" ? window.innerWidth : 1200,
+    height: typeof window !== "undefined" ? window.innerHeight : 800,
+  };
+}
+
+/**
+ * Resolve the autocomplete anchor in viewport coordinates so split panes and
+ * padded xterm screens stay aligned with the real cursor.
+ *
+ * When `commandStartRow` is above `cursorRow` (a wrapped command), an
+ * upward popup pins to the start row so it cannot cover the first physical
+ * line after a wrap-induced scroll (#3061). Downward popups still pin to
+ * the cursor row so they sit below the whole command.
+ */
+export function resolveAutocompleteAnchorInViewport(
+  term: XTerm,
+  container: HTMLElement | null,
+  itemCount: number,
+  cursorColumn = term.buffer.active.cursorX,
+  cursorRow = term.buffer.active.cursorY,
+  commandStartRow = cursorRow,
+): AutocompleteViewportAnchor {
+  const empty: AutocompleteViewportAnchor = {
+    anchorLeft: 0,
+    anchorTop: 0,
+    anchorBottom: 0,
     expandUpward: false,
   };
+  if (!container || !term.element) return empty;
+
+  const rows = Math.max(1, term.rows);
+  const estimatedPopupHeight = estimatePopupHeight(itemCount);
+  const dims = getXTermCellDimensions(term);
+
+  const screen =
+    container.querySelector<HTMLElement>(".xterm-screen")
+    ?? term.element.querySelector<HTMLElement>(".xterm-screen")
+    ?? container;
+  const screenRect = screen.getBoundingClientRect();
+  const upwardRow = Math.min(commandStartRow, cursorRow);
+  const downwardRow = Math.max(commandStartRow, cursorRow);
+  const spaceBelow = Math.max(0, (rows - downwardRow - 1) * dims.height);
+  const spaceAbove = Math.max(0, upwardRow * dims.height);
+  const expandUpward = shouldExpandAutocompleteUpward(
+    downwardRow,
+    spaceBelow,
+    spaceAbove,
+    estimatedPopupHeight,
+  );
+  const anchorRow = expandUpward ? upwardRow : downwardRow;
+  const anchorLeft = screenRect.left + cursorColumn * dims.width;
+  const anchorTop = screenRect.top + anchorRow * dims.height;
+  const anchorBottom = screenRect.top + (anchorRow + 1) * dims.height;
+
+  return {
+    anchorLeft,
+    anchorTop,
+    anchorBottom,
+    expandUpward,
+  };
+}
+
+/** Popup viewport anchor using the live wrapped command-start row (#3061). */
+export function resolveAutocompletePopupAnchorInViewport(
+  term: XTerm,
+  container: HTMLElement | null,
+  itemCount: number,
+  cursorColumn: number,
+  cursorRow: number,
+): AutocompleteViewportAnchor {
+  return resolveAutocompleteAnchorInViewport(
+    term,
+    container,
+    itemCount,
+    cursorColumn,
+    cursorRow,
+    resolveAutocompleteCommandStartRow(term),
+  );
+}
+
+/**
+ * Next stored popup viewport when the command-start / cursor anchor moves.
+ * Returns `prev` when nothing changed so callers can skip a React update.
+ */
+export function nextAutocompletePopupAnchorViewport(
+  prev: { left: number; top: number; bottom: number },
+  expandUpward: boolean,
+  anchor: AutocompleteViewportAnchor,
+): { viewport: { left: number; top: number; bottom: number }; expandUpward: boolean } | null {
+  const viewport = {
+    left: anchor.anchorLeft,
+    top: anchor.anchorTop,
+    bottom: anchor.anchorBottom,
+  };
+  if (
+    prev.left === viewport.left
+    && prev.top === viewport.top
+    && prev.bottom === viewport.bottom
+    && expandUpward === anchor.expandUpward
+  ) {
+    return null;
+  }
+  return { viewport, expandUpward: anchor.expandUpward };
 }

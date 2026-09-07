@@ -19,8 +19,40 @@ interface TerminalAutocompleteKeyEventContext {
   handleSubDirSelect: (level: number, entry: SubDirEntry) => void;
   fetchSubDirForIndex: (index: number) => void;
   renderPreviewSelection: (index: number) => void;
-  acceptSnippet: (snippet: Snippet) => void;
+  acceptPreviewlessSelection: (index: number) => boolean;
+  acceptSnippet: (snippet: Snippet) => boolean;
+  /** Deadline (ms) until which `.` / `_` are treated as readline Meta follow-ups. */
+  escMetaPrefixUntilRef: MutableRefObject<number>;
+  now?: () => number;
 }
+
+/** Readline keyseq-timeout default; Esc then . within this window is M-. */
+export const AUTOCOMPLETE_ESC_META_TIMEOUT_MS = 500;
+
+export function autocompleteEscMetaFollowUpSequence(e: {
+  key: string;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}): string | null {
+  if (e.altKey || e.ctrlKey || e.metaKey) return null;
+  // `_` is Shift+Minus on a standard keyboard; Shift+. is `>` and must not yank.
+  if (e.key === "." && !e.shiftKey) return "\x1b.";
+  if (e.key === "_") return "\x1b_";
+  return null;
+}
+
+const isAutocompleteConfirmEnter = (
+  e: KeyboardEvent,
+  settings: AutocompleteSettings,
+): boolean => (
+  e.key === "Enter" &&
+  !e.ctrlKey &&
+  !e.metaKey &&
+  !e.altKey &&
+  (!e.shiftKey || settings.shiftEnterNewlineEnabled === false)
+);
 
 export function handleTerminalAutocompleteKeyEvent(
   e: KeyboardEvent,
@@ -42,9 +74,28 @@ export function handleTerminalAutocompleteKeyEvent(
     handleSubDirSelect,
     fetchSubDirForIndex,
     renderPreviewSelection,
+    acceptPreviewlessSelection,
     acceptSnippet,
+    escMetaPrefixUntilRef,
+    now = Date.now,
   } = context;
   if (!settingsRef.current.enabled || e.type !== "keydown") return true;
+
+  const metaFollowUp = autocompleteEscMetaFollowUpSequence(e);
+  if (metaFollowUp && now() < escMetaPrefixUntilRef.current) {
+    escMetaPrefixUntilRef.current = 0;
+    e.preventDefault();
+    writeToTerminal(metaFollowUp);
+    // Match handleTerminalAutocompleteInput's ESC-sequence path: yank-last-arg
+    // rewrites the shell line, so the append-only typed buffer is stale.
+    typedInputBufferRef.current = "";
+    typedBufferReliableRef.current = false;
+    lastAcceptedCommandRef.current = null;
+    return false;
+  }
+  if (e.key !== "Escape" && e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
+    escMetaPrefixUntilRef.current = 0;
+  }
 
   const s = stateRef.current;
   const ghost = ghostAddonRef.current;
@@ -203,7 +254,7 @@ export function handleTerminalAutocompleteKeyEvent(
         });
         // Live-render the highlighted entry's full path into the line (#1005).
         const newEntry = focusedPanel.entries[newIdx];
-        if (newEntry) renderSubDirPath(focusLevel, newEntry);
+        if (newEntry && settingsRef.current.livePreview) renderSubDirPath(focusLevel, newEntry);
         // Auto-expand next level if the newly selected item is a directory
         if (newEntry?.type === "directory") {
           expandSubDir(focusLevel, newEntry);
@@ -227,7 +278,7 @@ export function handleTerminalAutocompleteKeyEvent(
           return false;
         }
       }
-      if (e.key === "Enter" || e.key === "Tab") {
+      if (isAutocompleteConfirmEnter(e, settingsRef.current) || e.key === "Tab") {
         const entry = focusedPanel.entries[focusedPanel.selectedIndex];
         if (entry && focusedPanel.selectedIndex >= 0) {
           e.preventDefault();
@@ -276,7 +327,7 @@ export function handleTerminalAutocompleteKeyEvent(
         selectedIndex: next,
         subDirPanels: [], subDirFocusLevel: -1,
       }));
-      renderPreviewSelection(next);
+      if (settingsRef.current.livePreview) renderPreviewSelection(next);
       if (next >= 0) fetchSubDirForIndex(next);
       return false;
     }
@@ -287,13 +338,27 @@ export function handleTerminalAutocompleteKeyEvent(
     // lastAcceptedCommandRef (set on select) but falls back to the live
     // buffer when the user edited the previewed command (typing nulls that
     // ref), so recording stays accurate in both cases.
-    if (e.key === "Enter") {
+    if (isAutocompleteConfirmEnter(e, settingsRef.current)) {
       const selected = s.selectedIndex >= 0 ? s.suggestions[s.selectedIndex] : null;
       if (selected?.source === "snippet" && selected.snippet) {
+        if (!acceptSnippet(selected.snippet)) {
+          clearState();
+          previewActiveRef.current = false;
+          return true;
+        }
         e.preventDefault();
         previewActiveRef.current = false;
-        acceptSnippet(selected.snippet);
         return false; // consume — run the snippet, not the typed text
+      }
+      if (!settingsRef.current.livePreview && selected) {
+        if (acceptPreviewlessSelection(s.selectedIndex)) {
+          e.preventDefault();
+          previewActiveRef.current = false;
+          return false;
+        }
+        clearState();
+        previewActiveRef.current = false;
+        return true;
       }
       clearState();
       previewActiveRef.current = false;
@@ -301,9 +366,11 @@ export function handleTerminalAutocompleteKeyEvent(
     }
   }
 
-  // Escape: close popup and hide ghost text
+  // Escape: close popup and hide ghost text.
   // Only consume Escape if popup is visible; don't block Escape for vi-mode shells
-  // when only ghost text is showing (ghost text is passive/non-intrusive)
+  // when only ghost text is showing (ghost text is passive/non-intrusive).
+  // After dismissing the popup, arm a short Meta prefix so Esc+. / Esc+_ still
+  // reach readline yank-last-arg (issue #2364) without entering vi-cmd mode.
   if (e.key === "Escape" && s.popupVisible) {
     e.preventDefault();
     if (previewActiveRef.current) {
@@ -312,6 +379,7 @@ export function handleTerminalAutocompleteKeyEvent(
     ghost?.hide();
     clearState();
     previewActiveRef.current = false;
+    escMetaPrefixUntilRef.current = now() + AUTOCOMPLETE_ESC_META_TIMEOUT_MS;
     return false;
   }
 

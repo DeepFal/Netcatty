@@ -1,10 +1,57 @@
-import type { SerialConfig } from './connection';
+import type { HostProtocol, PluginConnectionConfig, SerialConfig, Snippet } from './connection';
+import type { CodingCliProviderId } from '../codingCliProviders';
+import {
+  normalizeHibernateHiddenTabsDelaySec,
+  normalizeHibernateKeepRendererCount,
+  normalizeHibernateReplayChunkBytes,
+} from '../terminalHibernate';
+import {
+  normalizeInlineImageMaxMegapixels,
+  normalizeInlineImageSequenceLimitMb,
+  normalizeInlineImageStorageLimitMb,
+  TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_DEFAULT,
+  TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_DEFAULT,
+  TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_DEFAULT,
+} from '../terminalInlineImages';
 
 // Terminal appearance settings
 export type CursorShape = 'block' | 'bar' | 'underline';
-export type RightClickBehavior = 'context-menu' | 'paste' | 'select-word';
+export type TerminalMouseClickBehavior = 'context-menu' | 'paste' | 'select-word';
+export type RightClickBehavior = TerminalMouseClickBehavior;
+export type MiddleClickBehavior = 'context-menu' | 'paste' | 'disabled';
 export type LinkModifier = 'none' | 'ctrl' | 'alt' | 'meta';
 export type TerminalEmulationType = 'xterm-256color' | 'xterm-16color' | 'xterm';
+export type DynamicTabTitleMode = 'off' | 'agent' | 'all';
+/**
+ * What the terminal host info bar shows as its primary title (#2708).
+ * - address: user@host:port when available (historical default)
+ * - label: vault host label / display name
+ */
+export type HostInfoBarTitleMode = 'address' | 'label';
+/**
+ * How to assist when a sudo/su password prompt appears (#2156).
+ * - off: no assist
+ * - hint: ghost "press Enter" fill of the host session password
+ * - picker: WindTerm-like list of host + keychain password identities
+ */
+export type PasswordPromptAssistMode = 'off' | 'hint' | 'picker';
+/**
+ * Which command-history pool autocomplete suggestions draw from (#2595).
+ * - host: only the current host's recorded commands (default; avoids cross-device noise)
+ * - global: commands recorded across all hosts
+ */
+export type AutocompleteHistoryScope = 'host' | 'global';
+/**
+ * When remote programs emit OSC 9 / 777 / 99 desktop-notification sequences.
+ * - off: ignore
+ * - unfocused: notify only when this session is not the focused pane or the window is in the background
+ * - always: honor every notification (default; matches iTerm2 / Ghostty / Codex osc9)
+ */
+export type OscNotificationMode = 'off' | 'unfocused' | 'always';
+/** How an established terminal session reports a later disconnect. */
+export type DisconnectedNoticeMode = 'terminal' | 'dialog';
+
+export const DEFAULT_TERMINAL_WORD_SEPARATORS = ' ()[]{}\'"';
 
 // Keyword highlighting configuration
 export interface KeywordHighlightRule {
@@ -29,6 +76,7 @@ export interface TerminalSettings {
 
   // Font
   fontLigatures: boolean; // Enable font ligatures
+  fontSmoothing: boolean; // Use native macOS/WebKit font anti-aliasing
   fontWeight: number; // Normal font weight (100-900)
   fontWeightBold: number; // Bold font weight (100-900)
   linePadding: number; // Additional space between lines
@@ -37,6 +85,8 @@ export interface TerminalSettings {
   // Cursor
   cursorShape: CursorShape;
   cursorBlink: boolean;
+  /** Highlight the buffer row under the cursor (WindTerm-style decoration). */
+  highlightCursorLine: boolean;
 
   // Accessibility
   minimumContrastRatio: number; // Minimum contrast ratio (1-21)
@@ -44,6 +94,9 @@ export interface TerminalSettings {
   // Keyboard
   altAsMeta: boolean; // Use ⌥ as the Meta key
   optionArrowWordJump: boolean; // macOS: Option+←/→ send Meta-b/f for word jump
+  shiftEnterNewlineEnabled: boolean; // Send configured text on Shift+Enter
+  shiftEnterNewlineText: string; // Backslash-escaped text sent by Shift+Enter
+  kittyKeyboardProtocolEnabled: boolean; // Enable Kitty keyboard protocol support
   scrollOnInput: boolean; // Scroll terminal to bottom on input
   scrollOnOutput: boolean; // Scroll terminal to bottom on output
   scrollOnKeyPress: boolean; // Scroll terminal to bottom on key press
@@ -53,10 +106,21 @@ export interface TerminalSettings {
 
   // Mouse
   rightClickBehavior: RightClickBehavior;
+  // Show the app context menu even when a fullscreen app (tmux/vim) holds mouse tracking
+  showContextMenuOverFullscreenApps: boolean;
+  middleClickBehavior: MiddleClickBehavior;
   copyOnSelect: boolean; // Automatically copy selected text
-  middleClickPaste: boolean; // Paste on middle-click
+  /**
+   * When true, terminal copy paths strip display-padding spaces and join
+   * soft-wrapped rows before writing the clipboard. When false, use raw
+   * xterm getSelection() (screen-cell layout as-is).
+   */
+  normalizeTextOnCopy: boolean;
+  middleClickPaste: boolean; // Legacy mirror for older settings payloads
   wordSeparators: string; // Characters for word selection
   linkModifier: LinkModifier; // Modifier key to click links
+  autoCloseOnExit: boolean; // Automatically close terminal UI after eligible session exits
+  disconnectedNoticeMode: DisconnectedNoticeMode; // Non-blocking terminal line or legacy dialog after disconnect
 
   // Keyword Highlighting
   keywordHighlightEnabled: boolean;
@@ -68,8 +132,10 @@ export interface TerminalSettings {
   localStartDir: string; // Starting directory for local terminal (empty = home directory)
 
   // SSH Connection
+  verifyHostKeys: boolean; // Verify SSH host keys before authenticating
   keepaliveInterval: number; // Seconds between SSH-level keepalive packets (0 = disabled)
   keepaliveCountMax: number; // Unanswered keepalives before declaring the connection dead
+  sshAutoReconnectEnabled: boolean; // Automatically reconnect SSH sessions after unexpected disconnects
   x11Display: string; // Optional local X11 DISPLAY override (empty = use system DISPLAY/default)
 
   // Mosh Connection
@@ -78,11 +144,25 @@ export interface TerminalSettings {
   moshClientPath: string;
 
   // Server Stats Display (Linux only)
+  showHostInfoBar: boolean; // Show host identity and server stats above the terminal
+  /** Primary title in the host info bar: connection address or vault label. */
+  hostInfoBarTitleMode: HostInfoBarTitleMode;
   showServerStats: boolean; // Show CPU/Memory/Disk in terminal statusbar
   serverStatsRefreshInterval: number; // Seconds between stats refresh (default: 30)
 
+  // System Manager side panel polling (seconds)
+  systemManagerProcessRefreshInterval: number;
+  systemManagerTmuxRefreshInterval: number;
+  systemManagerDockerListRefreshInterval: number;
+  systemManagerDockerStatsRefreshInterval: number;
+
   // Paste
   disableBracketedPaste: boolean; // Disable bracketed paste mode (avoid ^[[200~ artifacts)
+
+  // When true, pasting while the clipboard holds an image automatically runs
+  // the "Upload clipboard image" action (SFTP upload + remote-path paste)
+  // instead of falling back to a text paste. Remote SSH sessions only.
+  autoUploadClipboardImageOnPaste: boolean;
 
   // Shell `clear` command behavior — controls whether CSI 3 J (erase scrollback)
   // from the shell is honored. Default true matches POSIX/ncurses since 2013:
@@ -104,8 +184,41 @@ export interface TerminalSettings {
   // Clipboard
   osc52Clipboard: 'off' | 'write-only' | 'read-write' | 'prompt'; // OSC-52 clipboard access: off, write-only (default), read-write, or prompt on read
 
+  // Desktop notifications from OSC 9 / OSC 777 notify / OSC 99
+  oscNotifications: OscNotificationMode;
+
+  // Tab titles
+  dynamicTabTitleMode: DynamicTabTitleMode; // off, agent-only, or all shell-reported titles
+
   // Rendering
   rendererType: 'auto' | 'webgl' | 'dom'; // Terminal renderer: auto (detect based on hardware), webgl, or dom
+  /** Dispose xterm for hidden tabs after a delay to save renderer memory; SSH stays connected. */
+  hibernateHiddenTabs: boolean;
+  /** Seconds after a tab leaves view before hibernating (see hibernateHiddenTabs). */
+  hibernateHiddenTabsDelaySec: number;
+  /** Skip full hibernate while a full-screen TUI owns the alternate screen buffer. */
+  hibernateSkipAltScreen: boolean;
+  /** Hidden tabs whose renderer is kept alive (WebGL suspended) before full hibernate. */
+  hibernateKeepRendererCount: number;
+  /** Bytes per animation frame when replaying hibernate snapshots in the renderer. */
+  hibernateReplayChunkBytes: number;
+  /** Prefer WASM terminal serialize when available (falls back to JS). */
+  hibernatePreferWasmSerialize: boolean;
+  /** Render inline raster images (Kitty graphics / SIXEL / iTerm IIP) emitted by remote programs. */
+  inlineImagesEnabled: boolean;
+  /** Kitty graphics protocol (APC G) support; requires inlineImagesEnabled. */
+  inlineImageKittyEnabled: boolean;
+  /** SIXEL (DCS q) support; requires inlineImagesEnabled. */
+  inlineImageSixelEnabled: boolean;
+  /** iTerm inline image protocol (OSC 1337 File=) support; requires inlineImagesEnabled. */
+  inlineImageIipEnabled: boolean;
+  /** Per-terminal inline image cache size in MB (FIFO eviction). */
+  inlineImageStorageLimitMb: number;
+  /** Largest single decoded inline image, in megapixels. */
+  inlineImageMaxMegapixels: number;
+  /** Largest single inline image escape sequence, in MB, before decoding. */
+  inlineImageSequenceLimitMb: number;
+  showLineTimestamps: boolean; // Show output timestamps in a side gutter
 
   // Autocomplete
   autocompleteEnabled: boolean; // Enable terminal command autocomplete
@@ -114,6 +227,14 @@ export interface TerminalSettings {
   autocompleteDebounceMs: number; // Debounce delay for fetching suggestions (ms)
   autocompleteMinChars: number; // Minimum characters before showing suggestions
   autocompleteMaxSuggestions: number; // Maximum suggestions in popup menu
+  /** Scope for history-backed autocomplete suggestions (host vs all hosts). */
+  autocompleteHistoryScope: AutocompleteHistoryScope;
+
+  /**
+   * Assist for sudo/su password prompts: off, quick Enter-to-paste (hint),
+   * or multi-credential picker. Default hint preserves historical sudo UX.
+   */
+  passwordPromptAssist: PasswordPromptAssistMode;
 }
 
 const STRICT_IPV4_OCTET_PATTERN = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)';
@@ -206,12 +327,97 @@ const normalizeKeywordHighlightRules = (
   return normalizedRules;
 };
 
+const isMiddleClickBehavior = (value: unknown): value is MiddleClickBehavior => (
+  value === 'context-menu' ||
+  value === 'paste' ||
+  value === 'disabled'
+);
+
+const resolveMiddleClickBehavior = (
+  settings?: Partial<TerminalSettings> | null,
+): MiddleClickBehavior => {
+  if (isMiddleClickBehavior(settings?.middleClickBehavior)) {
+    return settings.middleClickBehavior;
+  }
+
+  if (
+    settings &&
+    Object.prototype.hasOwnProperty.call(settings, 'middleClickPaste') &&
+    settings.middleClickPaste === false
+  ) {
+    return 'disabled';
+  }
+
+  return DEFAULT_TERMINAL_SETTINGS.middleClickBehavior;
+};
+
+const isDynamicTabTitleMode = (value: unknown): value is DynamicTabTitleMode => (
+  value === 'off' ||
+  value === 'agent' ||
+  value === 'all'
+);
+
+const isHostInfoBarTitleMode = (value: unknown): value is HostInfoBarTitleMode => (
+  value === 'address' ||
+  value === 'label'
+);
+
+const isPasswordPromptAssistMode = (value: unknown): value is PasswordPromptAssistMode => (
+  value === 'off' ||
+  value === 'hint' ||
+  value === 'picker'
+);
+
+const isAutocompleteHistoryScope = (value: unknown): value is AutocompleteHistoryScope => (
+  value === 'host' ||
+  value === 'global'
+);
+
+const isOscNotificationMode = (value: unknown): value is OscNotificationMode => (
+  value === 'off' ||
+  value === 'unfocused' ||
+  value === 'always'
+);
+
+const isDisconnectedNoticeMode = (value: unknown): value is DisconnectedNoticeMode => (
+  value === 'terminal' || value === 'dialog'
+);
+
 export const normalizeTerminalSettings = (
   settings?: Partial<TerminalSettings> | null,
 ): TerminalSettings => {
+  const middleClickBehavior = resolveMiddleClickBehavior(settings);
+  const wordSeparators = typeof settings?.wordSeparators === 'string'
+    ? settings.wordSeparators
+    : DEFAULT_TERMINAL_SETTINGS.wordSeparators;
+  const shiftEnterNewlineText = typeof settings?.shiftEnterNewlineText === 'string'
+    ? settings.shiftEnterNewlineText
+    : DEFAULT_TERMINAL_SETTINGS.shiftEnterNewlineText;
   const mergedSettings = {
     ...DEFAULT_TERMINAL_SETTINGS,
     ...(settings ?? {}),
+    middleClickBehavior,
+    middleClickPaste: middleClickBehavior === 'paste',
+    wordSeparators,
+    shiftEnterNewlineText,
+    dynamicTabTitleMode: isDynamicTabTitleMode(settings?.dynamicTabTitleMode)
+      ? settings.dynamicTabTitleMode
+      : DEFAULT_TERMINAL_SETTINGS.dynamicTabTitleMode,
+    hostInfoBarTitleMode: isHostInfoBarTitleMode(settings?.hostInfoBarTitleMode)
+      ? settings.hostInfoBarTitleMode
+      : DEFAULT_TERMINAL_SETTINGS.hostInfoBarTitleMode,
+    passwordPromptAssist: isPasswordPromptAssistMode(settings?.passwordPromptAssist)
+      ? settings.passwordPromptAssist
+      : DEFAULT_TERMINAL_SETTINGS.passwordPromptAssist,
+    autocompleteHistoryScope: isAutocompleteHistoryScope(settings?.autocompleteHistoryScope)
+      ? settings.autocompleteHistoryScope
+      : DEFAULT_TERMINAL_SETTINGS.autocompleteHistoryScope,
+    oscNotifications: isOscNotificationMode(settings?.oscNotifications)
+      ? settings.oscNotifications
+      : DEFAULT_TERMINAL_SETTINGS.oscNotifications,
+    disconnectedNoticeMode: isDisconnectedNoticeMode(settings?.disconnectedNoticeMode)
+      ? settings.disconnectedNoticeMode
+      : DEFAULT_TERMINAL_SETTINGS.disconnectedNoticeMode,
   };
 
   // Migrate legacy 'canvas' renderer to 'dom' (canvas removed in xterm.js 6.0)
@@ -219,9 +425,34 @@ export const normalizeTerminalSettings = (
     ? 'dom' as const
     : mergedSettings.rendererType;
 
+  // Persisted installs wrote the old default (8) into localStorage with no UI
+  // to change it; bump that sentinel to the new default while keeping custom caps.
+  const autocompleteMaxSuggestions = mergedSettings.autocompleteMaxSuggestions === 8
+    ? DEFAULT_TERMINAL_SETTINGS.autocompleteMaxSuggestions
+    : mergedSettings.autocompleteMaxSuggestions;
+
   return {
     ...mergedSettings,
     rendererType,
+    autocompleteMaxSuggestions,
+    hibernateHiddenTabsDelaySec: normalizeHibernateHiddenTabsDelaySec(
+      mergedSettings.hibernateHiddenTabsDelaySec,
+    ),
+    hibernateKeepRendererCount: normalizeHibernateKeepRendererCount(
+      mergedSettings.hibernateKeepRendererCount,
+    ),
+    hibernateReplayChunkBytes: normalizeHibernateReplayChunkBytes(
+      mergedSettings.hibernateReplayChunkBytes,
+    ),
+    inlineImageStorageLimitMb: normalizeInlineImageStorageLimitMb(
+      mergedSettings.inlineImageStorageLimitMb,
+    ),
+    inlineImageMaxMegapixels: normalizeInlineImageMaxMegapixels(
+      mergedSettings.inlineImageMaxMegapixels,
+    ),
+    inlineImageSequenceLimitMb: normalizeInlineImageSequenceLimitMb(
+      mergedSettings.inlineImageSequenceLimitMb,
+    ),
     autocompleteGhostText: mergedSettings.autocompletePopupMenu
       ? false
       : mergedSettings.autocompleteGhostText,
@@ -231,31 +462,45 @@ export const normalizeTerminalSettings = (
   };
 };
 
+/** Default scrollback rows for new installs (VS Code uses 1000; we keep a modest headroom). */
+export const DEFAULT_TERMINAL_SCROLLBACK = 3000;
+
 const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
-  scrollback: 10000,
+  scrollback: DEFAULT_TERMINAL_SCROLLBACK,
   drawBoldInBrightColors: true,
   terminalEmulationType: 'xterm-256color',
   startupCommandDelayMs: 600,
   fontLigatures: true,
+  fontSmoothing: true,
   fontWeight: 400,
   fontWeightBold: 700,
   linePadding: 0,
   fallbackFont: '',
   cursorShape: 'block',
   cursorBlink: true,
+  highlightCursorLine: false,
   minimumContrastRatio: 1,
   altAsMeta: false,
   optionArrowWordJump: false,
+  shiftEnterNewlineEnabled: true,
+  shiftEnterNewlineText: '\\n',
+  kittyKeyboardProtocolEnabled: false,
   scrollOnInput: true,
   scrollOnOutput: false,
   scrollOnKeyPress: false,
   scrollOnPaste: true,
   smoothScrolling: false,
   rightClickBehavior: 'context-menu',
+  showContextMenuOverFullscreenApps: false,
+  middleClickBehavior: 'paste',
   copyOnSelect: false,
+  normalizeTextOnCopy: true, // Clean soft wraps + padding on copy (opt-out available)
   middleClickPaste: true,
-  wordSeparators: ' ()[]{}\'"',
+  wordSeparators: DEFAULT_TERMINAL_WORD_SEPARATORS,
   linkModifier: 'none',
+  autoCloseOnExit: true,
+  // Issue #3087: keep terminal history visible after an established session disconnects.
+  disconnectedNoticeMode: 'terminal',
   keywordHighlightEnabled: true,
   keywordHighlightRules: DEFAULT_KEYWORD_HIGHLIGHT_RULES,
   localShell: '', // Empty = use system default
@@ -266,24 +511,54 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   // before declaring the session dead (~5 min). Hosts whose SSH stack doesn't
   // reply to keepalive@openssh.com (older routers/switches) should set their
   // own per-host keepaliveOverride and dial these values down.
+  verifyHostKeys: true,
   keepaliveInterval: 30,
   keepaliveCountMax: 10,
+  sshAutoReconnectEnabled: false,
   x11Display: '', // Empty = use DISPLAY/default local X server
   moshClientPath: '', // Legacy mosh-client override; normal UI uses bundled mosh-client
+  showHostInfoBar: true, // Preserve the existing host information bar by default
+  hostInfoBarTitleMode: 'address', // Historical default: prefer user@host:port
   showServerStats: true, // Show server stats by default
   serverStatsRefreshInterval: 5, // Refresh every 5 seconds
+  systemManagerProcessRefreshInterval: 3,
+  systemManagerTmuxRefreshInterval: 3,
+  systemManagerDockerListRefreshInterval: 5,
+  systemManagerDockerStatsRefreshInterval: 3,
   disableBracketedPaste: false, // Bracketed paste enabled by default
+  autoUploadClipboardImageOnPaste: false, // Opt-in: image in clipboard auto-uploads on paste (remote sessions)
   clearWipesScrollback: true, // POSIX-standard: shell `clear` clears scrollback too
   preserveSelectionOnInput: false, // Opt-in: keep selection alive when typing
   forcePromptNewLine: false, // Opt-in: keep the next shell prompt visually separated from unterminated final output lines
   osc52Clipboard: 'write-only', // OSC-52: allow remote programs to write clipboard by default
+  oscNotifications: 'always', // Honor OSC 9/777/99 desktop notifications by default
+  dynamicTabTitleMode: 'agent',
   rendererType: 'auto', // Auto-detect best renderer based on hardware
+  hibernateHiddenTabs: false,
+  hibernateHiddenTabsDelaySec: 5,
+  hibernateSkipAltScreen: true,
+  hibernateKeepRendererCount: 2,
+  hibernateReplayChunkBytes: 16 * 1024,
+  hibernatePreferWasmSerialize: false,
+  // Opt-in: loading the image addon has bundle/parser cost, and sessions that
+  // have drawn images cannot full-hibernate. Protocols stay enabled so turning
+  // the master switch on is a single click.
+  inlineImagesEnabled: false,
+  inlineImageKittyEnabled: true,
+  inlineImageSixelEnabled: true,
+  inlineImageIipEnabled: true,
+  inlineImageStorageLimitMb: TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_DEFAULT,
+  inlineImageMaxMegapixels: TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_DEFAULT,
+  inlineImageSequenceLimitMb: TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_DEFAULT,
+  showLineTimestamps: false, // Opt-in: shows output timestamps beside terminal lines
   autocompleteEnabled: true, // Autocomplete enabled by default
   autocompleteGhostText: false, // Mutually exclusive with popup menu
   autocompletePopupMenu: true, // Popup menu enabled by default
   autocompleteDebounceMs: 100, // 100ms debounce
   autocompleteMinChars: 1, // Start suggesting after 1 character
-  autocompleteMaxSuggestions: 8, // Show up to 8 suggestions
+  autocompleteMaxSuggestions: 50, // Show up to 50 suggestions (popup scrolls)
+  autocompleteHistoryScope: 'host', // Per-host history suggestions by default (#2595)
+  passwordPromptAssist: 'hint', // Historical sudo confirm-to-fill; picker is opt-in (#2156)
 };
 
 export interface TerminalTheme {
@@ -323,12 +598,19 @@ export interface TerminalSession {
   hostname: string;
   status: 'connecting' | 'connected' | 'disconnected';
   workspaceId?: string;
+  /** Script to auto-run after connect (multi-host script runner). */
+  pendingScriptId?: string;
+  /** Snapshot used by "Run now" so unsaved editor changes run exactly as shown. */
+  pendingScript?: Snippet;
   startupCommand?: string; // Command to run after connection (for snippet runner)
   noAutoRun?: boolean;     // If true, paste command without auto-executing
+  multiLineRunMode?: Snippet['multiLineRunMode'];
   // Connection-time protocol overrides (used instead of looking up from hosts)
-  protocol?: 'ssh' | 'telnet' | 'local' | 'serial';
+  protocol?: HostProtocol;
+  pluginConnection?: PluginConnectionConfig;
   port?: number;
   moshEnabled?: boolean;
+  etEnabled?: boolean;
   shellType?: 'posix' | 'fish' | 'powershell' | 'cmd' | 'unknown';
   charset?: string; // Connection-time charset override (e.g. for quick-connect serial)
   // Serial-specific connection settings
@@ -337,11 +619,57 @@ export interface TerminalSession {
   localShellArgs?: string[]; // Shell args for local terminals (from discovery)
   localShellName?: string;   // Display name for local shell (e.g., "Zsh", "Ubuntu (WSL)")
   localShellIcon?: string;   // Icon identifier for local shell (e.g., "zsh", "ubuntu")
-  // For tabs created via "Copy Tab" on an SSH session: the id of the source
-  // session whose already-authenticated connection should be reused so the
-  // duplicate does not trigger a second MFA prompt (issue #1204). The bridge
-  // reuses the source connection when it is still live, otherwise it falls back
-  // to a fresh connection — so this also applies on reconnect: a reconnect
-  // reuses the source again if still connected, else dials fresh.
+  localStartDir?: string;    // Per-session starting directory for local terminals
+  // For sessions created from an existing SSH session: the id of the source
+  // session whose already-authenticated connection should be reused so the new
+  // shell channel does not trigger a second MFA prompt (issue #1204). The
+  // bridge reuses the source connection when it is still live, otherwise it
+  // falls back to a fresh connection — so this also applies on reconnect: a
+  // reconnect reuses the source again if still connected, else dials fresh.
   reuseConnectionFromSessionId?: string;
+  // Marker for "Duplicate Session" clones: never multiplex onto any live,
+  // parked, or in-flight pooled transport (including the source's own
+  // connection) — always dial a brand-new connection with fresh auth. The
+  // starter turns this into `reuseTransport: false` on every attempt.
+  requireFreshConnection?: boolean;
+  // Per-pane font size override (workspace splits only; not persisted to vault hosts).
+  fontSize?: number;
+  fontSizeOverride?: boolean;
+  /** User-assigned display name for this terminal session (overrides hostLabel in UI) */
+  customName?: string;
+  /** Runtime shell-reported window title (OSC 0/2), shown on tabs when enabled */
+  dynamicTitle?: string;
+  /** Sticky coding CLI provider detected from launch command or window title */
+  codingCliProviderId?: CodingCliProviderId;
+  /** Runtime marker for sessions reconstructed from startup restore. */
+  restoreState?: 'restored-disconnected';
+  /**
+   * Runtime marker for sessions backed by an in-memory-only host (e.g. a
+   * password deep link). Excluded from session restore persistence because
+   * the one-time credentials cannot survive a relaunch.
+   */
+  ephemeralHost?: boolean;
+  /**
+   * Runtime marker for sessions opened via MCP host_open while "silent
+   * sessions" is enabled. Hidden from the main window's tab bar (TopTabs,
+   * QuickSwitcher, orphan tab ordering) and excluded from session-restore
+   * persistence, but remains a fully live session reachable by terminal
+   * exec/sftp/session-close tools, and still visible in TrayPanel and the
+   * external MCP session list.
+   */
+  hiddenFromTabs?: boolean;
+  /** Runtime hint to auto-open a side panel once the session connects. */
+  autoOpenSidePanel?: 'sftp';
+  /** Latest known working directory captured from terminal cwd tracking. */
+  lastCwd?: string;
+  /**
+   * Transient one-shot: a directory a freshly-cloned/split REMOTE session
+   * should `cd` into on its first connect. Set by the clone factory when a
+   * copy/split inherits the source pane's cwd; the terminal's restore-cwd
+   * injection path applies it on connect, and it is cleared from the session as
+   * soon as a live cwd is tracked (see `updateSessionRestoreCwd`) so a later
+   * remount + reconnect does not re-inject a stale `cd`. Not persisted across
+   * relaunch. Local clones use `localStartDir` instead of this field.
+   */
+  pendingInitialCwd?: string;
 }

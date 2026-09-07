@@ -1,24 +1,50 @@
 const { ipcRenderer, contextBridge, webUtils } = require("electron");
 const os = require("node:os");
 const { randomUUID } = require("node:crypto");
+const { SessionTombstones } = require("./preload/sessionTombstones.cjs");
 const { createPreloadApi } = require("./preload/api.cjs");
+const {
+  clearTerminalDataBacklog,
+  clearTerminalDataSession,
+  createTerminalDataBacklog,
+  createTerminalDataDispatcher,
+  hasPluginPipelineIngress,
+  hasPluginPipelineIngressMarker,
+} = require("./preload/terminalDataBacklog.cjs");
+const {
+  createTerminalOutputPortRegistry,
+} = require("./preload/terminalOutputPorts.cjs");
+const {
+  createTerminalUrgentInputPortRegistry,
+} = require("./preload/terminalUrgentInputPorts.cjs");
+const {
+  mergeTerminalDataMeta,
+} = require("./preload/terminalDataMeta.cjs");
 
 const dataListeners = new Map();
+const displayDataListeners = new Map();
+const terminalDataBacklog = createTerminalDataBacklog();
+const closedTerminalDataSessions = new SessionTombstones();
 const exitListeners = new Map();
-const transferProgressListeners = new Map();
-const transferCompleteListeners = new Map();
-const transferErrorListeners = new Map();
-const transferCancelledListeners = new Map();
+const globalSftpTransferListeners = new Set();
+const pluginContributionsChangedListeners = new Set();
 const chainProgressListeners = new Map();
+const connectionReuseFallbackListeners = new Set();
 const zmodemListeners = new Map();
 const zmodemOverwriteListeners = new Map(); // sessionId -> Set<cb>
 const sftpConnectionProgressListeners = new Set();
 const authFailedListeners = new Map();
 const telnetAutoLoginCompleteListeners = new Map();
 const telnetAutoLoginCancelledListeners = new Map();
+const telnetEchoModeListeners = new Map();
+const moshSessionReadyListeners = new Map();
 const languageChangeListeners = new Set();
 const fullscreenChangeListeners = new Set();
+const windowShownListeners = new Set();
+const windowFocusRequestedListeners = new Set();
+const windowWillHideListeners = new Set();
 const keyboardInteractiveListeners = new Set();
+const keyboardInteractiveCancelledListeners = new Set();
 const hostKeyVerificationListeners = new Set();
 const passphraseListeners = new Set();
 const passphraseTimeoutListeners = new Set();
@@ -30,12 +56,32 @@ const updateAvailableListeners = new Set();
 const updateNotAvailableListeners = new Set();
 const updateErrorListeners = new Set();
 const updateNeedsSaveListeners = new Set();
+const terminalPopupConfigState = {
+  pending: null,
+  // Keep the last delivered payload so StrictMode remount (unsubscribe →
+  // resubscribe) can replay config after the one-shot pending slot was drained.
+  lastPayload: null,
+  listeners: new Set(),
+};
 
-function cleanupTransferListeners(transferId) {
-  transferProgressListeners.delete(transferId);
-  transferCompleteListeners.delete(transferId);
-  transferErrorListeners.delete(transferId);
-  transferCancelledListeners.delete(transferId);
+function dispatchGlobalSftpTransferEvent(payload) {
+  for (const cb of globalSftpTransferListeners) {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Global SFTP transfer callback failed", err);
+    }
+  }
+}
+
+function dispatchPluginContributionsChanged(payload) {
+  for (const cb of pluginContributionsChangedListeners) {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Plugin contributions callback failed", err);
+    }
+  }
 }
 
 // ── MCP marker filter with per-session line buffering ──
@@ -45,7 +91,49 @@ function cleanupTransferListeners(transferId) {
 // chunk, then filter complete lines that contain the marker.
 
 const _mcpLineBufs = new Map(); // sessionId -> trailing fragment string
+const _mcpLineMetas = new Map(); // sessionId -> trailing fragment metadata
+const _mcpPendingMetas = new Map(); // sessionId -> metadata from filtered-empty chunks
 const _mcpFlushTimers = new Map(); // sessionId -> delayed-flush timer
+const _mcpDroppingWrappedLine = new Set(); // sessionIds with a split marker echo line in progress
+const _mcpProbePrompts = new Map(); // sessionId -> probe marker awaiting its command
+const _mcpAbortedProbes = new Map(); // sessionId -> bounded set of cancelled probe markers
+const MAX_MCP_BUFFERED_LINE_CHARS = 64 * 1024;
+
+function clearMcpSessionState(sessionId) {
+  if (!sessionId) return;
+  const pendingTimer = _mcpFlushTimers.get(sessionId);
+  if (pendingTimer) clearTimeout(pendingTimer);
+  _mcpFlushTimers.delete(sessionId);
+  _mcpLineBufs.delete(sessionId);
+  _mcpLineMetas.delete(sessionId);
+  _mcpPendingMetas.delete(sessionId);
+  _mcpDroppingWrappedLine.delete(sessionId);
+  _mcpProbePrompts.delete(sessionId);
+  _mcpAbortedProbes.delete(sessionId);
+}
+
+function filterProbePromptFragment(sessionId, fragment) {
+  const reset = fragment.match(/(__NCMCP_(?:(?!__NCMCP_)[A-Za-z0-9_])+)_R/);
+  if (reset) {
+    const aborted = _mcpAbortedProbes.get(sessionId) || new Set();
+    aborted.add(reset[1]);
+    if (aborted.size > 32) aborted.delete(aborted.values().next().value);
+    _mcpAbortedProbes.set(sessionId, aborted);
+    if (_mcpProbePrompts.get(sessionId) === reset[1]) _mcpProbePrompts.delete(sessionId);
+    return true;
+  }
+  const completion = fragment.match(/^\r?(__NCMCP_[A-Za-z0-9_]+)_Q/);
+  if (completion && !_mcpAbortedProbes.get(sessionId)?.has(completion[1])) {
+    _mcpProbePrompts.set(sessionId, completion[1]);
+  }
+  const marker = _mcpProbePrompts.get(sessionId);
+  if (!marker) return false;
+  const line = fragment.replace(/^\r/, "");
+  if (line.startsWith(`${marker}_S`) || line.startsWith(`${marker}_E`)) {
+    _mcpProbePrompts.delete(sessionId);
+  }
+  return true;
+}
 
 // Returns true if `s` ends with a non-empty prefix of "__NCMCP_"
 // (i.e. the next chunk might complete it into a marker-containing line).
@@ -54,10 +142,18 @@ function _endsWithMarkerPrefix(s) {
   for (let i = 1; i < p.length; i++) {
     if (s.endsWith(p.slice(0, i))) return true;
   }
+  // The shell-neutral live probe begins with this harmless builtin. Its
+  // echo can arrive before the random marker (e.g. " tru"), so retain the
+  // partial prefix just like a split marker. Ordinary text is still released
+  // by the existing bounded flush if no marker follows.
+  const probePrefix = " true __NCMCP_";
+  for (let i = 2; i < probePrefix.length; i++) {
+    if (s.endsWith(probePrefix.slice(0, i))) return true;
+  }
   return false;
 }
 
-function filterMcpChunk(sessionId, chunk) {
+function filterMcpChunk(sessionId, chunk, meta) {
   // Cancel any pending delayed flush — new data arrived
   const pendingTimer = _mcpFlushTimers.get(sessionId);
   if (pendingTimer) {
@@ -67,17 +163,37 @@ function filterMcpChunk(sessionId, chunk) {
 
   // Prepend any buffered fragment from the previous chunk
   const held = _mcpLineBufs.get(sessionId) || "";
+  const heldMeta = _mcpLineMetas.get(sessionId);
+  const heldIngressAlreadyAcknowledged = heldMeta?.pluginPipelineIngressBytes === 0;
+  const pendingMeta = _mcpPendingMetas.get(sessionId);
+  const stateMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), meta);
+  const sameChunkMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), meta, {
+    preserveTerminalPerf: true,
+  });
   const data = held + chunk;
   _mcpLineBufs.delete(sessionId);
+  _mcpLineMetas.delete(sessionId);
+  _mcpPendingMetas.delete(sessionId);
 
   // Fast path: nothing suspicious in the combined data
-  if (!data.includes("__NCMCP_") && !_endsWithMarkerPrefix(data)) {
-    return data;
+  if (!_mcpDroppingWrappedLine.has(sessionId) && !_mcpProbePrompts.has(sessionId) && !data.includes("__NCMCP_") && !_endsWithMarkerPrefix(data)) {
+    const deliveryMeta = held ? stateMeta : sameChunkMeta;
+    return {
+      data,
+      meta: heldIngressAlreadyAcknowledged
+        ? {
+            ...(deliveryMeta || {}),
+            pluginPipelineIngressBytes: Number.isFinite(meta?.pluginPipelineIngressBytes)
+              ? Math.max(0, Number(meta.pluginPipelineIngressBytes))
+              : chunk.length,
+          }
+        : deliveryMeta,
+    };
   }
 
   // Slow path: scan line by line
   let result = "";
-  let droppedAny = false;
+  let droppedAny = _mcpDroppingWrappedLine.has(sessionId);
   let pos = 0;
   while (pos < data.length) {
     const nlIdx = data.indexOf("\n", pos);
@@ -88,96 +204,252 @@ function filterMcpChunk(sessionId, chunk) {
       // echoes can wrap across PTY lines; wrapped fragments that don't
       // contain __NCMCP_ would otherwise leak through as garbage.
       const tail = data.slice(pos);
-      if (droppedAny || tail.includes("__NCMCP_") || _endsWithMarkerPrefix(tail)) {
-        _mcpLineBufs.set(sessionId, tail);
+      const probePrompt = filterProbePromptFragment(sessionId, tail);
+      if (probePrompt || droppedAny || tail.includes("__NCMCP_") || _endsWithMarkerPrefix(tail)) {
+        let tailMeta = !held && tail === chunk ? sameChunkMeta : stateMeta;
+        if (heldIngressAlreadyAcknowledged && !hasPluginPipelineIngress(tailMeta)) {
+          tailMeta = { ...(tailMeta || {}), pluginPipelineIngressBytes: 0 };
+        }
+        if (tail.length <= MAX_MCP_BUFFERED_LINE_CHARS) {
+          _mcpLineBufs.set(sessionId, tail);
+          if (tailMeta) _mcpLineMetas.set(sessionId, tailMeta);
+        } else {
+          // A malformed/wrapped marker line can otherwise grow forever while
+          // high-rate output keeps postponing the delayed flush. Its visible
+          // content is already being suppressed, so discard the oversized
+          // prefix and retain only the drop-until-newline state.
+          _mcpLineBufs.delete(sessionId);
+          _mcpLineMetas.delete(sessionId);
+          _mcpDroppingWrappedLine.add(sessionId);
+        }
+        // The reserved prefix already identifies an internal line. Its
+        // remaining marker or suffix may arrive after the timed flush.
+        if (probePrompt || droppedAny || tail.includes("__NCMCP_")) {
+          _mcpDroppingWrappedLine.add(sessionId);
+        }
       } else {
         result += tail; // safe to display immediately
       }
       break;
     }
     const line = data.slice(pos, nlIdx + 1); // includes the \n
-    if (!line.includes("__NCMCP_")) {
-      result += line;
+    const probePrompt = filterProbePromptFragment(sessionId, line);
+    if (probePrompt || droppedAny || line.includes("__NCMCP_")) {
+      droppedAny = false;
+      _mcpDroppingWrappedLine.delete(sessionId);
     } else {
-      droppedAny = true;
+      result += line;
     }
     pos = nlIdx + 1;
   }
 
-  return result;
+  const deliveryMeta = !held && result === chunk ? sameChunkMeta : stateMeta;
+  return {
+    data: result,
+    meta: heldIngressAlreadyAcknowledged
+      ? {
+          ...(deliveryMeta || {}),
+          pluginPipelineIngressBytes: Number.isFinite(meta?.pluginPipelineIngressBytes)
+            ? Math.max(0, Number(meta.pluginPipelineIngressBytes))
+            : chunk.length,
+        }
+      : deliveryMeta,
+  };
+}
+
+function consumeBufferedMcpIngress(sessionId) {
+  const heldMeta = _mcpLineMetas.get(sessionId);
+  if (!hasPluginPipelineIngress(heldMeta)) return;
+  // Retain an explicit zero so a later safe flush does not fall back to the
+  // visible chunk length and acknowledge the already-credited prefix twice.
+  _mcpLineMetas.set(sessionId, { ...heldMeta, pluginPipelineIngressBytes: 0 });
 }
 
 /**
  * Deliver data to session listeners.  Used both by the normal data path
  * and by the delayed-flush timer.
  */
-function _deliverToListeners(sessionId, data) {
-  const set = dataListeners.get(sessionId);
-  if (!set || !data) return;
-  set.forEach((cb) => {
-    try { cb(data); } catch (err) { console.error("Data callback failed", err); }
-  });
+const _deliverToListeners = createTerminalDataDispatcher({
+  dataListeners,
+  displayDataListeners,
+  terminalDataBacklog,
+  shouldDropSession: (sessionId) => closedTerminalDataSessions.has(sessionId),
+});
+
+function flushMcpBufferedOutput(sessionId) {
+    const timer = _mcpFlushTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    const held = _mcpLineBufs.get(sessionId);
+    const heldMeta = _mcpLineMetas.get(sessionId);
+    _mcpLineBufs.delete(sessionId);
+    _mcpLineMetas.delete(sessionId);
+    _mcpFlushTimers.delete(sessionId);
+    if (_mcpDroppingWrappedLine.has(sessionId)) {
+      // Retain a bounded partial marker so a delayed Q/R suffix still updates
+      // the probe lifecycle, rather than losing its identity at the timer.
+      if (held && /^\r?__NCMCP_[A-Za-z0-9_]*$/.test(held) && held.length <= 256) {
+        _mcpLineBufs.set(sessionId, held);
+        if (heldMeta) _mcpLineMetas.set(sessionId, heldMeta);
+        return;
+      }
+      // A timed flush is not a line boundary. Keep discarding a known
+      // internal line until its newline arrives, including slow prompts
+      // between the probe completion marker and an echo-disabled wrapper.
+      if (heldMeta) _mcpPendingMetas.set(sessionId, mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), heldMeta));
+      return;
+    }
+    if (held) {
+      let deliveryMeta = mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), heldMeta, {
+        preserveTerminalPerf: true,
+      });
+      if (heldMeta?.pluginPipelineIngressBytes === 0 && !hasPluginPipelineIngress(deliveryMeta)) {
+        deliveryMeta = { ...(deliveryMeta || {}), pluginPipelineIngressBytes: 0 };
+      }
+      _deliverToListeners(sessionId, held, deliveryMeta);
+      _mcpPendingMetas.delete(sessionId);
+    }
 }
 
-// ZMODEM file transfer events
+function scheduleMcpBufferedFlush(sessionId) {
+  if (!_mcpLineBufs.has(sessionId)) return;
+  _mcpFlushTimers.set(sessionId, setTimeout(() => flushMcpBufferedOutput(sessionId), 80));
+}
+
+function deliverTerminalData(sessionId, data, options = {}) {
+  if (!sessionId || (!data && !hasPluginPipelineIngressMarker(options.meta))) return;
+  if (closedTerminalDataSessions.has(sessionId)) return;
+  if (!data) {
+    _deliverToListeners(sessionId, "", options.meta);
+    return;
+  }
+  if (options.syntheticEcho) {
+    _deliverToListeners(sessionId, data, options.meta);
+    return;
+  }
+  const filtered = filterMcpChunk(sessionId, data, options.meta);
+  if (filtered?.data) {
+    _deliverToListeners(sessionId, filtered.data, filtered.meta);
+    if (hasPluginPipelineIngress(filtered.meta)) consumeBufferedMcpIngress(sessionId);
+  } else if (filtered?.meta) {
+    if (hasPluginPipelineIngress(filtered.meta)) {
+      // The legacy path must return flow credit even when MCP marker filtering
+      // removes every display byte. Waiting for unrelated visible output can
+      // otherwise leave a fully suppressed stream paused indefinitely.
+      _deliverToListeners(sessionId, "", filtered.meta);
+      consumeBufferedMcpIngress(sessionId);
+    } else {
+      _mcpPendingMetas.set(sessionId, mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), filtered.meta));
+    }
+  }
+  // If there is buffered content waiting for more data (e.g. a prompt
+  // right after a dropped marker line), schedule a delayed flush so it
+  // appears after a short pause instead of staying hidden forever.
+  scheduleMcpBufferedFlush(sessionId);
+}
+
+const terminalOutputDrainListeners = new Map();
+const terminalOutputPorts = createTerminalOutputPortRegistry({
+  ipcRenderer,
+  deliverToListeners: _deliverToListeners,
+  filterData(sessionId, data, message) {
+    if (message?.syntheticEcho) return data;
+    const filtered = filterMcpChunk(sessionId, data, message.meta);
+    // Metadata-only plugin output is delivered immediately by the output-port
+    // registry so renderer flow credit can be returned. Do not retain the same
+    // ingress metadata for the next visible chunk or it would be acknowledged
+    // twice. Non-ingress terminal-state metadata still follows the next output.
+    if (hasPluginPipelineIngress(filtered?.meta)) {
+      consumeBufferedMcpIngress(sessionId);
+    } else if (!filtered?.data && filtered?.meta) {
+      _mcpPendingMetas.set(sessionId, mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), filtered.meta));
+    }
+    scheduleMcpBufferedFlush(sessionId);
+    return filtered;
+  },
+  closedTerminalDataSessions,
+  onDrain(sessionId, requestId) {
+    flushMcpBufferedOutput(sessionId);
+    for (const listener of terminalOutputDrainListeners.get(sessionId) || []) {
+      try { listener({ sessionId, requestId }); } catch (err) { console.error("Terminal drain callback failed", err); }
+    }
+  },
+});
+terminalOutputPorts.register();
+
+const terminalUrgentInputPorts = createTerminalUrgentInputPortRegistry({
+  ipcRenderer,
+});
+terminalUrgentInputPorts.register();
+
+// ZMODEM file transfer events. Listener sets are owned by renderer subscribers
+// (disposed on unmount); delivery is gated by closedTerminalDataSessions so
+// events stop after exit/close and resume automatically when a session
+// restarts with the same id.
 ipcRenderer.on("netcatty:zmodem:detect", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "detect", ...payload }); } catch {} });
 });
+
+ipcRenderer.on("netcatty:window:terminalPopupConfig", (_event, payload) => {
+  // Always retain last config so a late/remounted subscriber (AppLockGate delay,
+  // React Strict Mode remount) still receives it via lastPayload replay.
+  terminalPopupConfigState.lastPayload = payload;
+  if (terminalPopupConfigState.listeners.size === 0) {
+    terminalPopupConfigState.pending = payload;
+    return;
+  }
+  terminalPopupConfigState.pending = null;
+  terminalPopupConfigState.listeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Terminal popup config callback failed", err);
+    }
+  });
+});
 ipcRenderer.on("netcatty:zmodem:progress", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "progress", ...payload }); } catch {} });
 });
 ipcRenderer.on("netcatty:zmodem:complete", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "complete", ...payload }); } catch {} });
 });
 ipcRenderer.on("netcatty:zmodem:error", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "error", ...payload }); } catch {} });
 });
 ipcRenderer.on("netcatty:zmodem:overwrite-request", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemOverwriteListeners.get(payload.sessionId);
   if (set) set.forEach((cb) => cb(payload));
 });
 
 ipcRenderer.on("netcatty:data", (_event, payload) => {
-  const set = dataListeners.get(payload.sessionId);
-  if (!set) return;
-  if (payload?.syntheticEcho) {
-    _deliverToListeners(payload.sessionId, payload.data);
-    return;
-  }
-  const data = filterMcpChunk(payload.sessionId, payload.data);
-  if (data) {
-    set.forEach((cb) => {
-      try {
-        cb(data);
-      } catch (err) {
-        console.error("Data callback failed", err);
-      }
-    });
-  }
-  // If there is buffered content waiting for more data (e.g. a prompt
-  // right after a dropped marker line), schedule a delayed flush so it
-  // appears after a short pause instead of staying hidden forever.
-  if (_mcpLineBufs.has(payload.sessionId)) {
-    const sid = payload.sessionId;
-    _mcpFlushTimers.set(sid, setTimeout(() => {
-      const held = _mcpLineBufs.get(sid);
-      _mcpLineBufs.delete(sid);
-      _mcpFlushTimers.delete(sid);
-      if (held) _deliverToListeners(sid, held);
-    }, 80));
-  }
+  deliverTerminalData(payload?.sessionId, payload?.data, {
+    syntheticEcho: payload?.syntheticEcho,
+    meta: payload?.meta,
+  });
 });
 
+// ZMODEM listener sets deliberately survive exit: they are owned by renderer
+// subscribers and disposed on unmount. Delivery is gated by
+// closedTerminalDataSessions (see zmodem handlers above), so events stop after
+// exit/close and resume when a session restarts with the same id.
 ipcRenderer.on("netcatty:exit", (_event, payload) => {
-  const set = exitListeners.get(payload.sessionId);
+  const sessionId = payload?.sessionId;
+  if (!sessionId) return;
+  const wasClosed = closedTerminalDataSessions.has(sessionId);
+  closedTerminalDataSessions.add(sessionId);
+  const set = wasClosed ? null : exitListeners.get(sessionId);
   if (set) {
     set.forEach((cb) => {
       try {
@@ -187,18 +459,14 @@ ipcRenderer.on("netcatty:exit", (_event, payload) => {
       }
     });
   }
-  dataListeners.delete(payload.sessionId);
-  exitListeners.delete(payload.sessionId);
-  telnetAutoLoginCompleteListeners.delete(payload.sessionId);
-  telnetAutoLoginCancelledListeners.delete(payload.sessionId);
-  zmodemListeners.delete(payload.sessionId);
-  zmodemOverwriteListeners.delete(payload.sessionId);
-  const pendingTimer = _mcpFlushTimers.get(payload.sessionId);
-  if (pendingTimer) {
-    clearTimeout(pendingTimer);
-    _mcpFlushTimers.delete(payload.sessionId);
-  }
-  _mcpLineBufs.delete(payload.sessionId); // clean up any held fragment
+  clearTerminalDataBacklog({ terminalDataBacklog }, sessionId);
+  terminalOutputPorts.closeSession(sessionId);
+  telnetAutoLoginCompleteListeners.delete(sessionId);
+  telnetAutoLoginCancelledListeners.delete(sessionId);
+  telnetEchoModeListeners.delete(sessionId);
+  moshSessionReadyListeners.delete(sessionId);
+  authFailedListeners.delete(sessionId);
+  clearMcpSessionState(sessionId);
 });
 
 // Chain progress events (for jump host connections)
@@ -210,6 +478,16 @@ ipcRenderer.on("netcatty:chain:progress", (_event, payload) => {
       cb(sessionId, hop, total, label, status, error);
     } catch (err) {
       console.error("Chain progress callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:connection-reuse:fallback", (_event, payload) => {
+  connectionReuseFallbackListeners.forEach((cb) => {
+    try {
+      cb(payload.sessionId, payload.sourceSessionId);
+    } catch (err) {
+      console.error("Connection reuse fallback callback failed", err);
     }
   });
 });
@@ -241,6 +519,36 @@ ipcRenderer.on("netcatty:window:fullscreen-changed", (_event, isFullscreen) => {
       cb(isFullscreen);
     } catch (err) {
       console.error("Fullscreen changed callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:window:shown", () => {
+  windowShownListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.error("Window shown callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:window:focus-requested", () => {
+  windowFocusRequestedListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.error("Window focus-requested callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:window:will-hide", () => {
+  windowWillHideListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.error("Window will-hide callback failed", err);
     }
   });
 });
@@ -285,6 +593,30 @@ ipcRenderer.on("netcatty:telnet:auto-login-cancelled", (_event, payload) => {
   });
 });
 
+ipcRenderer.on("netcatty:mosh:ready", (_event, payload) => {
+  const set = moshSessionReadyListeners.get(payload.sessionId);
+  if (!set) return;
+  set.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Mosh session ready callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:telnet:echo-mode", (_event, payload) => {
+  const set = telnetEchoModeListeners.get(payload.sessionId);
+  if (!set) return;
+  set.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Telnet echo mode callback failed", err);
+    }
+  });
+});
+
 // Keyboard-interactive authentication events (2FA/MFA)
 ipcRenderer.on("netcatty:keyboard-interactive", (_event, payload) => {
   keyboardInteractiveListeners.forEach((cb) => {
@@ -292,6 +624,16 @@ ipcRenderer.on("netcatty:keyboard-interactive", (_event, payload) => {
       cb(payload);
     } catch (err) {
       console.error("Keyboard-interactive callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:keyboard-interactive-cancelled", (_event, payload) => {
+  keyboardInteractiveCancelledListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Keyboard-interactive cancellation callback failed", err);
     }
   });
 });
@@ -412,152 +754,17 @@ ipcRenderer.on("netcatty:update:needs-save", () => {
   });
 });
 
-// Transfer progress events
-ipcRenderer.on("netcatty:transfer:progress", (_event, payload) => {
-  const cb = transferProgressListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.transferred, payload.totalBytes, payload.speed);
-    } catch (err) {
-      console.error("Transfer progress callback failed", err);
-    }
-  }
+ipcRenderer.on("netcatty:sftp:global-transfer", (_event, payload) => {
+  dispatchGlobalSftpTransferEvent(payload);
 });
 
-ipcRenderer.on("netcatty:transfer:complete", (_event, payload) => {
-  const cb = transferCompleteListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb();
-    } catch (err) {
-      console.error("Transfer complete callback failed", err);
-    }
-  }
-  cleanupTransferListeners(payload.transferId);
-});
-
-ipcRenderer.on("netcatty:transfer:error", (_event, payload) => {
-  const cb = transferErrorListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.error);
-    } catch (err) {
-      console.error("Transfer error callback failed", err);
-    }
-  }
-  cleanupTransferListeners(payload.transferId);
-});
-
-ipcRenderer.on("netcatty:transfer:cancelled", (_event, payload) => {
-  const cb = transferCancelledListeners.get(payload.transferId);
-  if (cb) {
-    try { cb(); } catch { }
-  }
-  cleanupTransferListeners(payload.transferId);
-});
-
-// Upload with progress listeners
-const uploadProgressListeners = new Map();
-const uploadCompleteListeners = new Map();
-const uploadErrorListeners = new Map();
-
-// Compress upload listeners
-const compressProgressListeners = new Map();
-const compressCompleteListeners = new Map();
-const compressErrorListeners = new Map();
-
-ipcRenderer.on("netcatty:upload:progress", (_event, payload) => {
-  const cb = uploadProgressListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.transferred, payload.totalBytes, payload.speed);
-    } catch (err) {
-      console.error("Upload progress callback failed", err);
-    }
-  }
-});
-
-ipcRenderer.on("netcatty:upload:complete", (_event, payload) => {
-  const cb = uploadCompleteListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb();
-    } catch (err) {
-      console.error("Upload complete callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  uploadProgressListeners.delete(payload.transferId);
-  uploadCompleteListeners.delete(payload.transferId);
-  uploadErrorListeners.delete(payload.transferId);
-});
-
-ipcRenderer.on("netcatty:upload:error", (_event, payload) => {
-  const cb = uploadErrorListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.error);
-    } catch (err) {
-      console.error("Upload error callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  uploadProgressListeners.delete(payload.transferId);
-  uploadCompleteListeners.delete(payload.transferId);
-  uploadErrorListeners.delete(payload.transferId);
-});
-
-// Compress upload events
-ipcRenderer.on("netcatty:compress:progress", (_event, payload) => {
-  const cb = compressProgressListeners.get(payload.compressionId);
-  if (cb) {
-    try {
-      cb(payload.phase, payload.transferred, payload.total);
-    } catch (err) {
-      console.error("Compress progress callback failed", err);
-    }
-  }
-});
-
-ipcRenderer.on("netcatty:compress:complete", (_event, payload) => {
-  const cb = compressCompleteListeners.get(payload.compressionId);
-  if (cb) {
-    try {
-      cb();
-    } catch (err) {
-      console.error("Compress complete callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  compressProgressListeners.delete(payload.compressionId);
-  compressCompleteListeners.delete(payload.compressionId);
-  compressErrorListeners.delete(payload.compressionId);
-});
-
-ipcRenderer.on("netcatty:compress:error", (_event, payload) => {
-  const cb = compressErrorListeners.get(payload.compressionId);
-  if (cb) {
-    try {
-      cb(payload.error);
-    } catch (err) {
-      console.error("Compress error callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  compressProgressListeners.delete(payload.compressionId);
-  compressCompleteListeners.delete(payload.compressionId);
-  compressErrorListeners.delete(payload.compressionId);
-});
-
-ipcRenderer.on("netcatty:compress:cancelled", (_event, payload) => {
-  // Just cleanup listeners, the UI already knows it's cancelled
-  compressProgressListeners.delete(payload.compressionId);
-  compressCompleteListeners.delete(payload.compressionId);
-  compressErrorListeners.delete(payload.compressionId);
+ipcRenderer.on("netcatty:plugins:contributions-changed", (_event, payload) => {
+  dispatchPluginContributionsChanged(payload);
 });
 
 // Port forwarding status listeners
 const portForwardStatusListeners = new Map();
+const portForwardRuntimeListeners = new Set();
 
 ipcRenderer.on("netcatty:portforward:status", (_event, payload) => {
   const { tunnelId, status, error } = payload;
@@ -573,9 +780,20 @@ ipcRenderer.on("netcatty:portforward:status", (_event, payload) => {
   }
 });
 
+ipcRenderer.on("netcatty:portforward:runtime", (_event, payload) => {
+  portForwardRuntimeListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Port forward runtime callback failed", err);
+    }
+  });
+});
+
 // File watcher listeners (for auto-sync feature)
 const fileWatchSyncedListeners = new Set();
 const fileWatchErrorListeners = new Set();
+const fileWatchStoppedListeners = new Set();
 
 ipcRenderer.on("netcatty:filewatch:synced", (_event, payload) => {
   fileWatchSyncedListeners.forEach((cb) => {
@@ -597,6 +815,16 @@ ipcRenderer.on("netcatty:filewatch:error", (_event, payload) => {
   });
 });
 
+ipcRenderer.on("netcatty:filewatch:stopped", (_event, payload) => {
+  fileWatchStoppedListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("File watch stopped callback failed", err);
+    }
+  });
+});
+
 // Buffer the latest tray menu data so it can be replayed when the React
 // component subscribes after lazy-mount (avoiding the first-open race).
 let _lastTrayMenuData = null;
@@ -610,21 +838,33 @@ const api = createPreloadApi({
   webUtils,
   randomUUID,
   dataListeners,
+  displayDataListeners,
   exitListeners,
-  transferProgressListeners,
-  transferCompleteListeners,
-  transferErrorListeners,
-  transferCancelledListeners,
+  closedTerminalDataSessions,
+  globalSftpTransferListeners,
+  pluginContributionsChangedListeners,
   chainProgressListeners,
+  connectionReuseFallbackListeners,
   zmodemListeners,
   zmodemOverwriteListeners,
   sftpConnectionProgressListeners,
   authFailedListeners,
   telnetAutoLoginCompleteListeners,
   telnetAutoLoginCancelledListeners,
+  telnetEchoModeListeners,
+  moshSessionReadyListeners,
+  terminalDataBacklog,
+  terminalOutputPorts,
+  clearTerminalOutputSessionState: clearMcpSessionState,
+  terminalOutputDrainListeners,
+  terminalUrgentInputPorts,
   languageChangeListeners,
   fullscreenChangeListeners,
+  windowShownListeners,
+  windowFocusRequestedListeners,
+  windowWillHideListeners,
   keyboardInteractiveListeners,
+  keyboardInteractiveCancelledListeners,
   hostKeyVerificationListeners,
   passphraseListeners,
   passphraseTimeoutListeners,
@@ -636,16 +876,12 @@ const api = createPreloadApi({
   updateNotAvailableListeners,
   updateErrorListeners,
   updateNeedsSaveListeners,
-  uploadProgressListeners,
-  uploadCompleteListeners,
-  uploadErrorListeners,
-  compressProgressListeners,
-  compressCompleteListeners,
-  compressErrorListeners,
+  terminalPopupConfigState,
   portForwardStatusListeners,
+  portForwardRuntimeListeners,
   fileWatchSyncedListeners,
   fileWatchErrorListeners,
-  cleanupTransferListeners,
+  fileWatchStoppedListeners,
   get _lastTrayMenuData() { return _lastTrayMenuData; },
   set _lastTrayMenuData(value) { _lastTrayMenuData = value; },
 });

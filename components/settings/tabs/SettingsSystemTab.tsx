@@ -1,18 +1,22 @@
 /**
  * Settings System Tab - System information, temp file management, session logs, and global hotkey
  */
-import { AlertTriangle, ChevronDown, ChevronRight, Download, ExternalLink, FileText, FolderOpen, HardDrive, Keyboard, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, ExternalLink, FolderOpen, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
 import { useI18n } from "../../../application/i18n/I18nProvider";
+import type { AppLockSystemUnlockStatus } from "../../../application/state/useAppLockState";
+import type { AppLockSettings, AppLockSettingsChangeError, AppLockTimeoutMinutes } from "../../../domain/appLock";
 import { getCredentialProtectionAvailability } from "../../../infrastructure/services/credentialProtection";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import type { UpdateState } from '../../../application/state/useUpdateCheck';
 import { SessionLogFormat, keyEventToString } from "../../../domain/models";
-import { TabsContent } from "../../ui/tabs";
+import type { HttpNetworkProxyMode, HttpNetworkProxySettings } from "../../../domain/httpNetworkProxy";
 import { Button } from "../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../ui/tooltip";
-import { Toggle, Select, SettingRow } from "../settings-ui";
+import { Toggle, Select, SettingRow, SectionHeader, SettingCard, SettingHint, SettingsAnchor, SettingsTabContent } from "../settings-ui";
 import { cn } from "../../../lib/utils";
+import { isAppLockOverlayActive } from '../../../infrastructure/appLockOverlayDom';
+import { AppLockSettingsSection } from './AppLockSettingsSection';
 
 interface CrashLogFile {
   fileName: string;
@@ -77,18 +81,51 @@ function formatLastChecked(
 }
 
 interface SettingsSystemTabProps {
+  appLockSettings: AppLockSettings;
+  setAppLockTimeoutMinutes: (timeoutMinutes: AppLockTimeoutMinutes) => void;
+  requestAppLockDisable: (currentPassword: string) => Promise<AppLockSettings | { ok: false; error: AppLockSettingsChangeError }>;
+  requestAppLockPasswordChange: (input: {
+    currentPassword?: string;
+    nextPassword: string;
+  }) => Promise<AppLockSettings | { ok: false; error: AppLockSettingsChangeError }>;
+  appLockSystemUnlockStatus?: AppLockSystemUnlockStatus;
+  setAppLockSystemUnlockEnabled?: (input: {
+    enabled: boolean;
+    currentPassword?: string;
+    autoPromptEnabled?: boolean;
+  }) => Promise<AppLockSettings | { ok: false; error: 'empty-current' | 'incorrect' | 'locked' | 'unsupported' | 'unavailable' | 'cancelled' | 'failed' }>;
   sessionLogsEnabled: boolean;
   setSessionLogsEnabled: (enabled: boolean) => void;
   sessionLogsDir: string;
   setSessionLogsDir: (dir: string) => void;
   sessionLogsFormat: SessionLogFormat;
   setSessionLogsFormat: (format: SessionLogFormat) => void;
+  sessionLogsTimestampsEnabled: boolean;
+  setSessionLogsTimestampsEnabled: (enabled: boolean) => void;
   sshDebugLogsEnabled: boolean;
   setSshDebugLogsEnabled: (enabled: boolean) => void;
+  sshDeepLinkEnabled: boolean;
+  setSshDeepLinkEnabled: (enabled: boolean) => void;
+  jmsDeepLinkEnabled: boolean;
+  setJmsDeepLinkEnabled: (enabled: boolean) => void;
+  explorerContextMenuEnabled: boolean;
+  setExplorerContextMenuEnabled: (enabled: boolean) => void;
+  explorerContextMenuSupported: boolean;
+  restorePreviousSession: boolean;
+  setRestorePreviousSession: (enabled: boolean) => void;
+  restoreTerminalCwd: boolean;
+  setRestoreTerminalCwd: (enabled: boolean) => void;
+  startupLanding: "vault" | "local-terminal";
+  setStartupLanding: (landing: "vault" | "local-terminal") => void;
   toggleWindowHotkey: string;
   setToggleWindowHotkey: (hotkey: string) => void;
   closeToTray: boolean;
   setCloseToTray: (enabled: boolean) => void;
+  autoLaunchEnabled: boolean;
+  setAutoLaunchEnabled: (enabled: boolean) => void;
+  autoLaunchSupported: boolean;
+  httpNetworkProxy: HttpNetworkProxySettings;
+  setHttpNetworkProxy: (settings: HttpNetworkProxySettings | ((prev: HttpNetworkProxySettings) => HttpNetworkProxySettings)) => void;
   hotkeyRegistrationError: string | null;
   globalHotkeyEnabled: boolean;
   setGlobalHotkeyEnabled: (enabled: boolean) => void;
@@ -103,18 +140,44 @@ interface SettingsSystemTabProps {
 }
 
 const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
+  appLockSettings,
+  setAppLockTimeoutMinutes,
+  requestAppLockDisable,
+  requestAppLockPasswordChange,
+  appLockSystemUnlockStatus,
+  setAppLockSystemUnlockEnabled,
   sessionLogsEnabled,
   setSessionLogsEnabled,
   sessionLogsDir,
   setSessionLogsDir,
   sessionLogsFormat,
   setSessionLogsFormat,
+  sessionLogsTimestampsEnabled,
+  setSessionLogsTimestampsEnabled,
   sshDebugLogsEnabled,
   setSshDebugLogsEnabled,
+  sshDeepLinkEnabled,
+  setSshDeepLinkEnabled,
+  jmsDeepLinkEnabled,
+  setJmsDeepLinkEnabled,
+  explorerContextMenuEnabled,
+  setExplorerContextMenuEnabled,
+  explorerContextMenuSupported,
+  restorePreviousSession,
+  setRestorePreviousSession,
+  restoreTerminalCwd,
+  setRestoreTerminalCwd,
+  startupLanding,
+  setStartupLanding,
   toggleWindowHotkey,
   setToggleWindowHotkey,
   closeToTray,
   setCloseToTray,
+  autoLaunchEnabled,
+  setAutoLaunchEnabled,
+  autoLaunchSupported,
+  httpNetworkProxy,
+  setHttpNetworkProxy,
   hotkeyRegistrationError,
   globalHotkeyEnabled,
   setGlobalHotkeyEnabled,
@@ -145,6 +208,8 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   const [crashLogClearResult, setCrashLogClearResult] = useState<{ deletedCount: number } | null>(null);
   const [sshDebugLogInfo, setSshDebugLogInfo] = useState<SshDebugLogInfo | null>(null);
   const [isLoadingSshDebugLogInfo, setIsLoadingSshDebugLogInfo] = useState(false);
+  const [isClearingSessionLogs, setIsClearingSessionLogs] = useState(false);
+  const [sessionLogsClearResult, setSessionLogsClearResult] = useState<{ deletedCount: number; failedCount: number } | null>(null);
 
   const [appVersion, setAppVersion] = useState('');
 
@@ -325,6 +390,25 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     }
   }, [sessionLogsDir]);
 
+  const handleClearSessionLogs = useCallback(async () => {
+    const bridge = netcattyBridge.get();
+    if (!sessionLogsDir || !bridge?.clearSessionLogsDir) return;
+    if (!window.confirm(t("settings.sessionLogs.clearConfirm"))) return;
+
+    setIsClearingSessionLogs(true);
+    setSessionLogsClearResult(null);
+    try {
+      const result = await bridge.clearSessionLogsDir(sessionLogsDir);
+      if (result.success) {
+        setSessionLogsClearResult({ deletedCount: result.deletedCount, failedCount: result.failedCount });
+      }
+    } catch (err) {
+      console.error("[SettingsSystemTab] Failed to clear session logs:", err);
+    } finally {
+      setIsClearingSessionLogs(false);
+    }
+  }, [sessionLogsDir, t]);
+
   const handleOpenSshDebugLogDir = useCallback(async () => {
     const bridge = netcattyBridge.get();
     if (!bridge?.openSshDebugLogDir) return;
@@ -348,6 +432,7 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     if (!isRecordingHotkey) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isAppLockOverlayActive()) return;
       e.preventDefault();
       e.stopPropagation();
 
@@ -386,29 +471,10 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     { value: "raw", label: t("settings.sessionLogs.formatRaw") },
     { value: "html", label: t("settings.sessionLogs.formatHtml") },
   ];
-
   return (
-    <TabsContent
-      value="system"
-      className="data-[state=inactive]:hidden h-full flex flex-col"
-    >
-      <div className="flex-1 overflow-y-auto overflow-x-hidden px-8 py-6">
-        <div className="max-w-2xl space-y-8">
-          {/* Header */}
-          <div>
-            <h2 className="text-xl font-semibold">{t("settings.system.title")}</h2>
-            <p className="text-sm text-muted-foreground mt-1">
-              {t("settings.system.description")}
-            </p>
-          </div>
-
-          {/* Software Update Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <Download size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t('settings.update.title')}</h3>
-            </div>
-            <div className="rounded-lg border border-border/60 p-4 space-y-3">
+    <SettingsTabContent value="system">
+          <SectionHeader title={t('settings.update.title')} anchorId="system-update" />
+            <SettingCard className="space-y-3 py-4">
               {/* Current version */}
               <div className="flex items-center justify-between">
                 <span className="text-sm text-muted-foreground">
@@ -521,17 +587,18 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   </Button>
                 )}
               </div>
-            </div>
-            <SettingRow
-              label={t('settings.update.autoUpdateEnabled')}
-              description={t('settings.update.autoUpdateEnabledDesc')}
-            >
-              <Toggle
-                checked={autoUpdateEnabled}
-                onChange={setAutoUpdateEnabled}
-              />
-            </SettingRow>
-            <p className="text-xs text-muted-foreground">
+              <SettingRow
+                anchorId="system-auto-update"
+                label={t('settings.update.autoUpdateEnabled')}
+                description={t('settings.update.autoUpdateEnabledDesc')}
+              >
+                <Toggle
+                  checked={autoUpdateEnabled}
+                  onChange={setAutoUpdateEnabled}
+                />
+              </SettingRow>
+            </SettingCard>
+            <SettingHint>
               {updateState.lastCheckedAt && (
                 <span>
                   {t('settings.update.lastCheckedPrefix')}
@@ -540,17 +607,102 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                 </span>
               )}
               {t('settings.update.hint')}
-            </p>
-          </div>
+            </SettingHint>
 
-          {/* Credential Protection Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <HardDrive size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.system.credentials.title")}</h3>
-            </div>
+          <SectionHeader title={t("settings.autoLaunch.title")} />
+            <SettingCard className="py-4">
+              <SettingRow
+                anchorId="system-auto-launch"
+                label={t("settings.autoLaunch.enabled")}
+                description={
+                  autoLaunchSupported
+                    ? t("settings.autoLaunch.enabledDesc")
+                    : t("settings.autoLaunch.unsupportedDesc")
+                }
+              >
+                <Toggle
+                  checked={autoLaunchEnabled}
+                  onChange={setAutoLaunchEnabled}
+                  disabled={!autoLaunchSupported}
+                />
+              </SettingRow>
+            </SettingCard>
 
-            <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+          <SectionHeader title={t("settings.system.networkProxy.title")} />
+            <SettingCard className="space-y-4 py-4">
+              <SettingRow
+                anchorId="system-network-proxy-mode"
+                label={t("settings.system.networkProxy.mode")}
+                description={t("settings.system.networkProxy.description")}
+              >
+                <Select
+                  value={httpNetworkProxy.mode}
+                  onChange={(value) => {
+                    const mode = value as HttpNetworkProxyMode;
+                    setHttpNetworkProxy((prev) => ({ ...prev, mode }));
+                  }}
+                  options={[
+                    { value: "system", label: t("settings.system.networkProxy.mode.system") },
+                    { value: "direct", label: t("settings.system.networkProxy.mode.direct") },
+                    { value: "custom", label: t("settings.system.networkProxy.mode.custom") },
+                  ]}
+                />
+              </SettingRow>
+              {httpNetworkProxy.mode === "custom" && (
+                <>
+                  <SettingRow
+                    label={t("settings.system.networkProxy.url")}
+                    description={t("settings.system.networkProxy.url.desc")}
+                  >
+                    <input
+                      type="text"
+                      value={httpNetworkProxy.url}
+                      onChange={(e) => {
+                        const url = e.target.value;
+                        setHttpNetworkProxy((prev) => ({ ...prev, url }));
+                      }}
+                      placeholder={t("settings.system.networkProxy.url.placeholder")}
+                      className="w-64 h-9 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </SettingRow>
+                  <SettingRow
+                    label={t("settings.system.networkProxy.bypass")}
+                    description={t("settings.system.networkProxy.bypass.desc")}
+                  >
+                    <input
+                      type="text"
+                      value={httpNetworkProxy.bypass}
+                      onChange={(e) => {
+                        const bypass = e.target.value;
+                        setHttpNetworkProxy((prev) => ({ ...prev, bypass }));
+                      }}
+                      placeholder={t("settings.system.networkProxy.bypass.placeholder")}
+                      className="w-64 h-9 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </SettingRow>
+                </>
+              )}
+            </SettingCard>
+            <SettingHint>
+              {t("settings.system.networkProxy.hint")}
+            </SettingHint>
+
+          <AppLockSettingsSection
+            appLockSettings={appLockSettings}
+            setAppLockTimeoutMinutes={setAppLockTimeoutMinutes}
+            requestAppLockDisable={requestAppLockDisable}
+            requestAppLockPasswordChange={requestAppLockPasswordChange}
+            appLockSystemUnlockStatus={appLockSystemUnlockStatus}
+            setAppLockSystemUnlockEnabled={setAppLockSystemUnlockEnabled}
+          />
+
+          <SectionHeader title={t("settings.system.credentials.title")} />
+            <SettingsAnchor anchorId="system-credentials">
+            <SettingCard className="space-y-3 py-4">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-sm text-muted-foreground">
@@ -593,17 +745,12 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               <p className="text-xs text-muted-foreground">
                 {t("settings.system.credentials.portabilityHint")}
               </p>
-            </div>
-          </div>
+            </SettingCard>
+            </SettingsAnchor>
 
-          {/* Crash Logs Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <AlertTriangle size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.system.crashLogs.title")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+          <SectionHeader title={t("settings.system.crashLogs.title")} />
+            <SettingsAnchor anchorId="system-crash-logs">
+            <SettingCard className="space-y-3 py-4">
               <p className="text-sm text-muted-foreground">
                 {t("settings.system.crashLogs.description")}
               </p>
@@ -740,21 +887,16 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   {t("settings.system.crashLogs.cleared").replace("{count}", String(crashLogClearResult.deletedCount))}
                 </p>
               )}
-            </div>
+            </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.system.crashLogs.hint")}
-            </p>
-          </div>
+            </SettingHint>
+            </SettingsAnchor>
 
-          {/* Temp Directory Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <HardDrive size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.system.tempDirectory")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+          <SectionHeader title={t("settings.system.tempDirectory")} />
+            <SettingsAnchor anchorId="system-temp-directory">
+            <SettingCard className="space-y-3 py-4">
               {/* Path */}
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
@@ -828,23 +970,60 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   })}
                 </p>
               )}
-            </div>
+            </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.system.tempDirectoryHint")}
-            </p>
-          </div>
+            </SettingHint>
+            </SettingsAnchor>
 
-          {/* Session Logs Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <FileText size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.sessionLogs.title")}</h3>
-            </div>
+          <SectionHeader title={t("settings.sessionRestore.title")} />
+            <SettingCard className="space-y-4 py-4">
+              <SettingRow
+                anchorId="system-startup-landing"
+                label={t("settings.sessionRestore.startupLanding")}
+                description={t("settings.sessionRestore.startupLandingDesc")}
+              >
+                <Select
+                  value={startupLanding}
+                  onChange={(value) => {
+                    if (value === "vault" || value === "local-terminal") {
+                      setStartupLanding(value);
+                    }
+                  }}
+                  options={[
+                    { value: "vault", label: t("settings.sessionRestore.startupLanding.vault") },
+                    { value: "local-terminal", label: t("settings.sessionRestore.startupLanding.localTerminal") },
+                  ]}
+                />
+              </SettingRow>
+              <SettingRow
+                anchorId="system-session-restore"
+                label={t("settings.sessionRestore.restorePreviousSession")}
+                description={t("settings.sessionRestore.restorePreviousSessionDesc")}
+              >
+                <Toggle
+                  checked={restorePreviousSession}
+                  onChange={setRestorePreviousSession}
+                />
+              </SettingRow>
+              <SettingRow
+                anchorId="system-restore-terminal-cwd"
+                label={t("settings.sessionRestore.restoreTerminalCwd")}
+                description={t("settings.sessionRestore.restoreTerminalCwdDesc")}
+              >
+                <Toggle
+                  checked={restoreTerminalCwd}
+                  onChange={setRestoreTerminalCwd}
+                />
+              </SettingRow>
+            </SettingCard>
 
-            <div className="bg-muted/30 rounded-lg p-4 space-y-4">
+          <SectionHeader title={t("settings.sessionLogs.title")} />
+            <SettingCard className="space-y-4 py-4">
               {/* Enable Toggle */}
               <SettingRow
+                anchorId="system-session-logs-enable"
                 label={t("settings.sessionLogs.enableAutoSave")}
                 description={t("settings.sessionLogs.enableAutoSaveDesc")}
               >
@@ -904,25 +1083,107 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   options={formatOptions}
                   onChange={(val) => setSessionLogsFormat(val as SessionLogFormat)}
                   className="w-44"
-                  disabled={!sessionLogsEnabled}
                 />
               </SettingRow>
-            </div>
 
-            <p className="text-xs text-muted-foreground">
-              {t("settings.sessionLogs.hint")}
-            </p>
-          </div>
-
-          {/* SSH Debug Logs Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <FileText size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.sshDebugLogs.title")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-4">
               <SettingRow
+                label={t("settings.sessionLogs.timestamps")}
+                description={t("settings.sessionLogs.timestampsDesc")}
+              >
+                <Toggle
+                  checked={sessionLogsTimestampsEnabled}
+                  onChange={setSessionLogsTimestampsEnabled}
+                />
+              </SettingRow>
+
+              {/* Clear All Logs */}
+              <div className="space-y-2 pt-2 border-t border-border/60">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium">{t("settings.sessionLogs.clearAll")}</p>
+                    <p className="text-xs text-muted-foreground">{t("settings.sessionLogs.clearAllDesc")}</p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleClearSessionLogs}
+                    disabled={isClearingSessionLogs || !sessionLogsDir}
+                    className="gap-1.5 shrink-0 text-destructive hover:text-destructive hover:bg-destructive/10"
+                  >
+                    <Trash2 size={14} />
+                    {isClearingSessionLogs ? t("settings.system.clearing") : t("settings.sessionLogs.clearAll")}
+                  </Button>
+                </div>
+                {sessionLogsClearResult && (
+                  <p className="text-sm text-muted-foreground">
+                    {t("settings.system.clearResult", {
+                      deleted: sessionLogsClearResult.deletedCount,
+                      failed: sessionLogsClearResult.failedCount,
+                    })}
+                  </p>
+                )}
+              </div>
+            </SettingCard>
+
+            <SettingHint>
+              {t("settings.sessionLogs.hint")}
+            </SettingHint>
+
+          <SectionHeader title={t('settings.sshDeepLink.title')} />
+            <SettingCard>
+              <SettingRow
+                anchorId="system-ssh-deep-link"
+                label={t('settings.sshDeepLink.enable')}
+                description={t('settings.sshDeepLink.enableDesc')}
+              >
+                <Toggle
+                  checked={sshDeepLinkEnabled}
+                  onChange={setSshDeepLinkEnabled}
+                  ariaLabel={t('settings.sshDeepLink.enable')}
+                />
+              </SettingRow>
+            </SettingCard>
+
+          <SectionHeader title={t('settings.jmsDeepLink.title')} />
+            <SettingCard>
+              <SettingRow
+                anchorId="system-jms-deep-link"
+                label={t('settings.jmsDeepLink.enable')}
+                description={t('settings.jmsDeepLink.enableDesc')}
+              >
+                <Toggle
+                  checked={jmsDeepLinkEnabled}
+                  onChange={setJmsDeepLinkEnabled}
+                  ariaLabel={t('settings.jmsDeepLink.enable')}
+                />
+              </SettingRow>
+            </SettingCard>
+
+          {explorerContextMenuSupported ? (
+            <>
+              <SectionHeader title={t('settings.explorerContextMenu.title')} />
+              <SettingCard>
+                <SettingRow
+                  anchorId="system-explorer-context-menu"
+                  label={t('settings.explorerContextMenu.enable')}
+                  description={t('settings.explorerContextMenu.enableDesc')}
+                >
+                  <Toggle
+                    checked={explorerContextMenuEnabled}
+                    onChange={setExplorerContextMenuEnabled}
+                    ariaLabel={t('settings.explorerContextMenu.enable')}
+                  />
+                </SettingRow>
+              </SettingCard>
+            </>
+          ) : (
+            <SettingsAnchor anchorId="system-explorer-context-menu" />
+          )}
+
+          <SectionHeader title={t("settings.sshDebugLogs.title")} />
+            <SettingCard className="min-w-0 max-w-full overflow-hidden space-y-4 py-4">
+              <SettingRow
+                anchorId="system-ssh-debug-logs"
                 label={t("settings.sshDebugLogs.enable")}
                 description={t("settings.sshDebugLogs.enableDesc")}
               >
@@ -934,9 +1195,12 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
 
               <div className="space-y-2">
                 <span className="text-sm font-medium">{t("settings.sshDebugLogs.location")}</span>
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 min-w-0">
-                    <div className="bg-background border border-input rounded-md px-3 py-2 text-sm font-mono truncate">
+                <div className="grid w-full min-w-0 max-w-full grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2">
+                  <div className="min-w-0 overflow-hidden">
+                    <div
+                      className="w-full min-w-0 overflow-hidden truncate rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+                      title={isLoadingSshDebugLogInfo ? "..." : (sshDebugLogInfo?.path || "-")}
+                    >
                       {isLoadingSshDebugLogInfo ? "..." : (sshDebugLogInfo?.path || "-")}
                     </div>
                   </div>
@@ -974,23 +1238,17 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   </span>
                 </div>
               </div>
-            </div>
+            </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.sshDebugLogs.hint")}
-            </p>
-          </div>
+            </SettingHint>
 
-          {/* Global Toggle Window Section (Quake Mode) */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <Keyboard size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.globalHotkey.title")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-4">
+          <SectionHeader title={t("settings.globalHotkey.title")} />
+            <SettingCard className="space-y-4 py-4">
               {/* Enable/Disable Global Hotkey */}
               <SettingRow
+                anchorId="system-global-hotkey-enabled"
                 label={t('settings.globalHotkey.enabled')}
                 description={t('settings.globalHotkey.enabledDesc')}
               >
@@ -1003,6 +1261,7 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               <div className={cn(!globalHotkeyEnabled && "opacity-50 pointer-events-none")}>
                 {/* Toggle Window Hotkey */}
                 <SettingRow
+                  anchorId="system-global-hotkey-toggle"
                   label={t("settings.globalHotkey.toggleWindow")}
                   description={t("settings.globalHotkey.toggleWindowDesc")}
                 >
@@ -1045,6 +1304,7 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
 
               {/* Close to Tray */}
               <SettingRow
+                anchorId="system-close-to-tray"
                 label={t("settings.globalHotkey.closeToTray")}
                 description={t("settings.globalHotkey.closeToTrayDesc")}
               >
@@ -1053,16 +1313,13 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   onChange={setCloseToTray}
                 />
               </SettingRow>
-            </div>
+            </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.globalHotkey.hint")}
-            </p>
-          </div>
-        </div>
-      </div>
-    </TabsContent>
+            </SettingHint>
+    </SettingsTabContent>
   );
 };
 
-export default SettingsSystemTab;
+export default React.memo(SettingsSystemTab);

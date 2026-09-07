@@ -2,20 +2,41 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  addCodexExecutableEnvForSdk,
   buildWindowsShellCommandLine,
   extractTrailingIdlePrompt,
+  formatSyntheticEcho,
   getFreshIdlePrompt,
   isDefaultPowerShellPromptLine,
+  isDefaultCmdPromptLine,
+  isDefaultPosixPromptLine,
   isPlausibleCliVersionOutput,
   looksLikeIdleAutoLogout,
   prepareCommandForSpawn,
-  resolveClaudeAcpBinaryPath,
-  resolveClaudeCodeExecutableForAcp,
+  resolveWindowsShimToNativeExe,
+  resolveClaudeCodeExecutableForSdk,
+  resolveCodexExecutableForSdk,
+  resolveCodebuddyExecutableForSdk,
+  parseRegQueryPath,
+  expandWindowsEnvRefs,
+  mergeWindowsPath,
+  readWindowsRegistryPath,
   trackSessionIdlePrompt,
 } = require("./shellUtils.cjs");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+
+test("formatSyntheticEcho normalizes multi-line commands to CRLF so xterm doesn't staircase", () => {
+  assert.equal(
+    formatSyntheticEcho("set -e\ncd /tmp\necho done"),
+    "set -e\r\ncd /tmp\r\necho done\r\n",
+  );
+  // Already-CRLF input is not doubled.
+  assert.equal(formatSyntheticEcho("a\r\nb"), "a\r\nb\r\n");
+  // Single-line commands keep the original shape.
+  assert.equal(formatSyntheticEcho("npm test"), "npm test\r\n");
+});
 
 test("extracts a trailing PowerShell idle prompt", () => {
   assert.equal(
@@ -74,6 +95,37 @@ test("isDefaultPowerShellPromptLine matches default shapes and rejects look-alik
   assert.equal(isDefaultPowerShellPromptLine(null), false);
 });
 
+test("extracts a trailing cmd.exe idle prompt", () => {
+  // Windows OpenSSH default shell is cmd.exe; without capturing `C:\...>`
+  // AI exec cannot select the cmd wrapper when shellKind is still unset.
+  assert.equal(
+    extractTrailingIdlePrompt("Microsoft Windows...\r\nC:\\Users\\alice>"),
+    "C:\\Users\\alice>",
+  );
+  assert.equal(extractTrailingIdlePrompt("welcome\r\nC:\\>"), "C:\\>");
+  assert.equal(extractTrailingIdlePrompt("welcome\r\nD:\\data\\proj>"), "D:\\data\\proj>");
+});
+
+test("isDefaultCmdPromptLine matches drive-letter cmd prompts only", () => {
+  assert.equal(isDefaultCmdPromptLine("C:\\Users\\alice>"), true);
+  assert.equal(isDefaultCmdPromptLine("C:\\>"), true);
+  assert.equal(isDefaultCmdPromptLine("C:>"), true);
+  assert.equal(isDefaultCmdPromptLine("PS C:\\Users\\alice>"), false);
+  assert.equal(isDefaultCmdPromptLine("alice@host:~$"), false);
+  assert.equal(isDefaultCmdPromptLine("C: >"), false);
+  assert.equal(isDefaultCmdPromptLine(""), false);
+});
+
+test("isDefaultPosixPromptLine matches classic user@host prompts", () => {
+  assert.equal(isDefaultPosixPromptLine("alice@host:~$"), true);
+  assert.equal(isDefaultPosixPromptLine("alice@wsl:/mnt/c$"), true);
+  assert.equal(isDefaultPosixPromptLine("root@box:/#"), true);
+  assert.equal(isDefaultPosixPromptLine("root@host ~#"), false);
+  assert.equal(isDefaultPosixPromptLine("PS C:\\Users\\alice>"), false);
+  assert.equal(isDefaultPosixPromptLine("C:\\Users\\alice>"), false);
+  assert.equal(isDefaultPosixPromptLine(""), false);
+});
+
 test("isPlausibleCliVersionOutput rejects stack traces and file URLs", () => {
   assert.equal(isPlausibleCliVersionOutput("2.1.123 (Claude Code)"), true);
   assert.equal(isPlausibleCliVersionOutput("codex-cli 0.125.0"), true);
@@ -108,7 +160,7 @@ test("prepareCommandForSpawn wraps Windows cmd shims as a single shell command",
   }
 });
 
-test("resolveClaudeCodeExecutableForAcp maps Windows npm cmd shim to Claude Code cli.js", () => {
+test("resolveClaudeCodeExecutableForSdk maps Windows npm cmd shim to Claude Code cli.js", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-claude-shim-"));
   try {
     const shimPath = path.join(tmp, "claude.cmd");
@@ -121,20 +173,20 @@ test("resolveClaudeCodeExecutableForAcp maps Windows npm cmd shim to Claude Code
       "utf8",
     );
 
-    assert.equal(resolveClaudeCodeExecutableForAcp(shimPath, "win32"), scriptPath);
+    assert.equal(resolveClaudeCodeExecutableForSdk(shimPath, "win32"), scriptPath);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
 
-test("resolveClaudeCodeExecutableForAcp leaves non-Windows Claude paths unchanged", () => {
+test("resolveClaudeCodeExecutableForSdk leaves non-Windows Claude paths unchanged", () => {
   assert.equal(
-    resolveClaudeCodeExecutableForAcp("/usr/local/bin/claude", "darwin"),
+    resolveClaudeCodeExecutableForSdk("/usr/local/bin/claude", "darwin"),
     "/usr/local/bin/claude",
   );
 });
 
-test("resolveClaudeCodeExecutableForAcp keeps Windows cmd shim when Claude Code cli.js is missing", () => {
+test("resolveClaudeCodeExecutableForSdk keeps Windows cmd shim when Claude Code cli.js is missing", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-claude-missing-cli-"));
   try {
     const shimPath = path.join(tmp, "claude.cmd");
@@ -144,10 +196,409 @@ test("resolveClaudeCodeExecutableForAcp keeps Windows cmd shim when Claude Code 
       "utf8",
     );
 
-    assert.equal(resolveClaudeCodeExecutableForAcp(shimPath, "win32"), shimPath);
+    assert.equal(resolveClaudeCodeExecutableForSdk(shimPath, "win32"), shimPath);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("resolveClaudeCodeExecutableForSdk maps Windows npm cmd shim to native claude.exe when cli.js is absent", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-claude-native-"));
+  try {
+    const shimPath = path.join(tmp, "claude.cmd");
+    const nativeExe = path.join(tmp, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+    fs.mkdirSync(path.dirname(nativeExe), { recursive: true });
+    fs.writeFileSync(nativeExe, "", "utf8");
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\n"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveClaudeCodeExecutableForSdk(shimPath, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveWindowsShimToNativeExe resolves npm .cmd shim to native exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-shim-native-"));
+  try {
+    const shimPath = path.join(tmp, "claude.cmd");
+    const nativeExe = path.join(tmp, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+    fs.mkdirSync(path.dirname(nativeExe), { recursive: true });
+    fs.writeFileSync(nativeExe, "", "utf8");
+    // Single backslashes in the .cmd content (%~dp0 expands to the shim dir)
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\n"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n',
+      "utf8",
+    );
+
+    const resolved = resolveWindowsShimToNativeExe(shimPath, "win32");
+    assert.equal(resolved, nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCommandForSpawn can skip native exe unwrap for node+script shims", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-spawn-no-unwrap-"));
+  try {
+    const shimPath = path.join(tmp, "cursor-agent.cmd");
+    const nodeExe = path.join(tmp, "versions", "2026.06.01-abc", "node.exe");
+    fs.mkdirSync(path.dirname(nodeExe), { recursive: true });
+    fs.writeFileSync(nodeExe, "", "utf8");
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\n"%~dp0\\versions\\2026.06.01-abc\\node.exe" "%~dp0\\versions\\2026.06.01-abc\\index.js" %*\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveWindowsShimToNativeExe(shimPath, "win32"), nodeExe);
+
+    const unwrapped = prepareCommandForSpawn(shimPath, ["status", "--format", "json"]);
+    const wrapped = prepareCommandForSpawn(shimPath, ["status", "--format", "json"], {
+      unwrapNativeExe: false,
+    });
+    if (process.platform === "win32") {
+      assert.deepEqual(unwrapped, {
+        command: nodeExe,
+        args: ["status", "--format", "json"],
+        shell: false,
+      });
+      assert.deepEqual(wrapped, {
+        command: buildWindowsShellCommandLine(shimPath, ["status", "--format", "json"]),
+        args: [],
+        shell: true,
+      });
+    } else {
+      assert.equal(unwrapped.shell, false);
+      assert.equal(wrapped.shell, false);
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCommandForSpawn resolves Windows cmd shim to native exe with shell:false", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-spawn-native-"));
+  try {
+    const shimPath = path.join(tmp, "claude.cmd");
+    const nativeExe = path.join(tmp, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+    fs.mkdirSync(path.dirname(nativeExe), { recursive: true });
+    fs.writeFileSync(nativeExe, "", "utf8");
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\n"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n',
+      "utf8",
+    );
+
+    const result = prepareCommandForSpawn(shimPath, ["--version"]);
+    if (process.platform === "win32") {
+      assert.deepEqual(result, {
+        command: nativeExe,
+        args: ["--version"],
+        shell: false,
+      });
+    } else {
+      // On non-Windows, resolveWindowsShimToNativeExe is skipped; verify win32 behavior explicitly.
+      assert.equal(resolveWindowsShimToNativeExe(shimPath, "win32"), nativeExe);
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+function writeCodexWin32NativeLayout(globalPrefix, arch = process.arch === "arm64" ? "arm64" : "x64") {
+  const triple = arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+  const platformPackage = arch === "arm64" ? "@openai/codex-win32-arm64" : "@openai/codex-win32-x64";
+  const nativeExe = path.join(
+    globalPrefix,
+    "node_modules",
+    platformPackage,
+    "vendor",
+    triple,
+    "bin",
+    "codex.exe",
+  );
+  fs.mkdirSync(path.dirname(nativeExe), { recursive: true });
+  fs.writeFileSync(nativeExe, "", "utf8");
+  return nativeExe;
+}
+
+test("resolveCodexExecutableForSdk maps Windows npm cmd shim to native codex.exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-shim-"));
+  try {
+    const shimPath = path.join(tmp, "codex.cmd");
+    const nativeExe = writeCodexWin32NativeLayout(tmp);
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\nnode "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveCodexExecutableForSdk(shimPath, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexExecutableForSdk maps Windows local npm bin shim to native codex.exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-local-shim-"));
+  try {
+    const shimPath = path.join(tmp, "node_modules", ".bin", "codex.cmd");
+    const nativeExe = writeCodexWin32NativeLayout(tmp);
+    fs.mkdirSync(path.dirname(shimPath), { recursive: true });
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\nnode "%~dp0\\..\\@openai\\codex\\bin\\codex.js" %*\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveCodexExecutableForSdk(shimPath, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexExecutableForSdk leaves non-Windows Codex paths unchanged", () => {
+  assert.equal(
+    resolveCodexExecutableForSdk("/usr/local/bin/codex", "darwin"),
+    "/usr/local/bin/codex",
+  );
+});
+
+test("resolveCodexExecutableForSdk returns null for Windows cmd shim when native codex.exe is missing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-missing-native-"));
+  try {
+    const shimPath = path.join(tmp, "codex.cmd");
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\nnode "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveCodexExecutableForSdk(shimPath, "win32"), null);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexExecutableForSdk maps Windows nvmd bin shim to native codex.exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-nvmd-shim-"));
+  try {
+    const nvmdHome = path.join(tmp, ".nvmd");
+    const binDir = path.join(nvmdHome, "bin");
+    const versionRoot = path.join(nvmdHome, "versions", "22.14.0");
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(nvmdHome, "default"), "22.14.0\n", "utf8");
+    fs.writeFileSync(
+      path.join(nvmdHome, "packages.json"),
+      JSON.stringify({ codex: ["22.14.0"] }),
+      "utf8",
+    );
+
+    // nvmd Windows package shims are copies of npm.cmd / nvmd.exe, not npm's
+    // @openai/codex launcher. The real install lives under versions/<ver>/.
+    const shimPath = path.join(binDir, "codex.cmd");
+    fs.writeFileSync(shimPath, '@echo off\r\n"%~dpn0.exe" %*\r\n', "utf8");
+    fs.writeFileSync(path.join(binDir, "codex.exe"), "", "utf8");
+    fs.writeFileSync(path.join(binDir, "nvmd.exe"), "", "utf8");
+
+    const nativeExe = writeCodexWin32NativeLayout(versionRoot);
+
+    assert.equal(resolveCodexExecutableForSdk(shimPath, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexExecutableForSdk maps Windows nvmd.exe package shim to native codex.exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-nvmd-exe-"));
+  try {
+    const nvmdHome = path.join(tmp, ".nvmd");
+    const binDir = path.join(nvmdHome, "bin");
+    const versionRoot = path.join(nvmdHome, "versions", "20.18.0");
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(nvmdHome, "default"), "20.18.0\n", "utf8");
+
+    const shimPath = path.join(binDir, "codex.exe");
+    fs.writeFileSync(shimPath, "", "utf8");
+    fs.writeFileSync(path.join(binDir, "nvmd.exe"), "", "utf8");
+    const nativeExe = writeCodexWin32NativeLayout(versionRoot);
+
+    assert.equal(resolveCodexExecutableForSdk(shimPath, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexExecutableForSdk maps Windows PowerShell shim to native codex.exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-ps1-shim-"));
+  try {
+    const shimPath = path.join(tmp, "codex.ps1");
+    const nativeExe = writeCodexWin32NativeLayout(tmp);
+    fs.writeFileSync(
+      shimPath,
+      '& "$basedir/node_modules/@openai/codex/bin/codex.js" $args\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveCodexExecutableForSdk(shimPath, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexExecutableForSdk maps codex.js entry to native codex.exe", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-js-entry-"));
+  try {
+    const codexJs = path.join(tmp, "node_modules", "@openai", "codex", "bin", "codex.js");
+    const nativeExe = writeCodexWin32NativeLayout(tmp);
+    fs.mkdirSync(path.dirname(codexJs), { recursive: true });
+    fs.writeFileSync(codexJs, "", "utf8");
+
+    assert.equal(resolveCodexExecutableForSdk(codexJs, "win32"), nativeExe);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("addCodexExecutableEnvForSdk prepends bundled Codex path dir on Windows", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-env-path-"));
+  try {
+    const nativeExe = writeCodexWin32NativeLayout(tmp);
+    const pathDir = path.join(path.dirname(path.dirname(nativeExe)), "codex-path");
+    fs.mkdirSync(pathDir, { recursive: true });
+
+    const env = addCodexExecutableEnvForSdk({ Path: "C:\\Windows\\System32" }, nativeExe, "win32");
+
+    assert.equal(env.Path, `${pathDir};C:\\Windows\\System32`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+function writeCodebuddyWin32BinLayout(dir) {
+  const binJs = path.join(dir, "node_modules", "@tencent-ai", "codebuddy-code", "bin", "codebuddy");
+  fs.mkdirSync(path.dirname(binJs), { recursive: true });
+  fs.writeFileSync(binJs, "#!/usr/bin/env node\n", "utf8");
+  return binJs;
+}
+
+test("resolveCodebuddyExecutableForSdk leaves non-Windows CodeBuddy paths unchanged", () => {
+  assert.equal(
+    resolveCodebuddyExecutableForSdk("/usr/local/bin/codebuddy", "darwin"),
+    "/usr/local/bin/codebuddy",
+  );
+});
+
+test("resolveCodebuddyExecutableForSdk maps Windows npm cmd shim to package bin/codebuddy", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codebuddy-shim-"));
+  try {
+    const shimPath = path.join(tmp, "codebuddy.cmd");
+    const binJs = writeCodebuddyWin32BinLayout(tmp);
+    fs.writeFileSync(
+      shimPath,
+      '@ECHO off\r\nnode "%~dp0\\node_modules\\@tencent-ai\\codebuddy-code\\bin\\codebuddy" %*\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveCodebuddyExecutableForSdk(shimPath, "win32"), binJs);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodebuddyExecutableForSdk maps extensionless Windows shim to package bin/codebuddy", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codebuddy-noext-"));
+  try {
+    const shimPath = path.join(tmp, "codebuddy");
+    const binJs = writeCodebuddyWin32BinLayout(tmp);
+    fs.writeFileSync(shimPath, "#!/bin/sh\n", "utf8");
+
+    assert.equal(resolveCodebuddyExecutableForSdk(shimPath, "win32"), binJs);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodebuddyExecutableForSdk returns null for Windows cmd shim when package JS is missing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codebuddy-missing-"));
+  try {
+    const shimPath = path.join(tmp, "codebuddy.cmd");
+    fs.writeFileSync(shimPath, "@ECHO off\r\nnode foo %*\r\n", "utf8");
+
+    assert.equal(resolveCodebuddyExecutableForSdk(shimPath, "win32"), null);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodebuddyExecutableForSdk passes through a native exe path", () => {
+  assert.equal(
+    resolveCodebuddyExecutableForSdk("C:\\tools\\codebuddy.exe", "win32"),
+    "C:\\tools\\codebuddy.exe",
+  );
+});
+
+test("parseRegQueryPath extracts the Path value from reg query output", () => {
+  const out = parseRegQueryPath(
+    "\r\nHKEY_CURRENT_USER\\Environment\r\n    Path    REG_EXPAND_SZ    C:\\Users\\me\\AppData\\Roaming\\npm;C:\\tools\r\n",
+  );
+  assert.equal(out, "C:\\Users\\me\\AppData\\Roaming\\npm;C:\\tools");
+});
+
+test("parseRegQueryPath handles REG_SZ and missing value", () => {
+  assert.equal(parseRegQueryPath("    Path    REG_SZ    C:\\bin"), "C:\\bin");
+  assert.equal(parseRegQueryPath("HKEY_CURRENT_USER\\Environment\r\n    Temp    REG_SZ    C:\\Temp"), "");
+});
+
+test("expandWindowsEnvRefs expands %VAR% case-insensitively", () => {
+  assert.equal(
+    expandWindowsEnvRefs("%AppData%\\npm;%Other%", { APPDATA: "C:\\Users\\me\\AppData\\Roaming" }),
+    "C:\\Users\\me\\AppData\\Roaming\\npm;%Other%",
+  );
+});
+
+test("mergeWindowsPath dedupes case-insensitively and trims trailing slashes", () => {
+  const out = mergeWindowsPath(
+    "C:\\Windows\\System32;C:\\tools\\",
+    "c:\\windows\\system32;C:\\tools;C:\\new",
+  );
+  assert.equal(out, "C:\\Windows\\System32;C:\\tools\\;C:\\new");
+});
+
+test("mergeWindowsPath keeps refreshed Windows PATH entries ahead of stale process entries", () => {
+  const out = mergeWindowsPath(
+    "C:\\new-codebuddy;C:\\Windows\\System32",
+    "C:\\Users\\me\\AppData\\Roaming\\npm",
+    "C:\\old-codebuddy;C:\\Windows\\System32",
+  );
+  assert.equal(out, "C:\\new-codebuddy;C:\\Windows\\System32;C:\\Users\\me\\AppData\\Roaming\\npm;C:\\old-codebuddy");
+});
+
+test("readWindowsRegistryPath merges HKCU and HKLM and expands refs", async () => {
+  const exec = async (cmd, args) => {
+    assert.equal(cmd, "reg");
+    const hive = args[1];
+    if (hive === "HKCU\\Environment") {
+      return { stdout: "    Path    REG_EXPAND_SZ    %APPDATA%\\npm\r\n" };
+    }
+    return { stdout: "    Path    REG_EXPAND_SZ    C:\\Windows\\System32\r\n" };
+  };
+  const out = await readWindowsRegistryPath({ exec, env: { APPDATA: "C:\\Roaming" } });
+  assert.equal(out, "C:\\Roaming\\npm;C:\\Windows\\System32");
+});
+
+test("readWindowsRegistryPath tolerates a failing hive query", async () => {
+  const exec = async (cmd, args) => {
+    if (args[1] === "HKCU\\Environment") throw new Error("ERROR: cannot read");
+    return { stdout: "    Path    REG_SZ    C:\\tools\r\n" };
+  };
+  const out = await readWindowsRegistryPath({ exec, env: {} });
+  assert.equal(out, "C:\\tools");
 });
 
 test("tracks PowerShell idle prompt after SSH output", () => {
@@ -294,55 +745,3 @@ function withExecPath(fakePath, fn) {
     Object.defineProperty(process, "execPath", { value: original, configurable: true, writable: true });
   }
 }
-
-test("resolveClaudeAcpBinaryPath sets ELECTRON_RUN_AS_NODE when packaged execPath is not node", (t) => {
-  // Simulate the packaged Electron case where process.execPath is the app
-  // binary (e.g. Netcatty.exe).  We copy the real node binary to a fake path
-  // so existsSync() succeeds while basename != "node".
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-acp-runtime-"));
-  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
-  const fakeRuntime = path.join(tempDir, process.platform === "win32" ? "Netcatty.exe" : "Netcatty");
-  fs.copyFileSync(process.execPath, fakeRuntime);
-
-  const result = withExecPath(fakeRuntime, () =>
-    resolveClaudeAcpBinaryPath(null, { app: { isPackaged: true } }),
-  );
-
-  assert.equal(result.command, fakeRuntime);
-  assert.equal(result.prependArgs.length, 1);
-  assert.ok(
-    result.prependArgs[0].endsWith(path.join("claude-agent-acp", "dist", "index.js")),
-    `prependArgs[0] should point at the bundled script, got: ${result.prependArgs[0]}`,
-  );
-  assert.deepEqual(result.env, { ELECTRON_RUN_AS_NODE: "1" });
-});
-
-test("resolveClaudeAcpBinaryPath leaves env empty when execPath is a real node binary", (t) => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-acp-runtime-node-"));
-  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
-  const fakeRuntime = path.join(tempDir, process.platform === "win32" ? "node.exe" : "node");
-  fs.copyFileSync(process.execPath, fakeRuntime);
-
-  const result = withExecPath(fakeRuntime, () =>
-    resolveClaudeAcpBinaryPath(null, { app: { isPackaged: true } }),
-  );
-
-  assert.equal(result.command, fakeRuntime);
-  assert.deepEqual(result.env, {});
-});
-
-test("resolveClaudeAcpBinaryPath falls back to bundled script in dev mode when nothing is on PATH", () => {
-  // Dev mode (isPackaged = false) with a shellEnv whose PATH cannot resolve
-  // claude-agent-acp falls through to the bundled-script branch, which uses
-  // process.execPath as the runtime.
-  const result = resolveClaudeAcpBinaryPath({ PATH: "" }, { app: { isPackaged: false } });
-
-  assert.equal(result.command, process.execPath);
-  assert.equal(result.prependArgs.length, 1);
-  assert.ok(
-    result.prependArgs[0].endsWith(path.join("claude-agent-acp", "dist", "index.js")),
-    `prependArgs[0] should point at the bundled script, got: ${result.prependArgs[0]}`,
-  );
-  // Test runner's process.execPath is a real node, so no ELECTRON_RUN_AS_NODE here.
-  assert.deepEqual(result.env, {});
-});

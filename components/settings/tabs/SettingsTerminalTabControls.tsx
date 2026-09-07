@@ -6,6 +6,7 @@ import { DEFAULT_KEYWORD_HIGHLIGHT_RULES, type KeywordHighlightRule } from "../.
 import { useI18n } from "../../../application/i18n/I18nProvider";
 import { TERMINAL_THEMES } from "../../../infrastructure/config/terminalThemes";
 import { cn } from "../../../lib/utils";
+import { Toggle } from "../settings-ui";
 import { Button } from "../../ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "../../ui/dialog";
 import { Input } from "../../ui/input";
@@ -14,6 +15,16 @@ import { Textarea } from "../../ui/textarea";
 
 // Keyword highlight rules editor for global settings
 const DEFAULT_NEW_RULE_COLOR = '#F87171';
+
+/** Temporarily disable/enable one rule without deleting it. */
+export function toggleKeywordHighlightRuleEnabled(
+  rules: KeywordHighlightRule[],
+  ruleId: string,
+): KeywordHighlightRule[] {
+  return rules.map((rule) => (
+    rule.id === ruleId ? { ...rule, enabled: !rule.enabled } : rule
+  ));
+}
 
 export const AddCustomRuleDialog: React.FC<{
   open: boolean;
@@ -194,6 +205,11 @@ export const KeywordHighlightRulesEditor: React.FC<{
                 style={{ backgroundColor: rule.color }}
               />
             </label>
+            <Toggle
+              checked={rule.enabled}
+              onChange={() => onChange(toggleKeywordHighlightRuleEnabled(rules, rule.id))}
+              ariaLabel={`${rule.label}, ${rule.enabled ? t('common.enabled') : t('common.disabled')}`}
+            />
           </div>
         );
       })}
@@ -249,15 +265,18 @@ export const KeywordHighlightRulesEditor: React.FC<{
 // Theme preview button component
 export const ThemePreviewButton: React.FC<{
   theme: (typeof TERMINAL_THEMES)[0];
-  onClick: () => void;
+  onClick?: () => void;
   buttonLabel: string;
-}> = ({ theme, onClick, buttonLabel }) => {
+  disabled?: boolean;
+}> = ({ theme, onClick, buttonLabel, disabled = false }) => {
   const c = theme.colors;
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
       className={cn(
-        "w-full flex items-center gap-4 p-3 rounded-lg border bg-card hover:bg-accent/50 transition-all text-left",
+        "w-full flex items-center gap-4 p-3 rounded-lg border bg-card transition-all text-left",
+        disabled ? "cursor-default" : "hover:bg-accent/50",
       )}
     >
       {/* Theme preview swatch */}
@@ -288,7 +307,7 @@ export const ThemePreviewButton: React.FC<{
       {/* Action button area */}
       <div className="flex items-center gap-2 text-muted-foreground">
         <span className="text-xs">{buttonLabel}</span>
-        <ChevronRight size={16} />
+        {!disabled && <ChevronRight size={16} />}
       </div>
     </button>
   );

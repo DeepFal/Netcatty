@@ -1,9 +1,101 @@
 /* eslint-disable no-undef */
+const {
+  windowsFramelessContentChromeOptions,
+} = require("./windowsWindowChrome.cjs");
+const { attachDisplayRecovery } = require("./displayRecovery.cjs");
+
+const TERMINAL_KEYBOARD_FOCUS = Symbol("netcattyTerminalKeyboardFocus");
+
+function setTerminalKeyboardFocusForWindow(win, focused) {
+  if (!win || win.isDestroyed?.() || !win.webContents) return false;
+  const isFocused = focused === true;
+  try {
+    win[TERMINAL_KEYBOARD_FOCUS] = isFocused;
+    win.webContents.setIgnoreMenuShortcuts?.(isFocused);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasTerminalKeyboardFocus(win) {
+  return win?.[TERMINAL_KEYBOARD_FOCUS] === true;
+}
+
 function createMainWindowApi(ctx) {
   with (ctx) {
     async function createWindow(electronModule, options) {
       const { BrowserWindow, nativeTheme, app, screen, shell } = electronModule;
-      const { preload, devServerUrl, isDev, appIcon, isMac, onRegisterBridge, electronDir } = options;
+      const {
+        preload,
+        devServerUrl,
+        isDev,
+        appIcon,
+        isMac,
+        onRegisterBridge,
+        electronDir,
+        route,
+        onAppContentWindowClosed,
+        registerAsMainWindow = true,
+        persistWindowState = registerAsMainWindow,
+        registerAsAppContentWindow = true,
+        startHidden = false,
+      } = options;
+      const rendererHash = typeof route === "string" && route.trim()
+        ? `#/${route.trim().replace(/^#?\/*/, "")}`
+        : "";
+      const CHROMIUM_ZOOM_FACTORS = [
+        0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5,
+      ];
+
+      const isPrimaryZoomInEqualInput = (input) => {
+        if (input?.type !== "keyDown") return false;
+        if (input.alt) return false;
+        const hasPrimaryModifier = isMac
+          ? Boolean(input.meta) && !input.control
+          : Boolean(input.control) && !input.meta;
+        if (!hasPrimaryModifier || input.shift) return false;
+        return String(input.key || "") === "=";
+      };
+
+      const isPrimaryZoomOutMinusInput = (input) => {
+        if (input?.type !== "keyDown") return false;
+        if (input.alt) return false;
+        const hasPrimaryModifier = isMac
+          ? Boolean(input.meta) && !input.control
+          : Boolean(input.control) && !input.meta;
+        if (!hasPrimaryModifier || input.shift) return false;
+        return String(input.key || "") === "-";
+      };
+
+      const isPrimaryResetZoomInput = (input) => {
+        if (input?.type !== "keyDown") return false;
+        if (input.alt) return false;
+        const hasPrimaryModifier = isMac
+          ? Boolean(input.meta) && !input.control
+          : Boolean(input.control) && !input.meta;
+        if (!hasPrimaryModifier || input.shift) return false;
+        return String(input.key || "") === "0";
+      };
+
+      const adjustWindowZoom = (mode) => {
+        const webContents = win?.webContents;
+        if (!webContents || webContents.isDestroyed?.()) return false;
+        const currentFactor = Number(webContents.getZoomFactor?.());
+        const safeCurrentFactor = Number.isFinite(currentFactor) ? currentFactor : 1;
+        const nextFactor = mode === "in"
+          ? CHROMIUM_ZOOM_FACTORS.find((factor) => factor > safeCurrentFactor + 0.0001)
+          : mode === "out"
+            ? [...CHROMIUM_ZOOM_FACTORS].reverse().find((factor) => factor < safeCurrentFactor - 0.0001)
+            : 1;
+        if (!nextFactor) return false;
+        try {
+          webContents.setZoomFactor?.(nextFactor);
+          return true;
+        } catch {
+          return false;
+        }
+      };
     
       // Store app reference for window state persistence
       electronApp = app;
@@ -15,7 +107,7 @@ function createMainWindowApi(ctx) {
       const themeConfig = THEME_COLORS[effectiveTheme] || THEME_COLORS.light;
     
       // Load saved window state
-      const savedState = loadWindowState();
+      const savedState = persistWindowState ? loadWindowState() : null;
       let windowBounds = {
         width: DEFAULT_WINDOW_WIDTH,
         height: DEFAULT_WINDOW_HEIGHT,
@@ -53,6 +145,8 @@ function createMainWindowApi(ctx) {
         }
       }
     
+      const windowsChrome = !isMac ? windowsFramelessContentChromeOptions() : {};
+
       const win = new BrowserWindow({
         ...windowBounds,
         minWidth: MIN_WINDOW_WIDTH,
@@ -63,19 +157,46 @@ function createMainWindowApi(ctx) {
         frame: isMac,
         titleBarStyle: isMac ? "hiddenInset" : undefined,
         trafficLightPosition: isMac ? { x: 12, y: 12 } : undefined,
+        ...windowsChrome,
         webPreferences: {
           preload,
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: false,
+          spellcheck: false,
+          backgroundThrottling: false,
           v8CacheOptions: V8_CACHE_OPTIONS,
         },
       });
     
-      mainWindow = win;
+      if (registerAsMainWindow) {
+        if (typeof registerMainWindow === "function") {
+          registerMainWindow(win);
+        } else {
+          mainWindow = win;
+        }
+      } else if (registerAsAppContentWindow && typeof registerAppContentWindow === "function") {
+        registerAppContentWindow(win, { queryDirtyEditors: true });
+      }
     
+      // Multi-monitor recovery (#3244): Windows lock/sleep can temporarily
+      // tear down a secondary display and the OS relocates the window onto
+      // the primary display. When the display comes back, put the window back
+      // where the user left it.
+      let detachDisplayRecovery = null;
+      try {
+        detachDisplayRecovery = attachDisplayRecovery({ win, screen });
+      } catch {
+        detachDisplayRecovery = null;
+      }
+
       // Clear reference when the main window is destroyed
       win.on('closed', () => {
+        try {
+          detachDisplayRecovery?.();
+        } catch {
+          // ignore
+        }
         try {
           if (win?.webContents?.id) {
             unhealthyWebContentsIds.delete(win.webContents.id);
@@ -84,7 +205,26 @@ function createMainWindowApi(ctx) {
         } catch {
           // ignore
         }
-        if (mainWindow === win) mainWindow = null;
+        if (registerAsMainWindow) {
+          if (typeof unregisterMainWindow === "function") {
+            unregisterMainWindow(win);
+          } else if (mainWindow === win) {
+            mainWindow = null;
+          }
+        } else if (registerAsAppContentWindow && typeof unregisterAppContentWindow === "function") {
+          unregisterAppContentWindow(win);
+        }
+        if (registerAsAppContentWindow) {
+          try {
+            if (typeof notifyAppContentWindowClosed === "function") {
+              notifyAppContentWindowClosed(win);
+            } else {
+              onAppContentWindowClosed?.(win);
+            }
+          } catch {
+            // The application-level close fallback must not disrupt teardown.
+          }
+        }
       });
     
       // Log renderer crashes for diagnostics (skip normal clean exits)
@@ -105,7 +245,7 @@ function createMainWindowApi(ctx) {
         } catch {}
         console.error("[WindowManager] Renderer process gone:", details);
       });
-    
+
       // Prevent top-level navigation away from the app origin. If a remote origin ever
       // loads in a privileged window (with preload), it can become an RCE vector.
       const allowedOrigins = new Set(["app://netcatty"]);
@@ -118,11 +258,23 @@ function createMainWindowApi(ctx) {
       }
       const isAllowedTopLevelUrl = (targetUrl) => {
         try {
-          return allowedOrigins.has(new URL(String(targetUrl)).origin);
+          const parsedUrl = new URL(String(targetUrl));
+          if (parsedUrl.protocol === "app:" && parsedUrl.host === "netcatty") return true;
+          return allowedOrigins.has(parsedUrl.origin);
         } catch {
           return false;
         }
       };
+      win.webContents.on("did-start-navigation", (_event, targetUrl, isInPlace, isMainFrame) => {
+        if (isMainFrame === false || isInPlace === true || !isAllowedTopLevelUrl(targetUrl)) return;
+        try {
+          if (typeof clearRendererReadyForWebContents === "function") {
+            clearRendererReadyForWebContents(win.webContents?.id);
+          }
+        } catch {
+          // ignore
+        }
+      });
       const blockUntrustedNavigation = (event, targetUrl) => {
         if (isAllowedTopLevelUrl(targetUrl)) return;
         try {
@@ -139,7 +291,37 @@ function createMainWindowApi(ctx) {
       // Terminal apps need these keys to pass through to the remote shell (e.g., byobu, tmux).
       // Using setIgnoreMenuShortcuts lets the keydown still reach the page (xterm.js)
       // while preventing Chromium's built-in shortcuts from triggering.
-      win.webContents.on("before-input-event", (_event, input) => {
+      win.webContents.on("before-input-event", (event, input) => {
+        if (isMac && shouldCloseWindowFromInput(input)) {
+          event.preventDefault();
+          requestWindowCommandClose(win);
+          return;
+        }
+
+        const isTerminalFontShortcut =
+          isPrimaryZoomInEqualInput(input)
+          || isPrimaryZoomOutMinusInput(input)
+          || isPrimaryResetZoomInput(input);
+        if (hasTerminalKeyboardFocus(win) && isTerminalFontShortcut) {
+          win.webContents.setIgnoreMenuShortcuts(true);
+          return;
+        }
+
+        if (isPrimaryZoomInEqualInput(input) && adjustWindowZoom("in")) {
+          event.preventDefault();
+          return;
+        }
+
+        if (isPrimaryZoomOutMinusInput(input) && adjustWindowZoom("out")) {
+          event.preventDefault();
+          return;
+        }
+
+        if (isPrimaryResetZoomInput(input) && adjustWindowZoom("reset")) {
+          event.preventDefault();
+          return;
+        }
+
         if (input.alt && !input.control && !input.meta) {
           if (input.key === "ArrowLeft" || input.key === "ArrowRight") {
             win.webContents.setIgnoreMenuShortcuts(true);
@@ -163,6 +345,8 @@ function createMainWindowApi(ctx) {
       // Track window bounds for saving (use last non-maximized/non-fullscreen bounds)
       let lastNormalBounds = null;
       let saveStateTimer = null;
+      let thisWindowCloseRequested = false;
+      let dirtyEditorCloseConfirmed = false;
     
       const updateNormalBounds = () => {
         if (!win.isDestroyed() && !win.isMaximized() && !win.isFullScreen()) {
@@ -171,6 +355,7 @@ function createMainWindowApi(ctx) {
       };
     
       const scheduleSaveState = () => {
+        if (!persistWindowState) return;
         if (saveStateTimer) clearTimeout(saveStateTimer);
         saveStateTimer = setTimeout(() => {
           const state = getWindowBoundsState(win, lastNormalBounds);
@@ -195,24 +380,66 @@ function createMainWindowApi(ctx) {
         scheduleSaveState();
       });
     
+      const queryDirtyEditorsBeforeClose = (event, { markCloseRequested = false } = {}) => {
+        event.preventDefault();
+        if (markCloseRequested) {
+          thisWindowCloseRequested = true;
+        }
+        const dirtyEditorQuery = typeof queryDirtyEditors === "function"
+          ? queryDirtyEditors(win.webContents, 5000, { ipcMain: electronModule.ipcMain })
+          : false;
+        Promise.resolve(dirtyEditorQuery)
+          .then((hasDirty) => {
+            if (hasDirty) {
+              thisWindowCloseRequested = false;
+              return;
+            }
+            dirtyEditorCloseConfirmed = true;
+            try {
+              win.close();
+            } catch {
+              // ignore
+            }
+          })
+          .catch(() => {
+            dirtyEditorCloseConfirmed = true;
+            try {
+              win.close();
+            } catch {
+              // ignore
+            }
+          });
+      };
+
       // Save state when window is about to close
       win.on("close", (event) => {
+        if (!registerAsMainWindow && registerAsAppContentWindow && !isQuitting && !dirtyEditorCloseConfirmed) {
+          queryDirtyEditorsBeforeClose(event, { markCloseRequested: true });
+          return;
+        }
+
         // Check if close-to-tray is enabled
-        if (!isQuitting && getGlobalShortcutBridge().handleWindowClose(event, win)) {
+        const trackedMainWindowCount = typeof getMainWindowCount === "function" ? getMainWindowCount() : 1;
+        if (registerAsMainWindow && trackedMainWindowCount <= 1 && !isQuitting && getGlobalShortcutBridge().handleWindowClose(event, win)) {
           // Window was hidden to tray - save state before returning
           if (saveStateTimer) clearTimeout(saveStateTimer);
-          const state = getWindowBoundsState(win, lastNormalBounds);
+          const state = persistWindowState ? getWindowBoundsState(win, lastNormalBounds) : null;
           if (state) saveWindowStateSync(state);
           hideSettingsWindow();
           return;
         }
-    
-        if (windowStateCloseRequested) {
+
+        if (registerAsMainWindow && registerAsAppContentWindow && !isQuitting && !dirtyEditorCloseConfirmed) {
+          queryDirtyEditorsBeforeClose(event);
           return;
         }
-        windowStateCloseRequested = true;
+    
+        if (thisWindowCloseRequested) {
+          return;
+        }
+        thisWindowCloseRequested = true;
         if (saveStateTimer) clearTimeout(saveStateTimer);
-        const state = getWindowBoundsState(win, lastNormalBounds);
+        const state = persistWindowState ? getWindowBoundsState(win, lastNormalBounds) : null;
         if (pendingWindowStateWrite) {
           event.preventDefault();
           if (state) queuedWindowState = state;
@@ -221,9 +448,9 @@ function createMainWindowApi(ctx) {
               // ignore async write errors before closing
             })
             .finally(() => {
-              const finalState = getWindowBoundsState(win, lastNormalBounds);
+              const finalState = persistWindowState ? getWindowBoundsState(win, lastNormalBounds) : null;
               if (finalState) saveWindowStateSync(finalState);
-              closeSettingsWindow();
+              if (registerAsMainWindow) closeSettingsWindow();
               try {
                 win.close();
               } catch {
@@ -233,7 +460,7 @@ function createMainWindowApi(ctx) {
           return;
         }
         if (state) saveWindowStateSync(state);
-        closeSettingsWindow();
+        if (registerAsMainWindow) closeSettingsWindow();
       });
     
       const safeSend = (channel, ...args) => {
@@ -256,6 +483,21 @@ function createMainWindowApi(ctx) {
         updateNormalBounds();
         scheduleSaveState();
       });
+
+      win.on("show", () => {
+        safeSend("netcatty:window:shown");
+        if (startHidden) {
+          // The hidden-launch tray pin exists so a --hidden cold start is
+          // never a windowless, trayless zombie; once this window is
+          // actually visible that concern no longer applies, so hand tray
+          // lifetime back to the user's normal close-to-tray preference.
+          try {
+            getGlobalShortcutBridge().releaseHiddenLaunchTrayPin?.();
+          } catch (err) {
+            console.warn("[MainWindow] Failed to release hidden-launch tray pin:", err?.message || err);
+          }
+        }
+      });
     
       // Ensure native background matches frontend background, even before first paint.
       try {
@@ -263,10 +505,12 @@ function createMainWindowApi(ctx) {
       } catch {
         // ignore
       }
+
+      applyWindowOpacityToWindow(win);
     
       // Defer show until renderer is ready; use fallback timeout to avoid keeping window hidden forever.
       // Production gets a shorter timeout since the splash screen provides visual feedback.
-      setupDeferredShow(win, { timeoutMs: isDev ? 3000 : 1500 });
+      setupDeferredShow(win, { timeoutMs: isDev ? 3000 : 1500, startHidden });
     
       win.webContents.on("did-create-window", (childWindow) => {
         try {
@@ -277,7 +521,8 @@ function createMainWindowApi(ctx) {
           // ignore
         }
         try {
-          if (appIcon && childWindow.setIcon) childWindow.setIcon(appIcon);
+          const iconPath = resolveLiveAppIcon(appIcon);
+          if (iconPath && childWindow.setIcon) childWindow.setIcon(iconPath);
         } catch {
           // ignore
         }
@@ -291,7 +536,11 @@ function createMainWindowApi(ctx) {
       });
     
       win.webContents.setWindowOpenHandler(
-        createAppWindowOpenHandler(shell, { backgroundColor, appIcon })
+        createAppWindowOpenHandler(shell, {
+          backgroundColor,
+          appIcon,
+          getAppIcon: () => resolveLiveAppIcon(appIcon),
+        })
       );
     
       // Register window control handlers
@@ -300,10 +549,23 @@ function createMainWindowApi(ctx) {
       // Register IPC handlers BEFORE loading any URL so the renderer never
       // calls a handler that hasn't been registered yet.
       onRegisterBridge?.(win);
-    
+
+      if (startHidden) {
+        // Belt-and-suspenders: guarantee a tray icon exists as soon as
+        // bridges (and electronModule) are ready, and keep it pinned
+        // (independent of the user's separate close-to-tray preference)
+        // until this window is actually shown — see releaseHiddenLaunchTrayPin
+        // in the "show" handler below.
+        try {
+          getGlobalShortcutBridge().pinTrayForHiddenLaunch?.();
+        } catch (err) {
+          console.warn("[MainWindow] Failed to create tray for hidden launch:", err?.message || err);
+        }
+      }
+
       if (isDev) {
         try {
-          await win.loadURL(getDevRendererBaseUrl(devServerUrl));
+          await win.loadURL(`${getDevRendererBaseUrl(devServerUrl)}${rendererHash}`);
           win.webContents.openDevTools({ mode: "detach" });
           return win;
         } catch (e) {
@@ -312,7 +574,7 @@ function createMainWindowApi(ctx) {
       }
     
       // Production mode - load via custom protocol.
-      await win.loadURL("app://netcatty/index.html");
+      await win.loadURL(`app://netcatty/index.html${rendererHash}`);
       return win;
     }
 
@@ -320,4 +582,7 @@ function createMainWindowApi(ctx) {
   }
 }
 
-module.exports = { createMainWindowApi };
+module.exports = {
+  createMainWindowApi,
+  setTerminalKeyboardFocusForWindow,
+};

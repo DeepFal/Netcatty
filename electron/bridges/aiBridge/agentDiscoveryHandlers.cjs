@@ -1,129 +1,178 @@
 /* eslint-disable no-undef */
+function getCursorPlatformPackageName(platform = process.platform, arch = process.arch) {
+  if (platform === "darwin" && (arch === "arm64" || arch === "x64")) return `@cursor/sdk-darwin-${arch}`;
+  if (platform === "linux" && (arch === "arm64" || arch === "x64")) return `@cursor/sdk-linux-${arch}`;
+  if (platform === "win32" && arch === "x64") return "@cursor/sdk-win32-x64";
+  return null;
+}
+
+// Bundled @cursor/sdk is importable in every Netcatty build. "installed" is the
+// user's Cursor Agent CLI, not that bundled package.
+function computeCursorInstallState({ sdkInstalled, cliBinPath, cliLoginOk } = {}) {
+  return {
+    sdkInstalled: Boolean(sdkInstalled),
+    installed: Boolean(cliBinPath) || Boolean(cliLoginOk),
+  };
+}
+
+async function probeCursorSdkAvailability(shellEnv, options = {}) {
+  const platformPackageName = getCursorPlatformPackageName();
+
+  let sdkInstalled = false;
+  if (platformPackageName) {
+    try {
+      await import("@cursor/sdk");
+      require.resolve(`${platformPackageName}/package.json`);
+      sdkInstalled = true;
+    } catch {
+      sdkInstalled = false;
+    }
+  }
+
+  const hasEnvApiKey = Boolean(shellEnv?.CURSOR_API_KEY);
+  const hasSettingsApiKey = Boolean(options?.apiKeyPresent);
+  const apiKeyOk = hasSettingsApiKey || hasEnvApiKey;
+  const probeCli = typeof options?.probeCursorCliAuth === "function"
+    ? options.probeCursorCliAuth
+    : null;
+  let cliAuth = { authenticated: false, authSource: null, email: null, binPath: null };
+  try {
+    if (probeCli) {
+      cliAuth = probeCli({ env: shellEnv }) || cliAuth;
+    }
+  } catch {
+    cliAuth = { authenticated: false, authSource: null, email: null, binPath: null };
+  }
+
+  const cliLoginOk = Boolean(cliAuth.authenticated);
+  const authenticated = apiKeyOk || cliLoginOk;
+  // authSource describes the primary credential for display priority; CLI UI
+  // must use cliLoginOk, not this field alone.
+  let authSource = null;
+  if (hasSettingsApiKey) authSource = "settings";
+  else if (hasEnvApiKey) authSource = "CURSOR_API_KEY";
+  else if (cliLoginOk) authSource = "cli-login";
+
+  const installState = computeCursorInstallState({
+    sdkInstalled,
+    cliBinPath: cliAuth.binPath,
+    cliLoginOk,
+  });
+  sdkInstalled = installState.sdkInstalled;
+  // Available if either mode can run a turn (API key + SDK, or CLI login).
+  const available = (apiKeyOk && sdkInstalled) || cliLoginOk;
+  const installed = installState.installed;
+  return {
+    installed,
+    sdkInstalled,
+    available,
+    authenticated,
+    authSource,
+    apiKeyOk,
+    cliLoginOk,
+    version: sdkInstalled ? "Cursor SDK" : (cliLoginOk || cliAuth.binPath ? "Cursor Agent CLI" : null),
+    cliBinPath: cliAuth.binPath || null,
+    cliEmail: cliAuth.email || null,
+  };
+}
+
 function registerAgentDiscoveryHandlers(ctx) {
   with (ctx) {
-  ipcMain.handle("netcatty:ai:agents:discover", async (event) => {
+  ipcMain.handle("netcatty:ai:agents:discover", async (event, options = {}) => {
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    if (options?.refreshShellEnv) {
+      invalidateShellEnvCache();
+    }
     const agents = [];
     const knownAgents = [
-      {
-        command: "claude",
-        name: "Claude Code",
-        icon: "claude",
-        description: "Anthropic's agentic coding assistant",
-        acpCommand: "claude-agent-acp",
-        acpArgs: [],
-        args: ["-p", "--output-format", "text", "{prompt}"],
-      },
-      {
-        command: "codex",
-        name: "Codex CLI",
-        icon: "openai",
-        description: "OpenAI's coding agent",
-        acpCommand: "codex-acp",
-        acpArgs: [],
-        args: ["exec", "--full-auto", "--json", "{prompt}"],
-        resolveAcp: resolveCodexAcpBinaryPath,
-      },
-      {
-        command: "copilot",
-        name: "GitHub Copilot CLI",
-        icon: "copilot",
-        description: "GitHub's coding agent CLI",
-        acpCommand: "copilot",
-        acpArgs: ["--acp", "--stdio"],
-        args: ["-p", "{prompt}"],
-      },
+      { command: "claude", name: "Claude Code", icon: "claude",
+        description: "Anthropic's agentic coding assistant", sdkBackend: "claude", args: [] },
+      { command: "codex", name: "Codex CLI", icon: "openai",
+        description: "OpenAI's coding agent", sdkBackend: "codex", args: [] },
+      { command: "copilot", name: "GitHub Copilot CLI", icon: "copilot",
+        description: "GitHub's coding agent CLI", sdkBackend: "copilot", args: [] },
+      { command: "cursor", name: "Cursor", icon: "cursor",
+        description: "Cursor's coding agent via Cursor SDK", sdkBackend: "cursor", args: [] },
+      { command: "codebuddy", name: "CodeBuddy Code", icon: "codebuddy",
+        description: "Tencent's coding agent CLI (Agent SDK)", sdkBackend: "codebuddy", args: [] },
+      { command: "opencode", name: "OpenCode", icon: "opencode",
+        description: "Open source coding agent via the official OpenCode SDK", sdkBackend: "opencode", args: [] },
+      { command: "grok", name: "Grok Build", icon: "grok",
+        description: "xAI's Grok Build coding agent CLI", sdkBackend: "grok", args: [] },
     ];
 
     const shellEnv = await getShellEnv();
     const seenPaths = new Set();
 
     for (const agent of knownAgents) {
-      let resolvedPath = resolveCliFromPath(agent.command, shellEnv);
-      const supportsBundledAcpFallback = agent.command === "codex";
+      let cursorSdkStatus = null;
+      if (agent.command === "cursor") {
+        cursorSdkStatus = await probeCursorSdkAvailability(shellEnv, {
+          apiKeyPresent: Boolean(options?.apiKeyPresent),
+          probeCursorCliAuth,
+        });
+        if (!cursorSdkStatus.available) continue;
+      }
 
-      // Codex can still work via bundled ACP if its standalone CLI is missing.
-      // Claude must resolve to the system `claude` executable and pass version probing.
-      // ACP resolvers return either a plain path or { command, prependArgs }.
-      let versionCommand = null;
-      let versionPrependArgs = [];
-      let usesAcpFallback = false;
-      const tryResolveAcpFallback = () => {
-        if (!agent.resolveAcp) return false;
-        const result = agent.resolveAcp(shellEnv, electronModule);
-        if (typeof result === "string") {
-          if (result && result !== agent.acpCommand && existsSync(result)) {
-            resolvedPath = result;
-            versionCommand = null;
-            versionPrependArgs = [];
-            usesAcpFallback = true;
-            return true;
-          }
-        } else if (result?.command) {
-          // On Windows the command may be `node` with the script in prependArgs.
-          // Use the script path for display/dedup so the UI shows the actual
-          // agent rather than the Node binary.
-          const scriptPath = result.prependArgs?.[0];
-          const displayPath = scriptPath || result.command;
-          if (displayPath !== agent.acpCommand && existsSync(displayPath)) {
-            resolvedPath = displayPath;
-            usesAcpFallback = true;
-            if (scriptPath) {
-              versionCommand = result.command;
-              versionPrependArgs = result.prependArgs;
-            } else {
-              versionCommand = null;
-              versionPrependArgs = [];
-            }
-            return true;
-          }
+      const resolvedPath = agent.command === "cursor"
+        ? (cursorSdkStatus.cliLoginOk
+          ? (cursorSdkStatus.cliBinPath || "cursor")
+          : (cursorSdkStatus.sdkInstalled ? "cursor" : (cursorSdkStatus.cliBinPath || "cursor")))
+        : await resolveCliFromPathAsync(agent.command, shellEnv); // Layer-1: locate
+      if (!resolvedPath || seenPaths.has(resolvedPath)) continue;
+
+      const probe = agent.command === "cursor"
+        ? { exitCode: 0, version: cursorSdkStatus.version }
+        : await probeCliVersion(resolvedPath, ["--version"], shellEnv); // Layer-2: version
+      const hasPlausibleVersion = agent.command === "cursor"
+        ? probe.exitCode === 0
+        : probe.exitCode === 0 && isPlausibleCliVersionOutput(probe.version);
+      if (!hasPlausibleVersion) continue;
+
+      // Layer-3: authentication (best-effort; never blocks discovery).
+      let auth = { authenticated: false, authSource: null };
+      try {
+        if (agent.command === "claude") {
+          auth = probeClaudeAuth({ env: shellEnv });
+        } else if (agent.command === "copilot") {
+          auth = probeCopilotAuth({});
+        } else if (agent.command === "codex") {
+          auth = { authenticated: false, authSource: null };
+        } else if (agent.command === "cursor") {
+          auth = {
+            authenticated: cursorSdkStatus.authenticated,
+            authSource: cursorSdkStatus.authSource,
+          };
+        } else if (agent.command === "codebuddy") {
+          auth = probeCodebuddyAuth({ env: shellEnv });
+        } else if (agent.command === "opencode") {
+          auth = { authenticated: true, authSource: "opencode-config" };
+        } else if (agent.command === "grok") {
+          auth = probeGrokAuth({ env: shellEnv });
         }
-        return false;
-      };
-      if (!resolvedPath && supportsBundledAcpFallback) {
-        tryResolveAcpFallback();
-      }
+      } catch { /* auth probe is best-effort */ }
 
-      if (!resolvedPath || seenPaths.has(resolvedPath)) {
-        continue;
-      }
-
-      // When the agent is invoked via Node (Windows), probe version with
-      // the full command (e.g. `node /path/to/dist/index.js --version`).
-      let probe = await probeCliVersion(versionCommand || resolvedPath, [...versionPrependArgs, "--version"], shellEnv);
-      let version = probe.version;
-      let hasPlausibleVersion = probe.exitCode === 0 && isPlausibleCliVersionOutput(version);
-      let hasUsableAcpFallback = isAcpFallbackProbeUsable(
-        agent.command,
-        usesAcpFallback,
-        resolvedPath,
-        probe,
-      );
-
-      if (!hasPlausibleVersion && !hasUsableAcpFallback && !usesAcpFallback && supportsBundledAcpFallback) {
-        const previousPath = resolvedPath;
-        if (tryResolveAcpFallback() && resolvedPath !== previousPath && !seenPaths.has(resolvedPath)) {
-          probe = await probeCliVersion(versionCommand || resolvedPath, [...versionPrependArgs, "--version"], shellEnv);
-          version = probe.version;
-          hasPlausibleVersion = probe.exitCode === 0 && isPlausibleCliVersionOutput(version);
-          hasUsableAcpFallback = isAcpFallbackProbeUsable(
-            agent.command,
-            usesAcpFallback,
-            resolvedPath,
-            probe,
-          );
-        }
-      }
-
-      if (!hasPlausibleVersion && !hasUsableAcpFallback) continue;
-
-      const { resolveAcp: _unused, ...agentInfo } = agent;
       agents.push({
-        ...agentInfo,
-        acpCommand: agent.command === "copilot" ? resolvedPath : agentInfo.acpCommand,
+        command: agent.command,
+        name: agent.name,
+        icon: agent.icon,
+        description: agent.description,
+        sdkBackend: agent.sdkBackend,
+        args: agent.args,
         path: resolvedPath,
-        version: hasPlausibleVersion ? version : "Bundled ACP",
+        binPath: resolvedPath,
+        version: probe.version,
+        installed: agent.command === "cursor" ? Boolean(cursorSdkStatus.installed) : true,
         available: true,
+        authenticated: auth.authenticated,
+        authSource: auth.authSource,
+        ...(agent.command === "cursor" ? {
+          cliEmail: cursorSdkStatus.cliEmail || null,
+          cliBinPath: cursorSdkStatus.cliBinPath || null,
+          cliLoginOk: Boolean(cursorSdkStatus.cliLoginOk),
+          apiKeyOk: Boolean(cursorSdkStatus.apiKeyOk),
+          sdkInstalled: Boolean(cursorSdkStatus.sdkInstalled),
+        } : {}),
       });
       seenPaths.add(resolvedPath);
     }
@@ -131,84 +180,80 @@ function registerAgentDiscoveryHandlers(ctx) {
     return agents;
   });
 
-  // Resolve a CLI binary path (auto-detect or validate custom path)
-  ipcMain.handle("netcatty:ai:resolve-cli", async (event, { command, customPath }) => {
+  ipcMain.handle("netcatty:ai:shell-env:prewarm", async (event) => {
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    try {
+      await getShellEnv();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  // Resolve a CLI binary path (auto-detect or validate custom path)
+  ipcMain.handle("netcatty:ai:resolve-cli", async (event, { command, customPath, refreshShellEnv, apiKeyPresent }) => {
+    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    if (refreshShellEnv) {
+      invalidateShellEnvCache();
+    }
     const shellEnv = await getShellEnv();
-    let resolvedPath = null;
-    let versionCommand = null;
-    let versionPrependArgs = [];
-    let usesAcpFallback = false;
-    const getBundledAcpFallback = () => {
-      if (command === "codex") {
-        const acpPath = resolveCodexAcpBinaryPath(shellEnv, electronModule);
-        if (acpPath && acpPath !== "codex-acp" && existsSync(acpPath)) {
-          return {
-            displayPath: acpPath,
-            command: null,
-            prependArgs: [],
-          };
-        }
-        return null;
-      }
-      return null;
-    };
-    const resolveBundledAcpFallback = () => {
-      const fallback = getBundledAcpFallback();
-      if (!fallback) return false;
-      if (resolvedPath === fallback.displayPath) {
-        versionCommand = fallback.command;
-        versionPrependArgs = fallback.prependArgs;
-        usesAcpFallback = true;
-        return true;
-      }
-      resolvedPath = fallback.displayPath;
-      versionCommand = fallback.command;
-      versionPrependArgs = fallback.prependArgs;
-      usesAcpFallback = true;
-      return true;
-    };
+    const hasCustomPath = command !== "cursor" && Boolean(String(customPath || "").trim());
 
-    if (customPath) {
+    let resolvedPath;
+    if (hasCustomPath) {
       // Normalize Windows shim paths like `codex` -> `codex.cmd` when present.
-      // Fall back to PATH search if the stored path no longer exists
-      // (e.g. CLI reinstalled to a different location).
-      resolvedPath = normalizeCliPathForPlatform(customPath) || resolveCliFromPath(command, shellEnv);
+      // A user-supplied path must be validated as-is; falling back to PATH would
+      // make Settings appear to accept one binary while actually using another.
+      resolvedPath = normalizeCliPathForPlatform(customPath);
     } else {
-      resolvedPath = resolveCliFromPath(command, shellEnv);
+      resolvedPath = await resolveCliFromPathAsync(command, shellEnv);
     }
-    if (!resolvedPath) {
-      resolveBundledAcpFallback();
-    } else {
-      const fallback = getBundledAcpFallback();
-      if (fallback && resolvedPath === fallback.displayPath) {
-        versionCommand = fallback.command;
-        versionPrependArgs = fallback.prependArgs;
-        usesAcpFallback = true;
-      }
+
+    if (command === "cursor") {
+      const cursorSdkStatus = await probeCursorSdkAvailability(shellEnv, {
+        apiKeyPresent: Boolean(apiKeyPresent),
+        probeCursorCliAuth,
+      });
+      // Prefer CLI bin only when CLI login is proven. Otherwise do not use a
+      // PATH `agent` binary (generic name) for API-key/SDK path identity.
+      const resolvedSdkPath = await resolveCliFromPathAsync(command, shellEnv);
+      const cursorPath = cursorSdkStatus.cliLoginOk
+        ? (cursorSdkStatus.cliBinPath || resolvedSdkPath || "cursor")
+        : (resolvedSdkPath || "cursor");
+      // Keep the SDK sentinel path when the bundled SDK is importable so
+      // API-key mode still has an identity without Cursor.app / Agent CLI.
+      const hasCursorPath = cursorSdkStatus.sdkInstalled
+        || cursorSdkStatus.installed
+        || cursorSdkStatus.available;
+      return {
+        path: hasCursorPath ? cursorPath : null,
+        binPath: hasCursorPath ? cursorPath : null,
+        version: cursorSdkStatus.version,
+        available: cursorSdkStatus.available,
+        installed: cursorSdkStatus.installed,
+        authenticated: cursorSdkStatus.authenticated,
+        authSource: cursorSdkStatus.authSource,
+        cliEmail: cursorSdkStatus.cliEmail || null,
+        cliBinPath: cursorSdkStatus.cliBinPath || null,
+        cliLoginOk: Boolean(cursorSdkStatus.cliLoginOk),
+        apiKeyOk: Boolean(cursorSdkStatus.apiKeyOk),
+        sdkInstalled: Boolean(cursorSdkStatus.sdkInstalled),
+      };
     }
 
     if (!resolvedPath) {
-      return { path: null, version: null, available: false };
+      return { path: null, binPath: null, version: null, available: false, installed: false };
     }
 
-    let probe = await probeCliVersion(versionCommand || resolvedPath, [...versionPrependArgs, "--version"], shellEnv);
-    let version = probe.version;
-    let hasPlausibleVersion = probe.exitCode === 0 && isPlausibleCliVersionOutput(version);
-    let hasUsableAcpFallback = isAcpFallbackProbeUsable(command, usesAcpFallback, resolvedPath, probe);
-    if (!hasPlausibleVersion && !hasUsableAcpFallback && !usesAcpFallback && command === "codex") {
-      if (resolveBundledAcpFallback()) {
-        probe = await probeCliVersion(versionCommand || resolvedPath, [...versionPrependArgs, "--version"], shellEnv);
-        version = probe.version;
-        hasPlausibleVersion = probe.exitCode === 0 && isPlausibleCliVersionOutput(version);
-        hasUsableAcpFallback = isAcpFallbackProbeUsable(command, usesAcpFallback, resolvedPath, probe);
-      }
-    }
-    if (!hasPlausibleVersion && !hasUsableAcpFallback) {
-      return { path: resolvedPath, version: null, available: false };
+    const probe = await probeCliVersion(resolvedPath, ["--version"], shellEnv);
+    const hasPlausibleVersion = command === "cursor"
+      ? probe.exitCode === 0
+      : probe.exitCode === 0 && isPlausibleCliVersionOutput(probe.version);
+    if (!hasPlausibleVersion) {
+      return { path: resolvedPath, binPath: resolvedPath, version: null, available: false, installed: true };
     }
 
-    return { path: resolvedPath, version: hasPlausibleVersion ? version : "Bundled ACP", available: true };
+    return { path: resolvedPath, binPath: resolvedPath, version: probe.version, available: true, installed: true };
   });
 
   ipcMain.handle("netcatty:ai:codex:get-integration", async (event, options) => {
@@ -220,7 +265,8 @@ function registerAgentDiscoveryHandlers(ctx) {
       invalidateShellEnvCache();
     }
     try {
-      const result = await runCodexCli(["login", "status"]);
+      const codexCliOptions = { codexPath: options?.codexPath };
+      const result = await runCodexCli(["login", "status"], codexCliOptions);
       const rawOutput = [result.stdout, result.stderr]
         .filter((chunk) => chunk.trim().length > 0)
         .join("\n")
@@ -228,27 +274,23 @@ function registerAgentDiscoveryHandlers(ctx) {
       let state = normalizeCodexIntegrationState(rawOutput);
       let effectiveRawOutput = rawOutput;
 
-      if (state === "connected_chatgpt") {
-        const validation = await validateCodexChatGptAuth({ maxAgeMs: 10000 });
+      if (state === "connected_chatgpt" && options?.validateChatGptAuth === true) {
+        const validation = await validateCodexChatGptAuth({ maxAgeMs: 10000, codexPath: options?.codexPath });
         if (!validation.ok) {
           if (isCodexAuthError(validation)) {
             try {
-              await runCodexCli(["logout"]);
+              await runCodexCli(["logout"], codexCliOptions);
             } catch {
               // Ignore logout failures; we still want to surface the invalid state.
             }
             invalidateCodexValidationCache();
             state = "not_logged_in";
-          } else {
-            state = "unknown";
           }
 
-          effectiveRawOutput = [
+          effectiveRawOutput = appendCodexChatGptValidationFailure(
             rawOutput,
-            "",
-            "ChatGPT auth validation failed:",
             validation.error || "Unknown validation error",
-          ].join("\n").trim();
+          );
         }
       }
 
@@ -291,16 +333,28 @@ function registerAgentDiscoveryHandlers(ctx) {
     }
   });
 
-  ipcMain.handle("netcatty:ai:codex:start-login", async (event) => {
+  ipcMain.handle("netcatty:ai:codex:start-login", async (event, options = {}) => {
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const existingSession = getActiveCodexLoginSession();
-    if (existingSession) {
-      return { ok: true, session: toCodexLoginSessionResponse(existingSession) };
+    const requestedPath = String(options?.codexPath || "").trim();
+    const requestedCodexPath = requestedPath ? normalizeCliPathForPlatform?.(requestedPath) : null;
+    if (requestedPath && !requestedCodexPath) {
+      return { ok: false, error: `Codex CLI path not found: ${requestedPath}` };
     }
 
     try {
       const shellEnv = await getShellEnv();
-      const codexCliPath = resolveCliFromPath("codex", shellEnv) || "codex";
+      const codexCliPath = requestedCodexPath
+        || await resolveCliFromPathAsync("codex", shellEnv)
+        || "codex";
+      const existingSession = getActiveCodexLoginSession();
+      if (existingSession) {
+        const existingPath = existingSession.codexPath || null;
+        if (existingPath && codexCliPath !== existingPath) {
+          return { ok: false, error: "A Codex login is already running for a different CLI path." };
+        }
+        return { ok: true, session: toCodexLoginSessionResponse(existingSession) };
+      }
+
       const sessionId = `codex_login_${randomUUID()}`;
       const spawnSpec = prepareCommandForSpawn(codexCliPath, ["login"]);
       const child = spawn(spawnSpec.command, spawnSpec.args, {
@@ -318,26 +372,39 @@ function registerAgentDiscoveryHandlers(ctx) {
         url: null,
         error: null,
         exitCode: null,
+        codexPath: codexCliPath,
       };
 
-      const handleChunk = (chunk) => {
-        appendCodexLoginOutput(session, chunk.toString("utf8"));
+      const stdoutDecoder = createCodexLoginOutputDecoder(session);
+      const stderrDecoder = createCodexLoginOutputDecoder(session);
+      let outputEnded = false;
+      const endOutput = () => {
+        if (outputEnded) return;
+        outputEnded = true;
+        stdoutDecoder.end();
+        stderrDecoder.end();
       };
 
-      child.stdout.on("data", handleChunk);
-      child.stderr.on("data", handleChunk);
+      child.stdout.on("data", (chunk) => stdoutDecoder.write(chunk));
+      child.stderr.on("data", (chunk) => stderrDecoder.write(chunk));
 
       child.once("error", (error) => {
+        endOutput();
+        clearCodexLoginKillTimer(session);
         session.state = "error";
         session.error = `[codex] Failed to start login flow: ${error.message}`;
         session.process = null;
+        recordCodexLoginSession(session);
       });
 
       child.once("close", (exitCode) => {
+        endOutput();
+        clearCodexLoginKillTimer(session);
         session.exitCode = exitCode;
         session.process = null;
 
         if (session.state === "cancelled") {
+          recordCodexLoginSession(session);
           return;
         }
 
@@ -348,9 +415,10 @@ function registerAgentDiscoveryHandlers(ctx) {
           session.state = "error";
           session.error = session.error || `Codex login exited with code ${exitCode ?? "unknown"}`;
         }
+        recordCodexLoginSession(session);
       });
 
-      codexLoginSessions.set(sessionId, session);
+      recordCodexLoginSession(session);
       invalidateCodexValidationCache();
       return { ok: true, session: toCodexLoginSessionResponse(session) };
     } catch (err) {
@@ -376,20 +444,20 @@ function registerAgentDiscoveryHandlers(ctx) {
 
     session.state = "cancelled";
     session.error = null;
-    if (session.process && !session.process.killed) {
-      session.process.kill("SIGTERM");
-    }
+    stopCodexLoginProcess(session);
+    recordCodexLoginSession(session);
 
     invalidateCodexValidationCache();
     return { ok: true, found: true, session: toCodexLoginSessionResponse(session) };
   });
 
-  ipcMain.handle("netcatty:ai:codex:logout", async (event) => {
+  ipcMain.handle("netcatty:ai:codex:logout", async (event, options = {}) => {
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
     try {
-      const logoutResult = await runCodexCli(["logout"]);
+      const codexCliOptions = { codexPath: options?.codexPath };
+      const logoutResult = await runCodexCli(["logout"], codexCliOptions);
       invalidateCodexValidationCache();
-      const statusResult = await runCodexCli(["login", "status"]);
+      const statusResult = await runCodexCli(["login", "status"], codexCliOptions);
       const rawOutput = [statusResult.stdout, statusResult.stderr]
         .filter((chunk) => chunk.trim().length > 0)
         .join("\n")
@@ -416,4 +484,4 @@ function registerAgentDiscoveryHandlers(ctx) {
   }
 }
 
-module.exports = { registerAgentDiscoveryHandlers };
+module.exports = { registerAgentDiscoveryHandlers, computeCursorInstallState };

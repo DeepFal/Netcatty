@@ -1,5 +1,41 @@
 
 declare global {
+  interface NetcattyKittyKeyboardModeState {
+    mainFlags: number;
+    alternateFlags: number;
+    mainStack: number[];
+    alternateStack: number[];
+    alternateScreenActive: boolean;
+  }
+
+  interface NetcattyTerminalInterruptTrace {
+    debug?: boolean;
+    traceId?: string;
+    source?: string;
+    sessionId?: string;
+    rendererKeyAt?: number;
+    rendererSendAt?: number;
+    rendererStatus?: string;
+    rendererHasSelection?: boolean;
+    rendererPriority?: {
+      sessionId: string | null;
+      backlogBytes: number;
+      writeQueueDepth: number;
+      deferredAckBytes: number;
+      ackAfterInputBytes: number;
+      scheduledBackendResume: boolean;
+      skippedReason?: string;
+    };
+  }
+
+  interface NetcattyTerminalOutputPerfMeta {
+    id: string;
+    emittedAt: number;
+    sessionId?: string;
+    chars: number;
+    lineFeeds: number;
+  }
+
   interface NetcattyBridge {
     getWindowsPtyInfo?(): NetcattyWindowsPtyInfo | null;
     startSSHSession(options: NetcattySSHOptions): Promise<string>;
@@ -13,7 +49,7 @@ declare global {
       rows?: number;
       charset?: string;
       env?: Record<string, string>;
-      sessionLog?: { enabled: boolean; directory: string; format: string };
+      sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
     }): Promise<string>;
     startMoshSession?(options: {
       sessionId?: string;
@@ -24,11 +60,20 @@ declare global {
       certificate?: string;
       keyId?: string;
       passphrase?: string;
+      authMethod?: import("../../domain/models").HostAuthMethod;
+      requiresMfa?: boolean;
       identityFilePaths?: string[];
+      useSshAgent?: boolean;
+      agentPublicKeys?: string[];
+      identityAgent?: string;
+      identitiesOnly?: boolean;
+      addKeysToAgent?: string;
+      useKeychain?: boolean;
       port?: number;
       moshServerPath?: string;
       moshClientPath?: string;
       agentForwarding?: boolean;
+      sudoAutofillPassword?: string;
       // Algorithm settings, forwarded so the host-info stats companion SSH
       // connection (issue #1198) negotiates the same KEX / cipher / host-key
       // set the interactive session would.
@@ -38,13 +83,59 @@ declare global {
       // Known hosts, used to verify the host key before the stats companion
       // connection (issue #1198) sends a saved password.
       knownHosts?: import("../../domain/models").KnownHost[];
+      verifyHostKeys?: boolean;
       cols?: number;
       rows?: number;
       charset?: string;
       env?: Record<string, string>;
-      sessionLog?: { enabled: boolean; directory: string; format: string };
+      sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
     }): Promise<string>;
-    startLocalSession?(options: { sessionId?: string; cols?: number; rows?: number; shell?: string; shellArgs?: string[]; cwd?: string; env?: Record<string, string>; sessionLog?: { enabled: boolean; directory: string; format: string } }): Promise<string>;
+    startEtSession?(options: {
+      sessionId?: string;
+      hostname: string;
+      hostId?: string;
+      username?: string;
+      password?: string;
+      privateKey?: string;
+      certificate?: string;
+      keyId?: string;
+      passphrase?: string;
+      authMethod?: import("../../domain/models").HostAuthMethod;
+      requiresMfa?: boolean;
+      identityFilePaths?: string[];
+      useSshAgent?: boolean;
+      agentPublicKeys?: string[];
+      identityAgent?: string;
+      identitiesOnly?: boolean;
+      addKeysToAgent?: string;
+      useKeychain?: boolean;
+      port?: number;
+      etPort?: number;
+      legacyAlgorithms?: boolean;
+      skipEcdsaHostKey?: boolean;
+      algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
+      knownHosts?: import("../../domain/models").KnownHost[];
+      verifyHostKeys?: boolean;
+      jumpHosts?: NetcattyJumpHost[];
+      agentForwarding?: boolean;
+      sudoAutofillPassword?: string;
+      cols?: number;
+      rows?: number;
+      charset?: string;
+      env?: Record<string, string>;
+      sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
+    }): Promise<string>;
+    startLocalSession?(options: {
+      sessionId?: string;
+      cols?: number;
+      rows?: number;
+      shell?: string;
+      shellArgs?: string[];
+      cwd?: string;
+      env?: Record<string, string>;
+      sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
+      bootEpoch?: number;
+    }): Promise<string>;
     startSerialSession?(options: {
       sessionId?: string;
       path: string;
@@ -54,7 +145,7 @@ declare global {
       parity?: 'none' | 'even' | 'odd' | 'mark' | 'space';
       flowControl?: 'none' | 'xon/xoff' | 'rts/cts';
       charset?: string;
-      sessionLog?: { enabled: boolean; directory: string; format: string };
+      sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
     }): Promise<string>;
     listSerialPorts?(): Promise<Array<{
       path: string;
@@ -64,6 +155,30 @@ declare global {
       productId: string;
       pnpId: string;
     }>>;
+    sendSerialYmodem?(sessionId: string, filePath: string): Promise<{
+      success: boolean;
+      fileName?: string;
+      totalBytes?: number;
+      writtenBytes?: number;
+      error?: string;
+      code?: string;
+    }>;
+    receiveSerialYmodem?(sessionId: string, destinationDir: string): Promise<{
+      success: boolean;
+      files?: Array<{
+        fileName: string;
+        filePath: string;
+        totalBytes: number;
+        writtenBytes: number;
+      }>;
+      fileCount?: number;
+      fileName?: string;
+      filePath?: string;
+      totalBytes?: number;
+      writtenBytes?: number;
+      error?: string;
+      code?: string;
+    }>;
     getDefaultShell?(): Promise<string>;
     discoverShells?(): Promise<DiscoveredShell[]>;
     validatePath?(path: string, type?: 'file' | 'directory' | 'any'): Promise<{ exists: boolean; isFile: boolean; isDirectory: boolean; isExecutable: boolean }>;
@@ -72,12 +187,21 @@ declare global {
       bits?: number;
       comment?: string;
     }): Promise<{ success: boolean; privateKey?: string; publicKey?: string; error?: string }>;
-    checkSshAgent?(): Promise<{ running: boolean; startupType: string | null; error: string | null }>;
+    checkSshAgent?(options?: {
+      identityAgent?: string;
+      agentForwarding?: boolean;
+      hostname?: string;
+      port?: number;
+      username?: string;
+    }): Promise<{ running: boolean; startupType: string | null; error: string | null }>;
     getDefaultKeys?(): Promise<Array<{ name: string; path: string }>>;
     execCommand(options: {
       hostname: string;
+      hostId?: string;
       username: string;
       port?: number;
+      authMethod?: import("../../domain/models").HostAuthMethod;
+      requiresMfa?: boolean;
       password?: string;
       privateKey?: string;
       certificate?: string;
@@ -85,14 +209,32 @@ declare global {
       keyId?: string;
       keySource?: 'generated' | 'imported' | 'reference';
       identityFilePaths?: string[];
+      useSshAgent?: boolean;
+      agentPublicKeys?: string[];
+      identityAgent?: string;
+      identitiesOnly?: boolean;
+      addKeysToAgent?: string;
+      useKeychain?: boolean;
       passphrase?: string;
       command: string;
       timeout?: number;
+      sshTcpConnectTimeoutMs?: number;
+      sshAuthReadyTimeoutMs?: number;
       enableKeyboardInteractive?: boolean;
       sessionId?: string;
+      legacyAlgorithms?: boolean;
+      skipEcdsaHostKey?: boolean;
+      algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
     }): Promise<{ stdout: string; stderr: string; code: number | null }>;
     /** Get current working directory from an active SSH session */
-    getSessionPwd?(sessionId: string): Promise<{ success: boolean; cwd?: string; error?: string }>;
+    getSessionPwd?(
+      sessionId: string,
+      options?: {
+        allowHomeFallback?: boolean;
+        allowLoginShellFallback?: boolean;
+        timeoutMs?: number;
+      },
+    ): Promise<{ success: boolean; cwd?: string; error?: string }>;
     /**
      * Get metadata about an already-connected SSH session — currently the
      * SSH server identification string (the `software` part of the
@@ -116,6 +258,16 @@ declare global {
       stdout?: string;
       stderr?: string;
       error?: string;
+    }>;
+    /** Read the remote host's shell history file via an exec channel. */
+    readRemoteHistory?(sessionId: string, limit?: number): Promise<{
+      success: boolean;
+      pending?: boolean;
+      error?: string;
+      shell?: string;
+      bash?: string;
+      zsh?: string;
+      fish?: string;
     }>;
     /** Get server stats (CPU, Memory, Disk, Network) from an active SSH session */
     getServerStats?(sessionId: string): Promise<{
@@ -145,13 +297,16 @@ declare global {
         diskUsed: number | null;      // Disk used in GB
         diskTotal: number | null;     // Total disk in GB
         disks: Array<{                // All mounted disks
+          capacityKey?: string;       // Filesystem or shared-pool identity
           mountPoint: string;
           used: number;               // Used in GB
           total: number;              // Total in GB
           percent: number;            // Usage percentage
+          filesystemType?: string;    // Filesystem type reported by df
         }>;
         netRxSpeed: number;           // Total network receive speed (bytes/sec)
         netTxSpeed: number;           // Total network transmit speed (bytes/sec)
+        latencyMs: number | null;     // TCP connection establishment latency to the SSH endpoint
         netInterfaces: Array<{        // Per-interface network stats
           name: string;               // Interface name (e.g., eth0, ens33)
           rxBytes: number;            // Total received bytes
@@ -159,13 +314,133 @@ declare global {
           rxSpeed: number;            // Receive speed (bytes/sec)
           txSpeed: number;            // Transmit speed (bytes/sec)
         }>;
+        hostname?: string;             // Hostname reported by the server
+        osName?: string;               // Friendly OS name when available
+        kernelRelease?: string;        // Kernel release from uname
+        uptimeSeconds?: number | null; // Server uptime in seconds
+        loadAverage?: number[];        // 1/5/15-minute load average
       };
     }>;
     setSessionEncoding?(sessionId: string, encoding: string): Promise<{ ok: boolean; encoding: string }>;
-    writeToSession(sessionId: string, data: string, options?: { automated?: boolean }): void;
+    writeToSession(
+      sessionId: string,
+      data: string,
+      options?: {
+        automated?: boolean;
+        /** Host-classified secret/no-echo input; always bypasses plugin observers and interceptors. */
+        sensitive?: boolean;
+        lineDelayMs?: number;
+        logRewrite?: { sentCommand: string; displayCommand: string };
+      },
+    ): void;
+    interruptSession?(sessionId: string, trace?: NetcattyTerminalInterruptTrace): void;
     resizeSession(sessionId: string, cols: number, rows: number): void;
+    /**
+     * Sync Windows ConPTY after the renderer clears the xterm viewport.
+     * No-op for SSH and non-ConPTY sessions.
+     */
+    clearSessionPtyBuffer?(sessionId: string): void;
     setSessionFlowPaused(sessionId: string, paused: boolean): void;
-    closeSession(sessionId: string): void;
+    setSessionFlowPausedAndWait?(sessionId: string, paused: boolean): Promise<{ success: boolean; error?: string }>;
+    acquireSessionFlowPauseLease?(sessionId: string): Promise<{
+      success: boolean;
+      leaseId?: string;
+      error?: string;
+    }>;
+    waitSessionFlowPauseLease?(sessionId: string, leaseId: string): Promise<{
+      success: boolean;
+      error?: string;
+    }>;
+    releaseSessionFlowPauseLease?(
+      sessionId: string,
+      leaseId: string,
+      options?: { keepPaused?: boolean },
+    ): Promise<{ success: boolean; error?: string }>;
+    onTerminalOutputDrainRequest?(
+      sessionId: string,
+      cb: (payload: { sessionId: string; requestId: string }) => void | Promise<void>,
+    ): () => void;
+    respondTerminalOutputDrain?(requestId: string): void;
+    notifyTerminalSessionDisplayReady?(sessionId: string): void;
+    ackSessionFlow(sessionId: string, bytes: number): void;
+    closeSession(sessionId: string, options?: { bootEpoch?: number; retainOwnership?: boolean }): void | Promise<void>;
+    /** Move a live session's output port to this renderer (same PTY). */
+    rebindTerminalSessionOutput?(sessionId: string, authorization: string): Promise<{
+      success: boolean;
+      previousWebContentsId?: number | null;
+      webContentsId?: number;
+      error?: string;
+    }>;
+    /** Restore output after an attach popup closes. */
+    restoreTerminalSessionOutput?(
+      sessionId: string,
+      webContentsId?: number | null,
+      authorization?: string,
+    ): Promise<{ success: boolean; restored?: boolean; webContentsId?: number; error?: string }>;
+    /** Ask the home renderer to serialize current terminal scrollback. */
+    requestTerminalSessionSnapshot?(sessionId: string, authorization: string): Promise<{
+      success: boolean;
+      snapshot?: string;
+      kittyKeyboardModeState?: NetcattyKittyKeyboardModeState;
+      kittyKeyboardProtocolEnabled?: boolean;
+      passwordPromptActive?: boolean;
+      cwd?: string | null;
+      title?: string | null;
+      error?: string;
+    }>;
+    /** Home renderer: listen for snapshot requests. */
+    onTerminalSessionSnapshotRequest?(
+      cb: (payload: { sessionId: string; requestId: string }) => void,
+    ): () => void;
+    /** Home renderer: reply with serialized scrollback. */
+    respondTerminalSessionSnapshot?(
+      requestId: string,
+      snapshot: string,
+      kittyKeyboardModeState?: NetcattyKittyKeyboardModeState,
+      kittyKeyboardProtocolEnabled?: boolean,
+      passwordPromptActive?: boolean,
+      cwd?: string | null,
+      title?: string | null,
+    ): void;
+    /** Observe popup: push current state back to the home renderer before restore. */
+    applyTerminalSessionSnapshot?(
+      sessionId: string,
+      snapshot: string,
+      context: {
+        contextSnapshot: string;
+        contextViewportSnapshot: string;
+        contextScrollbackSnapshot: string;
+        alternateScreen: boolean;
+        kittyKeyboardModeState?: NetcattyKittyKeyboardModeState;
+        kittyKeyboardProtocolEnabled?: boolean;
+        passwordPromptActive?: boolean;
+        cwd?: string | null;
+        title?: string | null;
+      },
+      authorization: string,
+    ): Promise<{
+      success: boolean;
+      error?: string;
+    }>;
+    markAttachPopupClosePrepared?(sessionId: string, authorization: string): Promise<{ success: boolean; error?: string }>;
+    onTerminalPopupPrepareClose?(cb: (payload: { sessionId: string; authorization: string }) => void): () => void;
+    /** Home renderer: apply a pushed snapshot from an observe popup. */
+    onTerminalSessionApplySnapshot?(
+      cb: (payload: {
+        sessionId: string;
+        snapshot: string;
+        contextSnapshot: string;
+        contextViewportSnapshot: string;
+        contextScrollbackSnapshot: string;
+        alternateScreen: boolean;
+        kittyKeyboardModeState?: NetcattyKittyKeyboardModeState;
+        kittyKeyboardProtocolEnabled?: boolean;
+        passwordPromptActive?: boolean;
+        cwd?: string | null;
+        title?: string | null;
+        requestId: string;
+      }) => boolean | Promise<boolean>,
+    ): () => void;
     // ZMODEM file transfer
     onZmodemEvent?(
       sessionId: string,
@@ -182,7 +457,17 @@ declare global {
         error?: string;
       }) => void
     ): () => void;
-    cancelZmodem?(sessionId: string): void;
+    cancelZmodem?(sessionId: string, options?: { interrupt?: boolean }): void;
+    startZmodemDragDropUpload?(
+      sessionId: string,
+      files: Array<{
+        path?: string;
+        name: string;
+        remoteName: string;
+        data?: ArrayBuffer;
+      }>,
+      uploadCommand?: string,
+    ): Promise<{ success: boolean; error?: string }>;
     onZmodemOverwriteRequest?(
       sessionId: string,
       cb: (payload: { sessionId: string; requestId: string; filename: string }) => void
@@ -192,19 +477,58 @@ declare global {
       action: "overwrite" | "skip" | "cancel";
       applyToRest: boolean;
     }): void;
-    onSessionData(sessionId: string, cb: (data: string) => void): () => void;
+    onSessionData(
+      sessionId: string,
+      cb: (
+        data: string,
+        meta?: {
+          droppedOutputMayAffectTerminalState?: boolean;
+          droppedOutputAlternateScreenAction?: "enter" | "leave";
+          /** True while Mosh is still on the ephemeral SSH handshake PTY. */
+          moshHandshake?: boolean;
+          /** The Mosh SSH bootstrap is blocked on input that Netcatty cannot answer automatically. */
+          moshHandshakeRequiresUserInput?: boolean;
+          terminalPerf?: NetcattyTerminalOutputPerfMeta;
+          /** Original host output units acknowledged even when an interceptor changes display length. */
+          pluginPipelineIngressBytes?: number;
+          /** Host-owned provenance marker for output already processed by an interceptor. */
+          pluginPipelineProcessed?: boolean;
+          /** Host-classified authentication prompt state for protecting subsequent input. */
+          pluginPipelineSensitiveInput?: boolean;
+          /** Host-owned marker that a Plugin connection Provider has explicitly reached connected status. */
+          pluginConnectionReady?: boolean;
+        },
+      ) => void,
+      options?: { replayBacklog?: boolean },
+    ): () => void;
     onSessionExit(
       sessionId: string,
       cb: (evt: { exitCode?: number; signal?: number; error?: string; reason?: "exited" | "error" | "timeout" | "closed" }) => void
     ): () => void;
     onTelnetAutoLoginComplete?(
       sessionId: string,
-      cb: (evt: { sessionId: string }) => void
+      cb: (evt: { sessionId: string; bootEpoch?: number }) => void
     ): () => void;
     onTelnetAutoLoginCancelled?(
       sessionId: string,
-      cb: (evt: { sessionId: string }) => void
+      cb: (evt: { sessionId: string; bootEpoch?: number }) => void
     ): () => void;
+    /** Fires after Mosh swaps from the SSH handshake PTY to mosh-client. */
+    onMoshSessionReady?(
+      sessionId: string,
+      cb: (evt: { sessionId: string; bootEpoch?: number }) => void
+    ): () => void;
+    onTelnetEchoMode?(
+      sessionId: string,
+      cb: (evt: { sessionId: string; remoteEcho: boolean; localEcho: boolean }) => void
+    ): () => void;
+    getTelnetEchoMode?(sessionId: string): Promise<{
+      success: boolean;
+      sessionId?: string;
+      remoteEcho?: boolean;
+      localEcho?: boolean;
+      error?: string;
+    }>;
     onAuthFailed?(
       sessionId: string,
       cb: (evt: { sessionId: string; error: string; hostname: string }) => void
@@ -215,11 +539,23 @@ declare global {
       cb: (request: {
         requestId: string;
         sessionId: string;
+        hostId?: string;
         name: string;
         instructions: string;
         prompts: Array<{ prompt: string; echo: boolean }>;
         hostname: string;
         savedPassword?: string | null;
+        /** When false, UI must not offer saving the response as the host password. */
+        allowSavePassword?: boolean;
+        scope?: "terminal" | "external";
+        bootEpoch?: number;
+      }) => void
+    ): () => void;
+    onKeyboardInteractiveCancelled?(
+      cb: (event: {
+        requestId: string;
+        sessionId?: string;
+        reason?: string;
       }) => void
     ): () => void;
     respondKeyboardInteractive?(
@@ -240,6 +576,7 @@ declare global {
         publicKey?: string;
         knownHostId?: string;
         knownFingerprint?: string;
+        bootEpoch?: number;
       }) => void
     ): () => void;
     respondHostKeyVerification?(
@@ -256,6 +593,8 @@ declare global {
         keyName: string;
         hostname?: string;
         passphraseInvalid?: boolean;
+        sessionId?: string;
+        bootEpoch?: number;
       }) => void
     ): () => void;
     respondPassphrase?(

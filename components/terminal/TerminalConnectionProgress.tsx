@@ -12,12 +12,15 @@ export interface TerminalConnectionProgressProps {
     status: 'connecting' | 'connected' | 'disconnected';
     error: string | null;
     timeLeft: number;
+    isAwaitingUserInput?: boolean;
+    showEnterReconnectHint?: boolean;
     isCancelling: boolean;
     showLogs: boolean;
     progressLogs: string[];
     onCancelConnect: () => void;
     onCloseSession: () => void;
-    onRetry: () => void;
+    onRetry?: () => void;
+    reconnectLabel?: string;
 }
 
 export interface TerminalConnectionLogListProps {
@@ -30,8 +33,8 @@ export const TerminalConnectionLogList: React.FC<TerminalConnectionLogListProps>
     error,
 }) => (
     <div className="rounded-md border border-border/35 bg-background/40">
-        <ScrollArea className="max-h-44 p-2.5">
-            <div className="space-y-1 text-xs text-foreground/90">
+        <ScrollArea className="max-h-44">
+            <div className="space-y-1 p-2.5 pb-4 pr-4 text-xs text-foreground/90">
                 {progressLogs.map((line, idx) => (
                     <div key={idx} className="flex items-start gap-2">
                         <div className="mt-[0.4rem] h-1.5 w-1.5 flex-shrink-0 rounded-full bg-emerald-500" />
@@ -53,12 +56,15 @@ export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProp
     status,
     error,
     timeLeft,
+    isAwaitingUserInput = false,
+    showEnterReconnectHint = false,
     isCancelling: _isCancelling,
     showLogs,
     progressLogs,
     onCancelConnect: _onCancelConnect,
     onCloseSession,
     onRetry,
+    reconnectLabel,
 }) => {
     const { t } = useI18n();
 
@@ -70,7 +76,9 @@ export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProp
                         <>
                             <Loader2 className="h-3 w-3 mt-0.5 flex-shrink-0 animate-spin" />
                             <span className="min-w-0 whitespace-pre-wrap break-words leading-5">
-                                {t('terminal.progress.timeoutIn', { seconds: timeLeft })}
+                                {isAwaitingUserInput
+                                    ? t('terminal.progress.waitingForUserInput')
+                                    : t('terminal.progress.timeoutIn', { seconds: timeLeft })}
                             </span>
                         </>
                     ) : (
@@ -88,18 +96,25 @@ export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProp
                 <TerminalConnectionLogList progressLogs={progressLogs} error={error} />
             )}
 
-            <div className="flex justify-end gap-2">
-                {status !== 'connecting' && (
-                    <>
+            {status !== 'connecting' && (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                    {showEnterReconnectHint && (
+                        <div className="min-w-0 break-words text-[11px] leading-5 text-muted-foreground">
+                            {t('terminal.progress.enterReconnectHint')}
+                        </div>
+                    )}
+                    <div className="ml-auto flex shrink-0 justify-end gap-2">
                         <Button variant="ghost" size="sm" className="h-7 px-3 text-[11px]" onClick={onCloseSession}>
                             {t('terminal.toolbar.closeSession')}
                         </Button>
-                        <Button size="sm" className="h-7 px-3 text-[11px]" onClick={onRetry}>
-                            <Play className="h-3 w-3 mr-1.5" /> {t('terminal.progress.startOver')}
-                        </Button>
-                    </>
-                )}
-            </div>
+                        {onRetry && (
+                            <Button size="sm" className="h-7 px-3 text-[11px]" onClick={onRetry}>
+                                <Play className="h-3 w-3 mr-1.5" /> {reconnectLabel ?? t('terminal.progress.startOver')}
+                            </Button>
+                        )}
+                    </div>
+                </div>
+            )}
         </>
     );
 };

@@ -1,10 +1,14 @@
 import React, { useCallback, useState } from "react";
-import { Plus, Shield, X } from "lucide-react";
+import { Plus, X } from "lucide-react";
 import type { AIPermissionMode } from "../../../../infrastructure/ai/types";
-import { DEFAULT_COMMAND_BLOCKLIST } from "../../../../infrastructure/ai/types";
+import {
+  DEFAULT_COMMAND_BLOCKLIST,
+  MAX_COMMAND_TIMEOUT_SECONDS,
+  MAX_RESPONSE_IDLE_TIMEOUT_SECONDS,
+} from "../../../../infrastructure/ai/types";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Button } from "../../../ui/button";
-import { Select, SettingRow } from "../../settings-ui";
+import { Select, SettingCard, SettingRow, SettingsAnchor, SettingsSection } from "../../settings-ui";
 
 export const SafetySettings: React.FC<{
   globalPermissionMode: AIPermissionMode;
@@ -13,6 +17,8 @@ export const SafetySettings: React.FC<{
   setCommandBlocklist: (value: string[]) => void;
   commandTimeout: number;
   setCommandTimeout: (value: number) => void;
+  responseIdleTimeout: number;
+  setResponseIdleTimeout: (value: number) => void;
   maxIterations: number;
   setMaxIterations: (value: number) => void;
 }> = ({
@@ -22,6 +28,8 @@ export const SafetySettings: React.FC<{
   setCommandBlocklist,
   commandTimeout,
   setCommandTimeout,
+  responseIdleTimeout,
+  setResponseIdleTimeout,
   maxIterations,
   setMaxIterations,
 }) => {
@@ -64,18 +72,15 @@ export const SafetySettings: React.FC<{
   const permissionModeOptions = [
     { value: "observer", label: t('ai.safety.permissionMode.observer') },
     { value: "confirm", label: t('ai.safety.permissionMode.confirm') },
-    { value: "autonomous", label: t('ai.safety.permissionMode.autonomous') },
+    { value: "auto", label: t('ai.safety.permissionMode.auto') },
   ];
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <Shield size={18} className="text-muted-foreground" />
-        <h3 className="text-base font-medium">{t('ai.safety.title')}</h3>
-      </div>
-
-      <div className="bg-muted/30 rounded-lg p-4 space-y-1">
+    <SettingsSection title={t('ai.safety.title')}>
+      <div className="flex flex-col gap-4">
+        <SettingCard divided>
         <SettingRow
+          anchorId="ai-safety-permission-mode"
           label={t('ai.safety.permissionMode')}
           description={t('ai.safety.permissionMode.description')}
         >
@@ -88,6 +93,29 @@ export const SafetySettings: React.FC<{
         </SettingRow>
 
         <SettingRow
+          anchorId="ai-safety-response-idle-timeout"
+          label={t('ai.safety.responseIdleTimeout')}
+          description={t('ai.safety.responseIdleTimeout.description')}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              aria-label={t('ai.safety.responseIdleTimeout')}
+              value={responseIdleTimeout}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10);
+                if (!isNaN(val)) setResponseIdleTimeout(val);
+              }}
+              min={1}
+              max={MAX_RESPONSE_IDLE_TIMEOUT_SECONDS}
+              className="w-20 h-9 rounded-md border border-input bg-background px-3 text-sm text-right focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            />
+            <span className="text-xs text-muted-foreground">{t('ai.safety.responseIdleTimeout.unit')}</span>
+          </div>
+        </SettingRow>
+
+        <SettingRow
+          anchorId="ai-safety-command-timeout"
           label={t('ai.safety.commandTimeout')}
           description={t('ai.safety.commandTimeout.description')}
         >
@@ -97,10 +125,10 @@ export const SafetySettings: React.FC<{
               value={commandTimeout}
               onChange={(e) => {
                 const val = parseInt(e.target.value, 10);
-                if (!isNaN(val) && val > 0) setCommandTimeout(val);
+                if (!isNaN(val)) setCommandTimeout(val);
               }}
               min={1}
-              max={3600}
+              max={MAX_COMMAND_TIMEOUT_SECONDS}
               className="w-20 h-9 rounded-md border border-input bg-background px-3 text-sm text-right focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             />
             <span className="text-xs text-muted-foreground">{t('ai.safety.commandTimeout.unit')}</span>
@@ -123,10 +151,11 @@ export const SafetySettings: React.FC<{
             className="w-20 h-9 rounded-md border border-input bg-background px-3 text-sm text-right focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
         </SettingRow>
-      </div>
+        </SettingCard>
 
       {/* Command Blocklist */}
-      <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+      <SettingsAnchor anchorId="ai-safety-blocklist">
+      <SettingCard padded className="space-y-3">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium">{t('ai.safety.blocklist')}</p>
@@ -194,11 +223,13 @@ export const SafetySettings: React.FC<{
           <Plus size={14} className="mr-1" />
           {t('ai.safety.blocklist.add')}
         </Button>
-      </div>
+      </SettingCard>
+      </SettingsAnchor>
 
-      <p className="text-xs text-muted-foreground">
-        {t('ai.safety.note')}
-      </p>
-    </div>
+        <p className="text-xs text-muted-foreground">
+          {t('ai.safety.note')}
+        </p>
+      </div>
+    </SettingsSection>
   );
 };

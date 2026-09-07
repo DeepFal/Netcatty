@@ -1,6 +1,139 @@
 /* eslint-disable no-undef */
+const { executeBoundedSshCommand } = require("../boundedSshExec.cjs");
+const { listInteractiveShellPids } = require("../sshInteractiveShells.cjs");
+function decodeLsofFileName(value) {
+  if (typeof value !== 'string') return null;
+  // lsof's caret form is ambiguous: a BEL byte and the literal characters
+  // "^G" have the same output. Reject it instead of navigating to a guessed path.
+  if (/\^[\x40-\x5f?]/.test(value)) return null;
+  const bytes = [];
+  const simpleEscapes = {
+    b: 0x08,
+    f: 0x0c,
+    n: 0x0a,
+    r: 0x0d,
+    t: 0x09,
+    v: 0x0b,
+    '\\': 0x5c,
+  };
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char !== '\\') {
+      bytes.push(...Buffer.from(char));
+      continue;
+    }
+    const escaped = value[index + 1];
+    if (!escaped) return null;
+    if (Object.prototype.hasOwnProperty.call(simpleEscapes, escaped)) {
+      bytes.push(simpleEscapes[escaped]);
+      index += 1;
+      continue;
+    }
+    if (escaped === 'x') {
+      const hex = value.slice(index + 2, index + 4);
+      if (!/^[0-9a-fA-F]{2}$/.test(hex)) return null;
+      bytes.push(Number.parseInt(hex, 16));
+      index += 3;
+      continue;
+    }
+    const octal = value.slice(index + 1).match(/^[0-7]{1,3}/)?.[0];
+    if (octal) {
+      bytes.push(Number.parseInt(octal, 8));
+      index += octal.length;
+      continue;
+    }
+    return null;
+  }
+
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wrap a one-shot remote probe so it cannot outlive the client-side timeout.
+ *
+ * If the renderer or transport abandons an exec (client-side run timeout,
+ * window close, teardown), sshd can keep the remote shell alive — on weak
+ * hosts these orphaned probe shells linger and burn CPU until someone kills
+ * them by hand (#3187). A watchdog subshell SIGKILLs the probe shell once the
+ * same bound the client enforces has elapsed, so an abandoned probe always
+ * terminates remotely even when the server never reacts to the channel close.
+ *
+ * POSIX-safe: `$$` inside a subshell still refers to the parent shell on
+ * bash/dash/ash, so the watchdog knows the probe shell's PID. Killing only
+ * `$$` is not enough: a probe blocked in an external child (`df`, `ps`,
+ * `lsof`, `cat`, ...) leaves that child orphaned, still holding the channel's
+ * output descriptors. The watchdog therefore also SIGKILLs the probe shell's
+ * whole descendant tree (found via a PPID walk over `ps`, excluding the
+ * watchdog's own lineage) before killing the probe shell itself. On hosts
+ * without a usable `ps` the watchdog degrades to the old self-kill. The
+ * subshell's stdio is detached from the channel so nothing it forks (notably
+ * its `sleep`) can hold the channel's output descriptors open. The trailing
+ * cleanup runs on the success path and must also kill the watchdog's pending
+ * `sleep` child: killing only the subshell would leave that `sleep` alive
+ * until the full watchdog duration (which equals the client-side timeout),
+ * and while it lived it would hold the channel's descriptors, delaying the
+ * channel close until then — turning successful probes into timeouts.
+ * Children are enumerated via a PPID walk *before* the subshell is killed;
+ * once it dies they are reparented to init and unreachable. After a watchdog
+ * kill the main shell is SIGKILLed before reaching the cleanup, so the
+ * already-finished watchdog leaves no orphaned `sleep` behind.
+ */
+function withRemoteWatchdog(command, timeoutMs) {
+  const seconds = Math.max(1, Math.ceil((Number(timeoutMs) || 10000) / 1000));
+  const descendantTreeAwk =
+    '{ pp[$1+0]=$2+0 } END { for (p in pp) { q=p+0; d=0; while (q>0 && d<4096) { if (q==root) { printf "%s ", p+0; break } if (q==self) break; q=pp[q]+0; d++ } } }';
+  const watchdog = [
+    `( sleep ${seconds}`,
+    // Resolve the watchdog subshell's own PID so the tree walk can skip it
+    // (killing ourselves mid-list would abort the remaining kills).
+    // exec replaces the command-substitution shell: without it Bash may
+    // report that intermediate PID instead of the watchdog subshell.
+    `&& nc_self=$(exec sh -c 'echo $PPID' 2>/dev/null)`,
+    `&& nc_tree=$(ps -e -o pid=,ppid= 2>/dev/null | awk -v root="$$" -v self="$nc_self" '${descendantTreeAwk}')`,
+    `&& kill -9 $nc_tree "$$" 2>/dev/null ) </dev/null >/dev/null 2>&1 & nc_watchdog_pid=$!`,
+  ].join(' ');
+  return [
+    watchdog,
+    command,
+    'nc_status=$?',
+    // Reap the watchdog's pending `sleep` before killing the subshell: after
+    // the subshell is SIGKILLed its children are reparented to init and a
+    // PPID walk can no longer find them.
+    'nc_kids=$(ps -e -o pid=,ppid= 2>/dev/null | awk -v root="$nc_watchdog_pid" -v self="-1" \'' +
+      descendantTreeAwk +
+      "')",
+    'kill -9 $nc_kids "$nc_watchdog_pid" 2>/dev/null',
+    'exit $nc_status',
+  ].join('; ');
+}
+
 function createSessionOpsApi(ctx) {
   with (ctx) {
+    const cwdRecoveryToken = Symbol('cwd-recovery');
+    function withPosixRemoteWatchdog(command, timeoutMs) {
+      // sshd invokes `$SHELL -c command`. fish/zsh cannot parse the POSIX watchdog.
+      // `exec sh -c` is accepted by fish and replaces the login shell so the
+      // POSIX sh's $PPID is sshd (needed by the cwd probe).
+      return `exec sh -c ${quoteShellArg(withRemoteWatchdog(command, timeoutMs))}`;
+    }
+    function getTcpLatencyTarget(session) {
+      if (session.tcpLatencyDirect === false) return null;
+
+      const auth = session.tcpLatencyTarget || session.moshStatsAuth || session.etStatsAuth || session._reuseEndpoint || null;
+      if (auth?.hasJumpHost || auth?.hasProxy) return null;
+
+      const hostname = auth?.hostname || session.hostname;
+      const rawPort = auth?.port ?? 22;
+      const port = Number(rawPort);
+      if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+      return { hostname, port };
+    }
+
     async function getSessionRemoteInfo(_event, payload) {
       const { sessionId } = payload || {};
       const session = sessions.get(sessionId);
@@ -29,61 +162,382 @@ function createSessionOpsApi(ctx) {
     async function getSessionDistroInfo(_event, payload) {
       const { sessionId } = payload || {};
       const session = sessions.get(sessionId);
-      if (!session || !session.conn) {
+      if (session?.type === "et") {
+        if (typeof execOnEtSession !== "function") {
+          return { success: false, error: "ET command executor unavailable" };
+        }
+        return execOnEtSession(session, "cat /etc/os-release 2>/dev/null || uname -a", 5000, {
+          requireTrustedHost: true,
+          knownHosts: session.etStatsAuth?.knownHosts,
+        });
+      }
+      if (session?.type === 'mosh' && !session.moshStatsConn && typeof ensureMoshStatsConnection === 'function') {
+        try {
+          await ensureMoshStatsConnection(session, sessionId, _event?.sender);
+        } catch (err) {
+          return { success: false, error: err?.message || String(err) };
+        }
+      }
+      const conn = session?.conn || session?.moshStatsConn;
+      if (!conn) {
         return { success: false, error: 'Session not found or not connected' };
       }
-      const command = "cat /etc/os-release 2>/dev/null || uname -a";
-      return new Promise((resolve) => {
-        let settled = false;
-        const settle = (result) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(result);
-        };
-        const timer = setTimeout(() => {
-          settle({ success: false, error: 'Timeout probing distro' });
-          // Clean up the exec channel so it doesn't linger.
-          try { if (activeStream) activeStream.close(); } catch { /* ignore */ }
-        }, 5000);
-        let activeStream = null;
-        try {
-          session.conn.exec(command, (err, stream) => {
-            if (err) {
-              settle({ success: false, error: err.message || String(err) });
-              return;
-            }
-            activeStream = stream;
-            let stdout = '';
-            let stderr = '';
-            stream.on('data', (chunk) => { stdout += chunk.toString(); });
-            stream.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-            stream.on('close', () => {
-              settle({ success: true, stdout, stderr });
-            });
-          });
-        } catch (err) {
-          settle({ success: false, error: err?.message || String(err) });
+      const command = withPosixRemoteWatchdog(
+        "cat /etc/os-release 2>/dev/null || uname -a",
+        5000,
+      );
+      try {
+        const { stdout, stderr } = await executeBoundedSshCommand(conn, command, {
+          openingTimeoutMs: 5000,
+          runTimeoutMs: 5000,
+          maxOutputBytes: 256 * 1024,
+        });
+        return { success: true, stdout, stderr };
+      } catch (err) {
+        return { success: false, error: err?.message || String(err) };
+      }
+    }
+
+    async function readRemoteHistory(event, payload) {
+      const { sessionId, limit } = payload || {};
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return { success: false, error: 'Session not found' };
+      }
+
+      const safeLimit =
+        Number.isFinite(limit) && limit > 0 && limit <= 10000 ? Math.floor(limit) : 1000;
+      const fishLimit = safeLimit * 3; // fish records span 2-3 lines each
+
+      const SHELL_MARKER = '__NC_SHELL__';
+      const BASH_MARKER = '__NC_BASH__';
+      const ZSH_MARKER = '__NC_ZSH__';
+      const FISH_MARKER = '__NC_FISH__';
+      // Shell parameter expansions kept as literal text so the remote POSIX
+      // shell (not Node or the user's login shell) resolves them; honours
+      // $HISTFILE / $XDG_DATA_HOME overrides.
+      const ZSH_HIST = '${HISTFILE:-$HOME/.zsh_history}';
+      const BASH_HIST = '${HISTFILE:-$HOME/.bash_history}';
+      const FISH_PATH = '${XDG_DATA_HOME:-$HOME/.local/share}/fish/fish_history';
+      const posixScript = [
+        `SH="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; [ -n "$SH" ] || SH="$SHELL"`,
+        `FISH="${FISH_PATH}"; [ -f "$FISH" ] || FISH="$HOME/.config/fish/fish_history"`,
+        `case "$SH" in`,
+        `  *zsh) printf '%s\\n' '${SHELL_MARKER}zsh'; printf '%s\\n' '${ZSH_MARKER}'; tail -n ${safeLimit} "${ZSH_HIST}" 2>/dev/null || true ;;`,
+        `  *bash) printf '%s\\n' '${SHELL_MARKER}bash'; printf '%s\\n' '${BASH_MARKER}'; tail -n ${safeLimit} "${BASH_HIST}" 2>/dev/null || true ;;`,
+        `  *fish) printf '%s\\n' '${SHELL_MARKER}fish'; printf '%s\\n' '${FISH_MARKER}'; tail -n ${fishLimit} "$FISH" 2>/dev/null || true ;;`,
+        `  *) printf '%s\\n' '${SHELL_MARKER}unknown'; printf '%s\\n' '${BASH_MARKER}'; tail -n ${safeLimit} "$HOME/.bash_history" 2>/dev/null || true; printf '%s\\n' '${ZSH_MARKER}'; tail -n ${safeLimit} "$HOME/.zsh_history" 2>/dev/null || true; printf '%s\\n' '${FISH_MARKER}'; tail -n ${fishLimit} "$FISH" 2>/dev/null || true ;;`,
+        `esac`,
+      ].join('\n');
+      // Match getSessionPwd: force POSIX sh so fish/zsh login shells do not
+      // parse the script themselves.
+      const command = `exec sh -c ${quoteShellArg(posixScript)}`;
+
+      const parse = (stdout) => {
+        const text = stdout || '';
+        let shell = 'unknown';
+        const shellIdx = text.indexOf(SHELL_MARKER);
+        if (shellIdx >= 0) {
+          const after = text.slice(shellIdx + SHELL_MARKER.length);
+          shell = (after.split(/\r?\n/, 1)[0] || 'unknown').trim();
         }
-      });
+        const section = (marker) => {
+          const start = text.indexOf(marker);
+          if (start < 0) return '';
+          const from = start + marker.length;
+          // End at the nearest following section marker, if any.
+          const ends = [BASH_MARKER, ZSH_MARKER, FISH_MARKER]
+            .map((m) => text.indexOf(m, from))
+            .filter((i) => i >= 0);
+          const end = ends.length ? Math.min(...ends) : text.length;
+          return text.slice(from, end).replace(/^\r?\n/, '').replace(/\r?\n\s*$/, '');
+        };
+        return {
+          shell,
+          bash: section(BASH_MARKER),
+          zsh: section(ZSH_MARKER),
+          fish: section(FISH_MARKER),
+        };
+      };
+
+      // ET session: no ssh2 conn — run through the shared system-ssh executor.
+      if (session.type === 'et') {
+        if (typeof execOnEtSession !== 'function') {
+          return { success: false, error: 'ET command executor unavailable' };
+        }
+        const result = await execOnEtSession(session, command, 8000);
+        if (!result || !result.success) {
+          return {
+            success: false,
+            error: (result && result.error) || 'Failed to read remote history',
+          };
+        }
+        return { success: true, ...parse(result.stdout || '') };
+      }
+
+      // Mosh has no interactive ssh2 conn of its own. Lazily open the same
+      // stats companion getServerStats uses — it lives on session.moshStatsConn,
+      // never session.conn (see moshStatsConnection.cjs). Reading the fixed
+      // history files is connection-agnostic, so the companion is a safe
+      // substitute here (unlike getSessionPwd, which needs the interactive
+      // shell's sibling exec channel).
+      if (
+        !session.conn &&
+        !session.moshStatsConn &&
+        session.type === 'mosh' &&
+        typeof ensureMoshStatsConnection === 'function'
+      ) {
+        await ensureMoshStatsConnection(session, sessionId, event?.sender);
+      }
+
+      const conn = session.conn || session.moshStatsConn;
+      if (!conn) {
+        // A Mosh session can be marked "connected" before the handshake stores
+        // credentials; report pending (mirrors getServerStats) so it isn't a
+        // hard failure during that window.
+        if (session.type === 'mosh' && !session.moshStatsAuth && !session.moshStatsConnFailed) {
+          return { success: false, pending: true, error: 'Mosh handshake in progress' };
+        }
+        return { success: false, error: 'Session not found or not connected' };
+      }
+
+      try {
+        const { stdout } = await executeBoundedSshCommand(conn, command, {
+          openingTimeoutMs: 8000,
+          runTimeoutMs: 8000,
+          maxOutputBytes: 10 * 1024 * 1024,
+        });
+        return { success: true, ...parse(stdout) };
+      } catch (err) {
+        return { success: false, error: err?.message || String(err) };
+      }
     }
     
     async function getSessionPwd(event, payload) {
       const { sessionId } = payload;
+      const isTargetedRecovery = payload?._cwdRecoveryToken === cwdRecoveryToken;
+      const allowHomeFallback = payload?.allowHomeFallback !== false;
+      // Login-shell fallback defaults to the same gate as ~ guessing so callers
+      // that pass allowHomeFallback: false (e.g. captureInheritedCwd) keep the
+      // pre-#2886 failure path and can fall through to lastCwd. SFTP fresh-cwd
+      // probes opt in explicitly with allowLoginShellFallback: true.
+      const allowLoginShellFallback = payload?.allowLoginShellFallback ?? allowHomeFallback;
+      const requestedTimeoutMs = Number(payload?.timeoutMs);
+      const timeoutMs = Number.isFinite(requestedTimeoutMs)
+        ? Math.min(Math.max(requestedTimeoutMs, 100), 5000)
+        : 5000;
       const session = sessions.get(sessionId);
     
       if (!session || !session.conn) {
         return { success: false, error: 'Session not found or not connected' };
+      }
+      if (
+        session.blockUntargetedCwdProbe
+        && session.cwdRecoveryPromise
+        && !isTargetedRecovery
+      ) {
+        return session.cwdRecoveryPromise;
+      }
+      if (session.blockUntargetedCwdProbe && !session.shellPid && !isTargetedRecovery) {
+        const transport = session.connRef || null;
+        if (session.cwdRecoveryPromise) return session.cwdRecoveryPromise;
+        if (transport?.cwdRecoveryPromise) {
+          await transport.cwdRecoveryPromise.catch(() => {});
+          return { success: false, error: 'Another cwd recovery was already in progress' };
+        }
+        if (session.allowCwdRecovery !== true || transport?.cwdRecoveryDisabled) {
+          return {
+            success: false,
+            error: 'Current directory is unavailable during an immediate reconnect',
+          };
+        }
+        const reconnectRisk = session.parkedReconnectRisk;
+        if (!reconnectRisk || reconnectRisk.hasUnknownOldShell) {
+          return {
+            success: false,
+            error: 'Current directory cannot be safely identified after reconnect',
+          };
+        }
+        // One real command/output pair permits one attempt. Ambiguous or failed
+        // recovery stays closed until another command produces output.
+        session.allowCwdRecovery = false;
+        const recoveryOwner = {
+          conn: session.conn,
+          connRef: session.connRef,
+          stream: session.stream,
+          shellCloseGeneration: transport?.shellCloseGeneration || 0,
+        };
+        const isCurrentOwner = () => (
+          sessions.get(sessionId) === session
+          && session.conn === recoveryOwner.conn
+          && session.connRef === recoveryOwner.connRef
+          && session.stream === recoveryOwner.stream
+        );
+        const recoveryPromise = (async () => {
+          const sharedTerminalCountBeforeRecovery = transport
+            ? [...sessions.values()].filter(
+              (candidate) => candidate?.connRef === transport && candidate?.stream,
+            ).length
+            : 1;
+          if (sharedTerminalCountBeforeRecovery !== 1) {
+            return {
+              success: false,
+              error: 'Current directory is ambiguous across shared terminal channels',
+            };
+          }
+          if (transport?.closedShellPidUnknown) {
+            return {
+              success: false,
+              error: 'Current directory cannot be safely identified after reconnect',
+            };
+          }
+          const oldShellPids = new Set([
+            ...(Array.isArray(reconnectRisk.oldShellPids) ? reconnectRisk.oldShellPids : []),
+            ...(
+              transport?.closedShellPids instanceof Set
+                ? [...transport.closedShellPids]
+                : []
+            ),
+          ].map(String));
+          const discovery = await listInteractiveShellPids(session.conn, {
+            quoteShellArg,
+            openingTimeoutMs: timeoutMs,
+            runTimeoutMs: timeoutMs,
+            setTimeoutFn: setTimeout,
+            clearTimeoutFn: clearTimeout,
+            // Best-effort cwd recovery must not kill the interactive shell or
+            // other SFTP/forward leases when a server never answers exec open.
+            invalidateOnOpenTimeout: false,
+          });
+          if (discovery.openTimedOut && transport) transport.cwdRecoveryDisabled = true;
+          if (!isCurrentOwner()) {
+            return { success: false, error: 'Session changed during cwd recovery' };
+          }
+          if (
+            transport
+            && (transport.shellCloseGeneration || 0) !== recoveryOwner.shellCloseGeneration
+          ) {
+            return { success: false, error: 'Terminal set changed during cwd recovery' };
+          }
+          if (transport?.closedShellPidUnknown) {
+            return {
+              success: false,
+              error: 'Current directory cannot be safely identified after reconnect',
+            };
+          }
+          const assignedSiblingPids = new Set(
+            [...sessions.values()]
+              .filter((candidate) => (
+                candidate?.connRef === session.connRef
+                && candidate !== session
+                && candidate.shellPid
+              ))
+              .map((candidate) => String(candidate.shellPid)),
+          );
+          const unclaimedPids = discovery.pids.filter(
+            (pid) => (
+              !assignedSiblingPids.has(String(pid))
+              && !oldShellPids.has(String(pid))
+            ),
+          );
+          const sharedTerminalCountAfterRecovery = session.connRef
+            ? [...sessions.values()].filter(
+              (candidate) => candidate?.connRef === session.connRef && candidate?.stream,
+            ).length
+            : 1;
+          if (
+            sharedTerminalCountAfterRecovery !== 1
+            || !discovery.available
+            || unclaimedPids.length !== 1
+          ) {
+            return {
+              success: false,
+              error: 'Current directory is still ambiguous after reconnect',
+            };
+          }
+          const recoveredPid = unclaimedPids[0];
+          const result = await getSessionPwd(event, {
+            ...payload,
+            _cwdRecoveryToken: cwdRecoveryToken,
+            _cwdRecoveryTargetPid: recoveredPid,
+            _cwdRecoveryTransport: transport,
+          });
+          if (!isCurrentOwner()) {
+            return { success: false, error: 'Session changed during cwd recovery' };
+          }
+          const sharedTerminalCountAfterPwd = transport
+            ? [...sessions.values()].filter(
+              (candidate) => candidate?.connRef === transport && candidate?.stream,
+            ).length
+            : 1;
+          if (
+            sharedTerminalCountAfterPwd !== 1
+            || (
+              transport
+              && (transport.shellCloseGeneration || 0) !== recoveryOwner.shellCloseGeneration
+            )
+            || transport?.closedShellPidUnknown
+          ) {
+            return { success: false, error: 'Terminal set changed during cwd recovery' };
+          }
+          if (!result.success) {
+            return result;
+          }
+          session.shellPid = recoveredPid;
+          session.blockUntargetedCwdProbe = false;
+          session.parkedReconnectRisk = null;
+          return result;
+        })().finally(() => {
+          if (session.cwdRecoveryPromise === recoveryPromise) {
+            session.cwdRecoveryPromise = null;
+          }
+          if (transport?.cwdRecoveryPromise === recoveryPromise) {
+            transport.cwdRecoveryPromise = null;
+          }
+        });
+        session.cwdRecoveryPromise = recoveryPromise;
+        if (transport) transport.cwdRecoveryPromise = recoveryPromise;
+        return recoveryPromise;
+      }
+
+      const requestedRecoveryPid = isTargetedRecovery ? payload?._cwdRecoveryTargetPid : '';
+      const targetLoginPid = /^\d+$/.test(String(requestedRecoveryPid || session.shellPid || ''))
+        ? String(requestedRecoveryPid || session.shellPid)
+        : '';
+      const sharedTerminalCount = session.connRef
+        ? [...sessions.values()].filter(
+          (candidate) => candidate?.connRef === session.connRef && candidate?.stream,
+        ).length
+        : 1;
+      if (sharedTerminalCount > 1 && !targetLoginPid) {
+        return {
+          success: false,
+          error: 'Current directory is ambiguous across shared terminal channels',
+        };
       }
     
       // Completely silent: uses a separate exec channel, nothing is printed
       // in the interactive terminal. The exec channel and the interactive
       // shell are both children of the same per-connection sshd process,
       // so we find the shell as a sibling via $PPID.
+      const pwdOwner = {
+        conn: session.conn,
+        connRef: session.connRef,
+        stream: session.stream,
+      };
+      const isCurrentPwdOwner = () => (
+        sessions.get(sessionId) === session
+        && session.conn === pwdOwner.conn
+        && session.connRef === pwdOwner.connRef
+        && session.stream === pwdOwner.stream
+      );
       return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          resolve({ success: false, error: 'Timeout getting pwd' });
-        }, 5000);
+        let settled = false;
+        const settle = (result) => {
+          if (settled) return;
+          settled = true;
+          resolve(result);
+        };
     
         // POSIX sh script that:
         //   1. Finds the user's interactive shell on the same SSH connection
@@ -92,12 +546,18 @@ function createSessionOpsApi(ctx) {
         //   2. Follows foreground child shells only, which covers bash->fish
         //      without mistaking background shell scripts for the active shell.
         //   3. Reads /proc/<pid>/cwd via readlink.
-        //   4. Falls back to the user's home directory if anything fails.
+        //   4. If the active (su'd) shell cwd is unreadable, falls back to the
+        //      same-uid login shell cwd when allowed.
+        //   5. Falls back to the user's home directory if the caller allows it.
         //
-        // `exec` makes sh replace the user's login shell (fish/bash/...)
-        // so sh keeps the same PID and $PPID = sshd. Starting another shell
-        // without exec would make $PPID point at the intermediate shell instead.
+        // Outer `exec sh -c` replaces the login shell (fish/zsh/...) so the
+        // POSIX sh's $PPID is sshd. That pid is exported as NC_SSHD_PPID
+        // because the watchdog wrapper would otherwise become $PPID of the
+        // inner posixScript (and macOS/BSD have no /proc fallback).
         const posixScript = `SELF=$$
+    TARGET_LOGIN=${targetLoginPid}
+    ALLOW_HOME_FALLBACK=${allowHomeFallback ? "1" : "0"}
+    ALLOW_LOGIN_FALLBACK=${allowLoginShellFallback ? "1" : "0"}
     # Find the user's interactive shell on this SSH connection.
     # Prefer the one attached to a controlling tty (the user's shell): probe exec
     # channels like this one have no tty ("?"), and ps output is unsorted, so
@@ -114,8 +574,9 @@ function createSessionOpsApi(ctx) {
     # entirely (#1123).
     find_login_shell() {
       _shell=$(ps -e -o pid=,ppid=,tty=,comm= 2>/dev/null | awk -v pp="$1" -v self="$SELF" '
-        $1 != self && $2 == pp && $4 ~ /^-?(ba|z|fi|k|da|a)?sh$/ {
-          if ($3 != "?") { print $1; found=1; exit }
+        function isshell(c) { sub(/^.*\\//, "", c); sub(/^-/, "", c); return c ~ /^(ba|z|fi|k|da|a|c|tc)?sh$/ }
+        $1 != self && $2 == pp && isshell($4) {
+          if ($3 !~ /^\\?+$/) { print $1; found=1; exit }
           if (any == "") any=$1
         }
         END { if (!found && any != "") print any }
@@ -141,7 +602,7 @@ function createSessionOpsApi(ctx) {
         [ "$_conn2" = "$_conn" ] || continue
         _comm=$(cat "$_d/comm" 2>/dev/null)
         case "$_comm" in
-          sh|bash|zsh|fish|ksh|dash|ash) ;;
+          sh|bash|zsh|fish|ksh|dash|ash|csh|tcsh) ;;
           *) continue ;;
         esac
         _tty=$(ps -p "$_pid" -o tty= 2>/dev/null | tr -d '[:space:]')
@@ -163,7 +624,7 @@ function createSessionOpsApi(ctx) {
     find_active_shell() {
       ps -e -o pid=,ppid=,stat=,comm= 2>/dev/null | awk -v start="$1" '
         { pp[$1]=$2; st[$1]=$3; cm[$1]=$4; ord[NR]=$1 }
-        function isshell(c) { return c ~ /^-?(ba|z|fi|k|da|a)?sh$/ }
+        function isshell(c) { sub(/^.*\\//, "", c); sub(/^-/, "", c); return c ~ /^(ba|z|fi|k|da|a|c|tc)?sh$/ }
         function depth(p,   d) { d=0; while (p != "" && d < 64) { if (p == start) return d; p=pp[p]; d++ } return -1 }
         END {
           best=-1; bp="";
@@ -178,20 +639,39 @@ function createSessionOpsApi(ctx) {
         }
       '
     }
-    login=$(find_login_shell "$PPID")
+    # Read a process's cwd. Linux exposes it via /proc; systems without a
+    # readable /proc fall back to lsof so the SFTP follow-terminal probe also
+    # works on macOS and on BSD hosts that provide lsof (#2335). Both paths
+    # only see same-uid processes, so a su'd / sudo'd shell owned by another
+    # user stays unreadable here (handled by the login-shell fallback below).
+    read_shell_cwd() {
+      _rc_cwd=$(readlink "/proc/$1/cwd" 2>/dev/null)
+      if [ -n "$_rc_cwd" ]; then printf '%s\\n' "$_rc_cwd"; return 0; fi
+      if command -v lsof >/dev/null 2>&1; then
+        _rc_cwd=$(LC_ALL=C lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n1)
+        if [ -n "$_rc_cwd" ]; then printf 'NETCATTY_LSOF_CWD=%s\\n' "$_rc_cwd"; return 0; fi
+      fi
+      return 1
+    }
+    login="$TARGET_LOGIN"
+    [ -n "$login" ] || login=$(find_login_shell "\${NC_SSHD_PPID:-$PPID}")
     if [ -n "$login" ]; then
+      printf 'NETCATTY_LOGIN_PID=%s\\n' "$login" >&2
       pid=$(find_active_shell "$login")
       [ -n "$pid" ] || pid="$login"
-      cwd=$(readlink /proc/$pid/cwd 2>/dev/null)
-      # /proc/<pid>/cwd is only readable for same-uid processes (ptrace perms), so
-      # this unprivileged exec channel cannot read a su'd / sudo'd shell owned by
-      # another user. Fall back to the same-uid login shell's cwd before giving up
-      # to the home directory (#1065 review).
-      if [ -z "$cwd" ] && [ "$pid" != "$login" ]; then
-        cwd=$(readlink /proc/$login/cwd 2>/dev/null)
+      cwd=$(read_shell_cwd "$pid")
+      # The active shell's cwd is only readable for same-uid processes (ptrace
+      # perms on /proc, lsof permissions on macOS/BSD), so this unprivileged
+      # exec channel cannot read a su'd / sudo'd shell owned by another user.
+      # Fall back to the same-uid login shell's cwd before giving up to the
+      # home directory (#1065 review). Callers that need this after disabling
+      # ~ guessing (SFTP preferFreshBackend) must set ALLOW_LOGIN_FALLBACK (#2886).
+      if [ -z "$cwd" ] && [ "$pid" != "$login" ] && [ "$ALLOW_LOGIN_FALLBACK" = "1" ]; then
+        cwd=$(read_shell_cwd "$login")
       fi
       [ -n "$cwd" ] && printf '%s\\n' "$cwd" && exit 0
     fi
+    [ "$ALLOW_HOME_FALLBACK" = "1" ] || exit 1
     emit_home() {
       case "$1" in
         /*) printf '%s\\n' "$1"; exit 0 ;;
@@ -210,28 +690,60 @@ function createSessionOpsApi(ctx) {
     emit_home "$home"
     emit_home "$HOME"
     exit 1`;
-        const cmd = `exec sh -c ${quoteShellArg(posixScript)}`;
-    
-        session.conn.exec(cmd, (err, stream) => {
-          if (err) {
-            clearTimeout(timer);
-            log('[getSessionPwd] exec error:', err.message);
-            resolve({ success: false, error: err.message });
+        // Capture sshd's pid in the exec'd POSIX sh (`$PPID` is sshd because
+        // `exec` replaced the login shell). Do not `exec` the inner posixScript:
+        // that would skip the watchdog cleanup after it.
+        const cmd = `exec sh -c ${quoteShellArg(
+          `export NC_SSHD_PPID=$PPID; ${withRemoteWatchdog(
+            `sh -c ${quoteShellArg(posixScript)}`,
+            timeoutMs,
+          )}`
+        )}`;
+
+        void executeBoundedSshCommand(session.conn, cmd, {
+          // Do not shorten channel opening: a timeout there invalidates the
+          // shared SSH transport. Only bound the best-effort command itself.
+          openingTimeoutMs: 5000,
+          runTimeoutMs: timeoutMs,
+          maxOutputBytes: 256 * 1024,
+          setTimeoutFn: setTimeout,
+          clearTimeoutFn: clearTimeout,
+          invalidateOnOpenTimeout: !isTargetedRecovery,
+        }).then(({ stdout, stderr, code }) => {
+              if (!isCurrentPwdOwner()) {
+                settle({ success: false, error: 'Session changed during cwd probe' });
+                return;
+              }
+              const rawPath = stdout.replace(/\r?\n$/, '');
+              const lsofPrefix = 'NETCATTY_LSOF_CWD=';
+              const path = rawPath.startsWith(lsofPrefix)
+                ? decodeLsofFileName(rawPath.slice(lsofPrefix.length))
+                : rawPath;
+              const loginPidMatch = stderr.match(/(?:^|\n)NETCATTY_LOGIN_PID=(\d+)(?:\n|$)/);
+              if (loginPidMatch && !isTargetedRecovery) {
+                session.shellPid = loginPidMatch[1];
+              }
+              log('[getSessionPwd]', { stdout: rawPath, stderr: stderr.trim(), exitCode: code });
+              if (path && path.startsWith('/')) {
+                settle({ success: true, cwd: path });
+              } else {
+                settle({ success: false, error: 'Could not determine cwd' });
+              }
+        }, (err) => {
+          if (isTargetedRecovery && err?.code === "SSH_EXEC_OPEN_TIMEOUT") {
+            const recoveryTransport = payload?._cwdRecoveryTransport || session.connRef;
+            if (recoveryTransport) recoveryTransport.cwdRecoveryDisabled = true;
+          }
+          if (!isCurrentPwdOwner()) {
+            settle({ success: false, error: 'Session changed during cwd probe' });
             return;
           }
-          let out = '';
-          let errOut = '';
-          stream.on('data', (d) => { out += d.toString(); });
-          stream.stderr?.on('data', (d) => { errOut += d.toString(); });
-          stream.on('close', (code) => {
-            clearTimeout(timer);
-            const path = out.trim();
-            log('[getSessionPwd]', { stdout: path, stderr: errOut.trim(), exitCode: code });
-            if (path && path.startsWith('/')) {
-              resolve({ success: true, cwd: path });
-            } else {
-              resolve({ success: false, error: 'Could not determine cwd' });
-            }
+          log('[getSessionPwd] exec error:', err?.message || String(err));
+          settle({
+            success: false,
+            error: err?.code === "SSH_EXEC_OPEN_TIMEOUT" || err?.code === "SSH_EXEC_RUN_TIMEOUT"
+              ? "Timeout getting pwd"
+              : err?.message || String(err),
           });
         });
       });
@@ -239,12 +751,10 @@ function createSessionOpsApi(ctx) {
     
     // Resolve the directory the running `rz` writes to (its own cwd) and report
     // which of `names` already exist there. Returns { dir, existing } or null.
-    function probeReceiveConflicts(session, names) {
-      return new Promise((resolve) => {
+    async function probeReceiveConflicts(session, names, { signal } = {}) {
         if (!session || !session.conn || !Array.isArray(names) || names.length === 0) {
-          return resolve(null);
+          return null;
         }
-        const timer = setTimeout(() => resolve(null), 5000);
         const script = `SELF=$$
     find_login_shell() {
       ps -e -o pid=,ppid=,tty=,comm= 2>/dev/null | awk -v pp="$1" -v self="$SELF" '
@@ -277,12 +787,14 @@ function createSessionOpsApi(ctx) {
     done`;
         const argv = names.map((n) => quoteShellArg(n)).join(" ");
         const cmd = `exec sh -c ${quoteShellArg(script)} sh ${argv}`;
-        session.conn.exec(cmd, (err, stream) => {
-          if (err) { clearTimeout(timer); return resolve(null); }
-          let out = "";
-          stream.on("data", (d) => { out += d.toString(); });
-          stream.on("close", () => {
-            clearTimeout(timer);
+        try {
+            const { stdout: out } = await executeBoundedSshCommand(session.conn, cmd, {
+              openingTimeoutMs: 5000,
+              runTimeoutMs: 5000,
+              maxOutputBytes: 1024 * 1024,
+              signal,
+              invalidateTransportOnAbort: false,
+            });
             let dir = null; const existing = []; const modes = {};
             for (const line of out.split("\n")) {
               const [tag, val, mode] = line.split("\t");
@@ -292,46 +804,66 @@ function createSessionOpsApi(ctx) {
                 if (mode && /^[0-7]{3,4}$/.test(mode)) modes[val] = mode;
               }
             }
-            resolve(dir ? { dir, existing, modes } : null);
-          });
-        });
-      });
+            return dir ? { dir, existing, modes } : null;
+        } catch {
+          return null;
+        }
     }
     
     // rm -f the given absolute remote paths (quoted; injection-safe).
-    function removeRemoteFiles(session, paths) {
-      return new Promise((resolve) => {
-        if (!session || !session.conn || !Array.isArray(paths) || paths.length === 0) return resolve();
+    async function removeRemoteFiles(session, paths, { signal } = {}) {
+        if (!session || !session.conn || !Array.isArray(paths) || paths.length === 0) return;
         const argv = paths.map((p) => quoteShellArg(p)).join(" ");
-        const timer = setTimeout(resolve, 5000);
-        session.conn.exec(`exec sh -c 'rm -f -- "$@"' sh ${argv}`, (err, stream) => {
-          if (err) { clearTimeout(timer); return resolve(); }
-          stream.on("data", () => {}); stream.stderr?.on("data", () => {});
-          stream.on("close", () => { clearTimeout(timer); resolve(); });
-        });
-      });
+        const commitToken = "NETCATTY_ZMODEM_COMMIT";
+        const command = `exec sh -c ${quoteShellArg(
+          `IFS= read -r token || exit 125; ` +
+          `[ "$token" = ${quoteShellArg(commitToken)} ] || exit 125; ` +
+          `rm -f -- "$@"`,
+        )} sh ${argv}`;
+        await executeBoundedSshCommand(
+          session.conn,
+          command,
+          {
+            openingTimeoutMs: 5000,
+            runTimeoutMs: 5000,
+            maxOutputBytes: 64 * 1024,
+            signal,
+            invalidateTransportOnAbort: false,
+            onStream: (stream) => stream.end(`${commitToken}\n`),
+          },
+        ).catch(() => {});
     }
     
     // chmod the given { path, mode } entries back to their captured permissions
     // (parameterized; injection-safe). Modes are validated octal before use.
-    function restoreRemoteModes(session, entries) {
-      return new Promise((resolve) => {
-        if (!session || !session.conn || !Array.isArray(entries) || entries.length === 0) return resolve();
+    async function restoreRemoteModes(session, entries, { signal } = {}) {
+        if (!session || !session.conn || !Array.isArray(entries) || entries.length === 0) return;
         const args = [];
         for (const e of entries) {
           if (!e || !e.path || !/^[0-7]{3,4}$/.test(String(e.mode))) continue;
           args.push(quoteShellArg(String(e.mode)));
           args.push(quoteShellArg(e.path));
         }
-        if (args.length === 0) return resolve();
-        const timer = setTimeout(resolve, 5000);
+        if (args.length === 0) return;
         const script = 'while [ "$#" -ge 2 ]; do chmod "$1" "$2" 2>/dev/null; shift 2; done';
-        session.conn.exec(`exec sh -c ${quoteShellArg(script)} sh ${args.join(" ")}`, (err, stream) => {
-          if (err) { clearTimeout(timer); return resolve(); }
-          stream.on("data", () => {}); stream.stderr?.on("data", () => {});
-          stream.on("close", () => { clearTimeout(timer); resolve(); });
-        });
-      });
+        const commitToken = "NETCATTY_ZMODEM_COMMIT";
+        const command = `exec sh -c ${quoteShellArg(
+          `IFS= read -r token || exit 125; ` +
+          `[ "$token" = ${quoteShellArg(commitToken)} ] || exit 125; ` +
+          script,
+        )} sh ${args.join(" ")}`;
+        await executeBoundedSshCommand(
+          session.conn,
+          command,
+          {
+            openingTimeoutMs: 5000,
+            runTimeoutMs: 5000,
+            maxOutputBytes: 64 * 1024,
+            signal,
+            invalidateTransportOnAbort: false,
+            onStream: (stream) => stream.end(`${commitToken}\n`),
+          },
+        ).catch(() => {});
     }
     
     /**
@@ -358,20 +890,11 @@ function createSessionOpsApi(ctx) {
     
       return new Promise((resolve) => {
         let settled = false;
-        let streamRef = null;
         const resolveOnce = (result) => {
           if (settled) return;
           settled = true;
-          clearTimeout(timer);
           resolve(result);
         };
-        const timer = setTimeout(() => {
-          try {
-            streamRef?.close?.();
-            streamRef?.destroy?.();
-          } catch {}
-          resolveOnce({ success: false, entries: [], error: 'Timeout listing directory' });
-        }, 3000);
     
         // Emit a NUL-delimited stream from plain POSIX shell/find so we don't depend on
         // Python/Perl, while still preserving whitespace and newline characters in filenames.
@@ -427,20 +950,14 @@ function createSessionOpsApi(ctx) {
           done
         ' sh '${safePrefix}' ${foldersOnly ? 1 : 0} ${maxEntries} {} + 2>/dev/null`;
     
-        session.conn.exec(cmd, (err, stream) => {
-          if (err) {
-            resolveOnce({ success: false, entries: [], error: err.message });
-            return;
-          }
-          streamRef = stream;
-          const chunks = [];
-          let errOut = '';
-          stream.on('data', (d) => { chunks.push(Buffer.from(d)); });
-          stream.stderr?.on('data', (d) => { errOut += d.toString(); });
-          stream.on('close', () => {
+        void executeBoundedSshCommand(session.conn, cmd, {
+          openingTimeoutMs: 3000,
+          runTimeoutMs: 3000,
+          maxOutputBytes: 1024 * 1024,
+        }).then(({ stdout, stderr: errOut }) => {
             if (settled) return;
             try {
-              const output = Buffer.concat(chunks);
+              const output = Buffer.from(stdout, 'utf8');
               const entries = [];
               let fieldStart = 0;
               let pendingName = null;
@@ -471,7 +988,8 @@ function createSessionOpsApi(ctx) {
                 error: errOut.trim() || 'Failed to parse directory listing',
               });
             }
-          });
+        }, (err) => {
+          resolveOnce({ success: false, entries: [], error: err?.message || String(err) });
         });
       });
     }
@@ -488,19 +1006,83 @@ function createSessionOpsApi(ctx) {
         return { success: false, error: 'Session not found or not connected' };
       }
 
-      // Mosh sessions run over UDP via a local mosh-client PTY and have no
-      // ssh2 connection of their own. Lazily open a best-effort companion SSH
-      // connection (reusing the handshake credentials) so the host-info bar
-      // works for Mosh too (issue #1198). The companion lives on
-      // session.moshStatsConn — deliberately NOT session.conn — so it stays
-      // invisible to other bridges (getSessionPwd / SFTP / MCP exec) that key
-      // off session.conn as the interactive connection. This is a no-op for
-      // real SSH sessions, which already carry session.conn.
-      if (!session.conn && !session.moshStatsConn && typeof ensureMoshStatsConnection === 'function') {
-        await ensureMoshStatsConnection(session, sessionId, event?.sender);
+      const isEtSession = session.type === "et";
+      const etUsesExecFallback = isEtSession && session.etStatsAuth?.hasJumpHost;
+
+      function createBufferedExecStream(stdout = "", stderr = "") {
+        const stream = {
+          stderr: {
+            on(eventName, handler) {
+              if (eventName === "data" && stderr) {
+                setTimeout(() => handler(Buffer.from(stderr)), 0);
+              }
+              return this;
+            },
+          },
+          on(eventName, handler) {
+            if (eventName === "data" && stdout) {
+              setTimeout(() => handler(Buffer.from(stdout)), 0);
+            }
+            if (eventName === "close") {
+              setTimeout(() => handler(0), 0);
+            }
+            return this;
+          },
+          close() {},
+          destroy() {},
+        };
+        return stream;
       }
 
-      const conn = session.conn || session.moshStatsConn;
+      function createEtStatsExecConn(etSession) {
+        return {
+          exec(command, cb) {
+            execOnEtSession(etSession, command, 10000, {
+              requireTrustedHost: true,
+              knownHosts: etSession.etStatsAuth?.knownHosts,
+            })
+              .then((result) => {
+                if (!result?.success) {
+                  cb(new Error(result?.error || result?.stderr || "ET stats command failed"));
+                  return;
+                }
+                cb(null, createBufferedExecStream(result.stdout || "", result.stderr || ""));
+              })
+              .catch((err) => {
+                cb(err instanceof Error ? err : new Error(String(err)));
+              });
+          },
+        };
+      }
+
+      // Mosh and direct ET sessions run through external PTYs and have no
+      // ssh2 connection of their own. Lazily open a best-effort companion SSH
+      // connection (reusing credentials) so the host-info bar can use the same
+      // stats parser as normal SSH. The companion lives on protocol-specific
+      // fields — never session.conn — so other bridges do not mistake it for
+      // the interactive connection. ET sessions with a jump host use the
+      // already-prepared OpenSSH environment via execOnEtSession instead.
+      if (!session.conn && !session.moshStatsConn && !session.etStatsConn) {
+        if (session.type === 'mosh' && typeof ensureMoshStatsConnection === 'function') {
+          await ensureMoshStatsConnection(session, sessionId, event?.sender);
+        } else if (
+          isEtSession &&
+          !etUsesExecFallback &&
+          !session.etStatsConnFailed &&
+          typeof ensureEtStatsConnection === 'function'
+        ) {
+          await ensureEtStatsConnection(session, sessionId, event?.sender);
+        }
+      }
+
+      const canExecEtStats =
+        isEtSession &&
+        typeof execOnEtSession === "function" &&
+        !!session.sshUserHost &&
+        !session.externalAuthArtifactsCleaned;
+      const sshStatsConn = session.conn || session.moshStatsConn || session.etStatsConn;
+      const usesEtStatsFallback = !sshStatsConn && canExecEtStats;
+      const conn = sshStatsConn || (usesEtStatsFallback ? createEtStatsExecConn(session) : null);
       if (!conn) {
         // A Mosh session can be marked "connected" (and start polling) from
         // the SSH bootstrap's visible output before swapToMoshClient stores
@@ -514,16 +1096,16 @@ function createSessionOpsApi(ctx) {
         return { success: false, error: 'Session not found or not connected' };
       }
     
-      // macOS stats command: uses sysctl, vm_stat, top, ps, df, netstat
-      // CPU reported as direct percentage (top computes delta internally)
+      // macOS stats command: uses sysctl, vm_stat, ps, df, netstat
+      // CPU is a fast best-effort sum of process %CPU normalized by logical cores.
       // cpuPerCore not available on macOS without sudo
       const macosStatsCommand = [
         `cores=$(sysctl -n hw.logicalcpu 2>/dev/null || echo "1")`,
         `pagesize=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")`,
         `memsize=$(sysctl -n hw.memsize 2>/dev/null || echo "0")`,
-        // CPU usage: top -l 1 gives one logging sample, parse idle%
-        `cpuline=$(top -l 1 -s 0 -n 0 2>/dev/null | grep "CPU usage:" | head -1)`,
-        `cpupct=$(echo "$cpuline" | awk '{for(i=1;i<=NF;i++){if($(i+1)~/^idle/){v=$i;gsub(/%/,"",v);idle=v+0;found=1}};if(found)printf "%.0f",100-idle}')`,
+        // CPU usage: avoid top here; on some remote macOS shells top can block long enough
+        // to trip the stats timeout. ps is fast and present on supported macOS versions.
+        `cpupct=$(ps -A -o %cpu= 2>/dev/null | awk -v c="$cores" '{s+=$1} END{if(c<=0)c=1;s=s/c;if(s<0)s=0;if(s>100)s=100;printf "%.0f",s}')`,
         // Memory: single vm_stat pipe → awk extracts all page counts (strip trailing dots with gsub)
         // Outputs: "memfree memcached" in MB
         `vmmem=$(vm_stat 2>/dev/null | awk -v ps="$pagesize" '/^Pages free:/{gsub(/[^0-9]/,"",$NF);free=$NF+0} /^Pages speculative:/{gsub(/[^0-9]/,"",$NF);spec=$NF+0} /^Pages inactive:/{gsub(/[^0-9]/,"",$NF);inact=$NF+0} /^Pages purgeable:/{gsub(/[^0-9]/,"",$NF);purg=$NF+0} END{mfree=int((free+spec)*ps/1024/1024);mcached=int((inact+purg)*ps/1024/1024);printf "%d %d",mfree,mcached}')`,
@@ -537,14 +1119,90 @@ function createSessionOpsApi(ctx) {
         `swapfree=$(echo "$swaptotal $swapused" | awk '{printf "%.0f",$1-$2}')`,
         // Top processes by memory%
         `procs=$(ps -A -o pid=,%mem=,comm= 2>/dev/null | sort -k2 -rn | head -10 | awk '{gsub(/;/,"_",$3);printf "%s;%.1f;%s,",$1,$2,$3}' | sed 's/,$//')`,
-        // Disk: only show root "/" and external volumes "/Volumes/*", skip system APFS snapshots
-        `disks=$(df -k 2>/dev/null | awk 'NR>1&&index($1,"/dev/")==1&&NF>=9&&($NF=="/"||index($NF,"/Volumes/")==1){u=$3/1048576;t=$2/1048576;p=$5;gsub(/%/,"",p);printf "%s:%.0f:%.0f:%s,",$NF,u,t,p}' | sed 's/,$//')`,
+        // Disk: -P keeps a stable six-column POSIX layout on macOS.
+        `mounts=$(mount 2>/dev/null || true)`,
+        `disks=$({ printf "%s\n" "$mounts"; printf "__NETCATTY_DF__\n"; df -kP 2>/dev/null; } | awk '$0=="__NETCATTY_DF__"{in_df=1;next} !in_df{if($1~/^\/dev\/disk/&&(index($0,"(apfs,")||index($0,"(apfs)"))){key=$1;sub(/s[0-9].*$/,"",key);capacity[$1]="apfs:" key}next} $1=="Filesystem"{next} index($1,"/dev/")==1{m=$6;if(m=="/"||index(m,"/Volumes/")==1){t=$2/1048576;key=(($1 in capacity)?capacity[$1]:$1);if(key~/^apfs:/){u=($2-$4)/1048576;p=(t>0?int(u*100/t+0.5):0)}else{u=$3/1048576;p=$5;gsub(/%/,"",p)}printf "%s:%.6f:%.6f:%s:%s,",m,u,t,p,key}}' | sed 's/,$//')`,
         // Network: Link# lines only, exclude loopback, detect column shift (no MAC addr → cols shift left)
-        `net=$(netstat -ib 2>/dev/null | awk '/^[a-z]/&&$3~/Link/&&$1!~/^lo/{if($4~/:/){rx=$7;tx=$10}else{rx=$6;tx=$9};if((rx+0)>0){gsub(/[*]/,"",$1);printf "%s:%s:%s,",$1,rx,tx}}' | sed 's/,$//')`,
-        `echo "CPU:$cpupct|CORES:$cores|MEMINFO:$memtotal $memfree 0 $memcached $swaptotal $swapfree|PROCS:$procs|DISKS:$disks|NET:$net"`,
+        `net=$(netstat -ibn 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++){if($i=="Ibytes")ib=i;if($i=="Obytes")ob=i}next} ib&&ob&&$1~/^[[:alpha:]]/&&$1!~/^lo/&&$0~/<Link#/{name=$1;gsub(/[*]/,"",name);rx=$(ib)+0;tx=$(ob)+0;if(rx>0||tx>0){seen[name]=rx ":" tx}} END{for(name in seen)printf "%s:%s,",name,seen[name]}' | sed 's/,$//')`,
+        `hostname_value=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo "")`,
+        `osname=$(printf "%s %s" "$(sw_vers -productName 2>/dev/null)" "$(sw_vers -productVersion 2>/dev/null)" | sed 's/[[:space:]]*$//')`,
+        `kernel=$(uname -r 2>/dev/null || echo "")`,
+        `bootsec=$(sysctl -n kern.boottime 2>/dev/null | awk -F'[ ,]+' '{for(i=1;i<=NF;i++){if($i=="sec"){print $(i+2);exit}}}')`,
+        `nowsec=$(date +%s 2>/dev/null || echo "0")`,
+        `uptime=$(awk -v n="$nowsec" -v b="$bootsec" 'BEGIN{if(n>0&&b>0)printf "%.0f",n-b}')`,
+        `loadavg=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1" "$2" "$3"}')`,
+        `echo "CPU:$cpupct|CORES:$cores|MEMINFO:$memtotal $memfree 0 $memcached $swaptotal $swapfree|PROCS:$procs|DISKS:$disks|NET:$net|HOST:$hostname_value|OS:$osname|KERNEL:$kernel|UPTIME:$uptime|LOAD:$loadavg"`,
       ].join('; ');
+
+      // Prefer df's filesystem type column so FUSE mounts can be identified
+      // even when their source name looks like an ordinary remote path.
+      // Fall back to the old layout for BusyBox builds without df -T.
+      const linuxDiskAwk = String.raw`awk '
+        $0 == "__NETCATTY_DF__" { in_df = 1; next }
+        !in_df {
+          on_marker = index($0, " on ");
+          if (on_marker > 1) {
+            mount_rest = substr($0, on_marker + 4);
+            type_marker = index(mount_rest, " type ");
+            if (type_marker > 1) {
+              mount_point = substr(mount_rest, 1, type_marker - 1);
+              filesystem_type = substr(mount_rest, type_marker + 6);
+              sub(/[[:space:]].*$/, "", filesystem_type);
+              mount_filesystem_types[mount_point] = filesystem_type;
+            }
+          }
+          next
+        }
+        $1 == "Filesystem" { has_type = ($2 == "Type"); next }
+        NF > 0 {
+          source = $1;
+          if (has_type) {
+            filesystem_type = $2;
+            total_kb = $3;
+            used_kb = $4;
+            percent = $6;
+            mount_point = $7;
+          } else {
+            filesystem_type = "";
+            total_kb = $2;
+            used_kb = $3;
+            percent = $5;
+            mount_point = $6;
+          }
+          if ((filesystem_type == "" || filesystem_type == "-") && (mount_point in mount_filesystem_types)) {
+            filesystem_type = mount_filesystem_types[mount_point];
+          }
+          if (mount_point == "") next;
+          if (source ~ /^\/dev\/loop/ && mount_point != "/") next;
+          if (mount_point != "/" && mount_point ~ /^\/(etc|proc|sys|dev|snap)(\/|$)/) next;
+          if (mount_point != "/" && source ~ /^(overlay|overlayfs)(\/|$|:)/) next;
+          fstype = tolower(filesystem_type);
+          source_lower = tolower(source);
+          is_network_or_fuse = 0;
+          if (fstype ~ /^fuse\.(rclone|sshfs|s3fs|gcsfuse|ufs|mergerfs|unionfs|unionfs-fuse|ceph|ceph-fuse|cephfs|glusterfs)$/) is_network_or_fuse = 1;
+          if (fstype ~ /clouddrive/) is_network_or_fuse = 1;
+          if (fstype ~ /^(fuse|rclone|sshfs|s3fs|gcsfuse|mergerfs|unionfs|unionfs-fuse|nfs|nfs4|cifs|smb|smb3|smbfs|afs|ceph|cephfs|glusterfs)$/) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower ~ /clouddrive/) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower ~ /^(fuse|fuse\..*|rclone|rclone:.*|sshfs|s3fs|gcsfuse|mergerfs|unionfs|unionfs-fuse|ceph|ceph-fuse|cephfs|gluster|glusterfs|ufs)$/) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower ~ /^\/\//) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower !~ /^(apfs|overlay|overlayfs):/ && source_lower ~ /^([a-z0-9._-]+|\[[0-9a-f:]+(%[a-z0-9._-]+)?\]):\//) is_network_or_fuse = 1;
+          if (is_network_or_fuse) next;
+          pseudo_type = (fstype != "" && fstype != "-") ? fstype : source_lower;
+          if (mount_point != "/" && pseudo_type ~ /^(tmpfs|shm|devtmpfs|udev|none|proc|sysfs|cgroup|cgroup2|devpts|mqueue|hugetlbfs|debugfs|tracefs|securityfs|pstore|bpf|fusectl|configfs|ramfs|rpc_pipefs|binfmt_misc|efivarfs)$/) next;
+          total = total_kb / 1048576;
+          used = used_kb / 1048576;
+          if (total <= 0) next;
+          gsub(/%/, "", percent);
+          if (percent !~ /^[0-9]+$/) percent = int(used * 100 / total + 0.5);
+          metadata = source;
+          if (filesystem_type != "" && filesystem_type != "-") metadata = "fs=" filesystem_type ":" source;
+          printf "%s:%.6f:%.6f:%s:%s,", mount_point, used, total, percent, metadata;
+        }
+      '`;
+      const linuxDiskTable = `{ LC_ALL=C mount 2>/dev/null; printf "%s\\n" "__NETCATTY_DF__"; LC_ALL=C df -kPT 2>/dev/null || LC_ALL=C df -kP 2>/dev/null; }`;
+      const linuxDiskRoot = `{ LC_ALL=C mount 2>/dev/null; printf "%s\\n" "__NETCATTY_DF__"; LC_ALL=C df -kPT / 2>/dev/null || LC_ALL=C df -kP / 2>/dev/null; }`;
     
-      // Command to get CPU (overall + per-core), Memory, Disk, and Network stats
+      // Command to get CPU (overall + per-core), Memory, and Network stats
       // This command is designed to work across most Linux distributions
       // Note: Using semicolons and avoiding comments for single-line execution
       // CPU: Output raw values (total and idle) instead of percentage - we calculate delta on backend
@@ -560,52 +1218,101 @@ function createSessionOpsApi(ctx) {
         `meminfo=$(awk '/^MemTotal:/{t=$2} /^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} /^SReclaimable:/{s=$2} /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2} END{printf "%d %d %d %d %d %d", t/1024, f/1024, b/1024, (c+s)/1024, st/1024, sf/1024}' /proc/meminfo 2>/dev/null || echo "")`,
         // Get top 10 processes by memory - with BusyBox fallback
         // GNU ps: ps -eo pid,%mem,comm --sort=-%mem
-        // BusyBox fallback: ps -o pid,vsz,comm and sort manually (BusyBox ps doesn't have %mem, use vsz instead)
-        `procs=$(ps -eo pid,%mem,comm --sort=-%mem 2>/dev/null | awk 'NR>1 && NR<=11 {gsub(/;/, "_", $3); printf "%s;%.1f;%s,", $1, $2, $3}' | sed 's/,$//' || ps -o pid,vsz,comm 2>/dev/null | awk 'NR>1 {gsub(/;/, "_", $3); print $2, $1, $3}' | sort -rn | head -10 | awk -v total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo) '{if(total>0) pct=$1*100/total; else pct=0; printf "%s;%.1f;%s,", $2, pct, $3}' | sed 's/,$//' || echo "")`,
-        // Get all mounted disk info - with BusyBox fallback
-        // GNU df: df -BG (block size in GB)
-        // BusyBox fallback: df and calculate from 1K blocks, or df -h and parse units
-        `disks=$(df -BG 2>/dev/null | awk 'NR>1 && $1 ~ /^\\/dev/ {gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); printf "%s:%s:%s:%s,", $6, $3, $2, $5}' | sed 's/,$//' || df 2>/dev/null | awk 'NR>1 && $1 ~ /^\\/dev/ {total=$2/1048576; used=$3/1048576; pct=$5; gsub(/%/,"",pct); printf "%s:%.0f:%.0f:%s,", $6, used, total, pct}' | sed 's/,$//' || echo "")`,
+        // BusyBox fallback: top exposes %VSZ/%CPU; minimal builds without top use plain ps VSZ.
+        `procs=$(if procraw=$(ps -eo pid,%mem,comm --sort=-%mem 2>/dev/null); then printf "%s\n" "$procraw" | awk 'NR>1 && NR<=11 {gsub(/;/, "_", $3); printf "%s;%.1f;%s,", $1, $2, $3}' | sed 's/,$//'; elif topraw=$(top -b -n 1 2>/dev/null); then printf "%s\n" "$topraw" | awk '$1 == "PID" {for(i=1;i<=NF;i++){if($i=="%VSZ") mem_col=i; else if($i=="COMMAND") cmd_col=i} next} $1 ~ /^[0-9]+$/ && mem_col && cmd_col {pct=$(mem_col); gsub(/%/, "", pct); cmd=$(cmd_col); gsub(/;/, "_", cmd); print pct ";" $1 ";" cmd}' | sort -t ';' -k1,1rn | head -10 | awk -F';' '{printf "%s;%.1f;%s,", $2, $1, $3}' | sed 's/,$//'; else ps ww 2>/dev/null | awk -v total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo) '$1 ~ /^[0-9]+$/ {v=$3; unit=substr(v,length(v),1); mult=1; if(unit=="m"||unit=="M")mult=1024; else if(unit=="g"||unit=="G")mult=1048576; sub(/[mMgG]$/, "", v); pct=total>0?v*mult*100/total:0; cmd=$5; gsub(/;/, "_", cmd); print pct, $1, cmd}' | sort -rn | head -10 | awk '{printf "%s;%.1f;%s,", $2, $1, $3}' | sed 's/,$//'; fi)`,
         // Get network interface stats from /proc/net/dev (interface:rx_bytes:tx_bytes), excluding lo and virtual interfaces
         `net=$(cat /proc/net/dev 2>/dev/null | awk 'NR>2 {gsub(/^[ \\t]+/, ""); split($0, a, ":"); iface=a[1]; if(iface != "lo" && iface !~ /^veth/ && iface !~ /^docker/ && iface !~ /^br-/) {split(a[2], b); printf "%s:%s:%s,", iface, b[1], b[9]}}' | sed 's/,$//' || echo "")`,
+        `hostname_value=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo "")`,
+        `osname=$(awk -F= '/^PRETTY_NAME=/{gsub(/"/,"",$2);print $2;exit}' /etc/os-release 2>/dev/null || uname -s 2>/dev/null || echo "")`,
+        `kernel=$(uname -r 2>/dev/null || echo "")`,
+        `uptime=$(awk '{printf "%.0f",$1}' /proc/uptime 2>/dev/null || echo "")`,
+        `loadavg=$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null || echo "")`,
         // Output all stats (using CPURAW and PERCORERAW instead of CPU and PERCORE)
-        `echo "CPURAW:$cpuraw|CORES:$cores|PERCORERAW:$percoreraw|MEMINFO:$meminfo|PROCS:$procs|DISKS:$disks|NET:$net"`
+        `echo "CPURAW:$cpuraw|CORES:$cores|PERCORERAW:$percoreraw|MEMINFO:$meminfo|PROCS:$procs|NET:$net|HOST:$hostname_value|OS:$osname|KERNEL:$kernel|UPTIME:$uptime|LOAD:$loadavg"`
       ].join('; ');
-    
-      // Auto-detect OS via uname — only Linux and macOS are supported
-      const statsCommand = `ostype=$(uname -s 2>/dev/null || echo "Unknown"); if [ "$ostype" = "Darwin" ]; then ${macosStatsCommand}; elif [ "$ostype" = "Linux" ]; then ${linuxStatsCommand}; else echo "UNSUPPORTED_OS:$ostype"; fi`;
+
+      // Client-side run bound shared by the stats and disk probes; the remote
+      // watchdog uses the same value so an abandoned probe self-kills instead
+      // of lingering on the target host (#3187).
+      const statsRunTimeoutMs = 10000;
+
+      // Get mounted disk info. GNU and BusyBox support df -T; the awk parser
+      // also accepts the legacy POSIX -kP layout as a fallback. PVE/LXC guests
+      // often expose ZFS datasets and host bind mounts without a /dev/* source,
+      // so keep non-pseudo filesystems. Skip FUSE/cloud/NFS/CIFS network mounts:
+      // their quotas are not local capacity. Keep a loop-backed rootfs while
+      // dropping snap loops, derive missing percentages, and fall back to "/".
+      const linuxDiskStatsCommand = withPosixRemoteWatchdog([
+        `disks=$( { ${linuxDiskTable}; } | ${linuxDiskAwk} | sed 's/,$//' )`,
+        `[ -n "$disks" ] || disks=$( { ${linuxDiskRoot}; } | ${linuxDiskAwk} | sed 's/,$//' )`,
+        `echo "DISKS:$disks"`,
+      ].join('; '), statsRunTimeoutMs);
+
+      // Dropbear rejects command requests larger than 9000 bytes by closing
+      // the entire SSH transport, including an already-open interactive shell.
+      // Keep Linux's large disk parser in its own request so future stats
+      // additions cannot repeat issue #2924.
+      const dropbearMaxCommandBytes = 9000;
+      const latencyMarker = "NC_LATENCY_MARK";
+      const statsCommand = withPosixRemoteWatchdog(
+        `printf "${latencyMarker}|"; ostype=$(uname -s 2>/dev/null || echo "Unknown"); if [ "$ostype" = "Darwin" ]; then ${macosStatsCommand}; elif [ "$ostype" = "Linux" ]; then ${linuxStatsCommand}; else echo "UNSUPPORTED_OS:$ostype"; fi`,
+        statsRunTimeoutMs,
+      );
+      const statsExecOptions = {
+        openingTimeoutMs: statsRunTimeoutMs,
+        runTimeoutMs: statsRunTimeoutMs,
+        maxOutputBytes: 1024 * 1024,
+        setTimeoutFn: setTimeout,
+        clearTimeoutFn: clearTimeout,
+      };
+      const executeStatsCommand = (command, options = statsExecOptions) => {
+        const commandBytes = Buffer.byteLength(command, 'utf8');
+        if (commandBytes > dropbearMaxCommandBytes) {
+          const error = new Error(`Server stats command exceeds Dropbear limit (${commandBytes} bytes)`);
+          error.code = "SSH_EXEC_COMMAND_LIMIT";
+          return Promise.reject(error);
+        }
+        return executeBoundedSshCommand(conn, command, options);
+      };
+      const tcpLatencyTarget = getTcpLatencyTarget(session);
+      const tcpLatencyPromise = tcpLatencyTarget && typeof measureTcpConnectLatency === 'function'
+        ? Promise.resolve(measureTcpConnectLatency(tcpLatencyTarget)).catch(() => null)
+        : Promise.resolve(null);
+      const formatStatsError = (error) => (
+        error?.code === "SSH_EXEC_OPEN_TIMEOUT" || error?.code === "SSH_EXEC_RUN_TIMEOUT"
+          ? "Timeout getting server stats"
+          : error?.message || String(error)
+      );
       return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          resolve({ success: false, error: 'Timeout getting server stats' });
-        }, 5000);
-    
-        conn.exec(statsCommand, (err, stream) => {
-          if (err) {
-            clearTimeout(timeout);
-            resolve({ success: false, error: err.message });
-            return;
-          }
-    
-          let stdout = '';
-          let stderr = '';
-    
-          stream.on('data', (data) => {
-            stdout += data.toString();
-          });
-    
-          stream.stderr.on('data', (data) => {
-            stderr += data.toString();
-          });
-    
-          stream.on('close', () => {
-            clearTimeout(timeout);
+        let settled = false;
+        const settle = (result) => {
+          if (settled) return false;
+          settled = true;
+          resolve(result);
+          return true;
+        };
+        void (async () => {
+          try {
+            const { stdout } = await executeStatsCommand(statsCommand);
+            if (settled) return;
+            let combinedStdout = String(stdout || '').trim();
+            const primaryOutput = combinedStdout.replace(new RegExp(`^${latencyMarker}\\|?`), '');
+            if (primaryOutput.startsWith('CPURAW:')) {
+              const diskResult = await executeStatsCommand(linuxDiskStatsCommand);
+              combinedStdout = [combinedStdout, String(diskResult.stdout || '').trim()]
+                .filter(Boolean)
+                .join('|');
+            }
+            const measuredLatency = await tcpLatencyPromise;
+            if (settled) return;
+            const latencyMs = Number.isFinite(measuredLatency) ? measuredLatency : null;
     
             // Parse the output
-            const output = stdout.trim();
+            const output = combinedStdout.replace(new RegExp(`^${latencyMarker}\\|?`), '');
     
             // Unsupported OS — stop polling this session
             if (output.startsWith('UNSUPPORTED_OS:')) {
-              resolve({ success: false, error: `Server stats not supported on this OS (${output.substring(15)})` });
+              settle({ success: false, error: `Server stats not supported on this OS (${output.substring(15)})` });
               return;
             }
     
@@ -626,10 +1333,15 @@ function createSessionOpsApi(ctx) {
             let topProcesses = [];  // Array of { pid, memPercent, command }
             let disks = [];  // Array of { mountPoint, used, total, percent }
             let networkInterfaces = [];  // Array of { name, rxBytes, txBytes }
+            let hostname = "";
+            let osName = "";
+            let kernelRelease = "";
+            let uptimeSeconds = null;
+            let loadAverage = [];
     
             for (const part of parts) {
               if (part.startsWith('CPU:')) {
-                // macOS: top reports CPU% directly (no delta needed)
+                // macOS: command reports normalized CPU% directly (no delta needed)
                 const val = parseFloat(part.substring(4).trim());
                 if (!isNaN(val)) cpuDirect = Math.min(100, Math.max(0, Math.round(val)));
               } else if (part.startsWith('CPURAW:')) {
@@ -708,11 +1420,31 @@ function createSessionOpsApi(ctx) {
                     const diskParts = entry.split(':');
                     if (diskParts.length >= 4) {
                       const mountPoint = diskParts[0];
-                      const used = parseInt(diskParts[1], 10);
-                      const total = parseInt(diskParts[2], 10);
-                      const percent = parseInt(diskParts[3], 10);
-                      if (!isNaN(used) && !isNaN(total) && !isNaN(percent)) {
-                        disks.push({ mountPoint, used, total, percent });
+                      const used = parseFloat(diskParts[1]);
+                      const total = parseFloat(diskParts[2]);
+                      let percent = parseInt(diskParts[3], 10);
+                      if (Number.isNaN(percent) && Number.isFinite(used) && Number.isFinite(total) && total > 0) {
+                        percent = Math.round((used / total) * 100);
+                      }
+                      if (!Number.isNaN(used) && !Number.isNaN(total) && !Number.isNaN(percent) && total > 0) {
+                        const diskMetadata = diskParts.slice(4).join(':').trim();
+                        let capacityKey = diskMetadata;
+                        let filesystemType;
+                        if (diskMetadata.startsWith('fs=')) {
+                          const separator = diskMetadata.indexOf(':');
+                          if (separator > 3) {
+                            filesystemType = diskMetadata.slice(3, separator).trim();
+                            capacityKey = diskMetadata.slice(separator + 1).trim();
+                          }
+                        }
+                        disks.push({
+                          mountPoint,
+                          used,
+                          total,
+                          percent,
+                          ...(capacityKey ? { capacityKey } : {}),
+                          ...(filesystemType ? { filesystemType } : {}),
+                        });
                       }
                     }
                   }
@@ -732,6 +1464,26 @@ function createSessionOpsApi(ctx) {
                       }
                     }
                   }
+                }
+              } else if (part.startsWith('HOST:')) {
+                hostname = part.substring(5).trim();
+              } else if (part.startsWith('OS:')) {
+                osName = part.substring(3).trim();
+              } else if (part.startsWith('KERNEL:')) {
+                kernelRelease = part.substring(7).trim();
+              } else if (part.startsWith('UPTIME:')) {
+                const uptimeText = part.substring(7).trim();
+                if (uptimeText !== '') {
+                  const uptime = Number(uptimeText);
+                  if (Number.isFinite(uptime) && uptime >= 0) uptimeSeconds = uptime;
+                }
+              } else if (part.startsWith('LOAD:')) {
+                const loadText = part.substring(5).trim();
+                if (loadText !== '') {
+                  loadAverage = loadText.split(/\s+/)
+                    .map((value) => Number(value))
+                    .filter((value) => Number.isFinite(value) && value >= 0)
+                    .slice(0, 3);
                 }
               }
             }
@@ -851,11 +1603,11 @@ function createSessionOpsApi(ctx) {
     
             // If no meaningful data was parsed, treat as failure to stop futile polling
             if (cpu === null && memTotal === null && cpuCores === null) {
-              resolve({ success: false, error: 'Unable to parse server stats (unsupported OS or shell)' });
+              settle({ success: false, error: 'Unable to parse server stats (unsupported OS or shell)' });
               return;
             }
     
-            resolve({
+            settle({
               success: true,
               stats: {
                 cpu,           // CPU usage percentage (0-100)
@@ -875,11 +1627,19 @@ function createSessionOpsApi(ctx) {
                 disks,         // Array of all mounted disks
                 netRxSpeed,    // Total network receive speed (bytes/sec)
                 netTxSpeed,    // Total network transmit speed (bytes/sec)
+                latencyMs,      // TCP connection establishment latency to the SSH endpoint (ms)
                 netInterfaces, // Per-interface network stats
+                hostname,
+                osName,
+                kernelRelease,
+                uptimeSeconds,
+                loadAverage,
               },
             });
-          });
-        });
+          } catch (error) {
+            settle({ success: false, error: formatStatsError(error) });
+          }
+        })();
       });
     }
     
@@ -891,7 +1651,7 @@ function createSessionOpsApi(ctx) {
       if (!session || !session.stream) {
         return { ok: false, encoding: encoding || "utf-8" };
       }
-      const enc = String(encoding || "utf-8").toLowerCase();
+      const enc = normalizeTerminalEncoding(encoding);
       if (!iconv.encodingExists(enc)) {
         return { ok: false, encoding: enc };
       }
@@ -909,6 +1669,7 @@ function createSessionOpsApi(ctx) {
     return {
       getSessionRemoteInfo,
       getSessionDistroInfo,
+      readRemoteHistory,
       getSessionPwd,
       probeReceiveConflicts,
       removeRemoteFiles,
@@ -920,4 +1681,4 @@ function createSessionOpsApi(ctx) {
   }
 }
 
-module.exports = { createSessionOpsApi };
+module.exports = { createSessionOpsApi, decodeLsofFileName };

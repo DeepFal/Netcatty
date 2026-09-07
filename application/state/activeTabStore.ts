@@ -2,6 +2,7 @@ import { useCallback, useSyncExternalStore } from 'react';
 
 // Simple store for active tab that allows fine-grained subscriptions
 type Listener = () => void;
+type SyncListener = (activeTabId: string) => void;
 
 // ----- Editor tab id helpers -----
 export const EDITOR_PREFIX = 'editor:';
@@ -15,29 +16,54 @@ export const toEditorTabId = (editorId: string): string => `${EDITOR_PREFIX}${ed
 /** Strip the "editor:" prefix to recover the internal editorTab id. */
 export const fromEditorTabId = (tabId: string): string => tabId.slice(EDITOR_PREFIX.length);
 
+type SetActiveTabOptions = {
+  /** When false, keep the previous-tab pointer unchanged (used for close restore). */
+  recordPrevious?: boolean;
+};
+
 class ActiveTabStore {
   private activeTabId: string = 'vault';
+  private previousActiveTabId: string | null = null;
   private listeners = new Set<Listener>();
-  private pendingNotify = false;
+  private syncListeners = new Set<SyncListener>();
+  private notifyRafId: number | null = null;
 
   getActiveTabId = () => this.activeTabId;
 
-  setActiveTabId = (id: string) => {
+  getPreviousActiveTabId = () => this.previousActiveTabId;
+
+  private scheduleNotify = () => {
+    if (this.notifyRafId !== null) return;
+    const schedule = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (cb: () => void) => window.setTimeout(cb, 0) as unknown as number;
+    this.notifyRafId = schedule(() => {
+      this.notifyRafId = null;
+      this.listeners.forEach((listener) => listener());
+    });
+  };
+
+  setActiveTabId = (id: string, options?: SetActiveTabOptions) => {
     if (this.activeTabId !== id) {
+      if (options?.recordPrevious !== false) {
+        this.previousActiveTabId = this.activeTabId;
+      }
       this.activeTabId = id;
-      // Defer listener notification to avoid "setState during render" if called from a render phase
-      if (this.pendingNotify) return;
-      this.pendingNotify = true;
-      Promise.resolve().then(() => {
-        this.pendingNotify = false;
-        this.listeners.forEach(listener => listener());
-      });
+      this.syncListeners.forEach((listener) => listener(id));
+      // Coalesce rapid tab switches into one notification per frame and avoid
+      // "setState during render" if called from a render phase.
+      this.scheduleNotify();
     }
   };
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  };
+
+  subscribeSync = (listener: SyncListener) => {
+    this.syncListeners.add(listener);
+    return () => this.syncListeners.delete(listener);
   };
 }
 
@@ -47,19 +73,15 @@ export const activeTabStore = new ActiveTabStore();
 export const useActiveTabId = () => {
   return useSyncExternalStore(
     activeTabStore.subscribe,
-    activeTabStore.getActiveTabId
+    activeTabStore.getActiveTabId,
+    activeTabStore.getActiveTabId,
   );
-};
-
-// Hook to get setter - never causes re-render
-export const useSetActiveTabId = () => {
-  return activeTabStore.setActiveTabId;
 };
 
 // Check if a specific tab is active - only re-renders when this specific tab's active state changes
 export const useIsTabActive = (tabId: string) => {
   const getSnapshot = useCallback(() => activeTabStore.getActiveTabId() === tabId, [tabId]);
-  return useSyncExternalStore(activeTabStore.subscribe, getSnapshot);
+  return useSyncExternalStore(activeTabStore.subscribe, getSnapshot, getSnapshot);
 };
 
 // Stable snapshot functions - defined once outside components
@@ -70,7 +92,8 @@ const getIsSftpActive = () => activeTabStore.getActiveTabId() === 'sftp';
 export const useIsVaultActive = () => {
   return useSyncExternalStore(
     activeTabStore.subscribe,
-    getIsVaultActive
+    getIsVaultActive,
+    getIsVaultActive,
   );
 };
 
@@ -78,7 +101,8 @@ export const useIsVaultActive = () => {
 export const useIsSftpActive = () => {
   return useSyncExternalStore(
     activeTabStore.subscribe,
-    getIsSftpActive
+    getIsSftpActive,
+    getIsSftpActive,
   );
 };
 
@@ -86,17 +110,5 @@ export const useIsSftpActive = () => {
 export const useIsEditorTabActive = (tabId: string): boolean => {
   const editorTopId = toEditorTabId(tabId);
   const getSnapshot = useCallback(() => activeTabStore.getActiveTabId() === editorTopId, [editorTopId]);
-  return useSyncExternalStore(activeTabStore.subscribe, getSnapshot);
-};
-
-// Check if terminal layer should be visible
-// Editor tabs are NOT terminal tabs, so exclude them from the visibility condition.
-export const useIsTerminalLayerVisible = (draggingSessionId: string | null) => {
-  const getSnapshot = useCallback(() => {
-    const activeTabId = activeTabStore.getActiveTabId();
-    const isTerminalTab = activeTabId !== 'vault' && activeTabId !== 'sftp' && !isEditorTabId(activeTabId);
-    return isTerminalTab || !!draggingSessionId;
-  }, [draggingSessionId]);
-
-  return useSyncExternalStore(activeTabStore.subscribe, getSnapshot);
+  return useSyncExternalStore(activeTabStore.subscribe, getSnapshot, getSnapshot);
 };

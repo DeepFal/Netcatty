@@ -6,19 +6,43 @@
  * No avatars. Thinking blocks are collapsible.
  */
 
-import { AlertCircle, FileText, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertCircle, BookOpen, FileText, RotateCcw, SquareTerminal, X, ZoomIn, ZoomOut } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
-import type { ChatMessage } from '../../infrastructure/ai/types';
+import type { ChatMessage, ToolCall as AgentToolCall } from '../../infrastructure/ai/types';
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import {
   Conversation,
   ConversationContent,
   ConversationScrollButton,
 } from '../ai-elements/conversation';
-import { Message, MessageContent, MessageResponse } from '../ai-elements/message';
+import { LazyMessageResponse } from '../ai-elements/LazyMessageResponse';
+import { Message, MessageContent } from '../ai-elements/messageShell';
+import {
+  AI_MARKDOWN_WARMUP_INITIAL_DELAY_MS,
+  AI_MARKDOWN_WARMUP_RESUME_DELAY_MS,
+  isAiComposerTyping,
+  scheduleAiMarkdownWarmup,
+} from './aiMarkdownWarmup';
 import { ToolCall } from '../ai-elements/tool-call';
 import ThinkingBlock from './ThinkingBlock';
+import AgentActivityGroup from './AgentActivityGroup';
+import ToolCallGroup from './ToolCallGroup';
+import { CodexUserInputCard } from './CodexUserInputCard';
+import { CodebuddyElicitationCard } from './CodebuddyElicitationCard';
+import {
+  VaultArtifactNavigationProvider,
+  type VaultArtifactNavSection,
+} from './toolArtifacts/VaultArtifactNavigationContext';
+import { parseTerminalToolArtifact } from './toolArtifacts/terminalToolArtifact';
+import { TerminalArtifactToolResult } from './toolArtifacts/TerminalArtifactToolResult';
+import {
+  inferArtifactToolNameFromCliArgs,
+  normalizeArtifactToolName,
+} from './toolArtifacts/toolArtifactNames';
+import { parseVaultToolArtifact } from './toolArtifacts/vaultToolArtifact';
+import { VaultArtifactToolResult } from './toolArtifacts/VaultArtifactToolResult';
+import type { Host, Snippet, VaultNote } from '../../types';
 import {
   onApprovalRequest,
   onApprovalCleared,
@@ -26,18 +50,153 @@ import {
   resolveApproval,
   type ApprovalRequest,
 } from '../../infrastructure/ai/shared/approvalGate';
+import {
+  onCodexAppServerInteraction,
+  onCodexAppServerInteractionCleared,
+  replayPendingCodexAppServerInteractions,
+  respondCodexUserInput,
+  type CodexAppServerInteraction,
+} from '../../infrastructure/ai/shared/codexAppServerInteractions';
+import {
+  onCodebuddyElicitation,
+  onCodebuddyElicitationCleared,
+  replayPendingCodebuddyElicitations,
+  respondCodebuddyElicitation,
+  type CodebuddyElicitation,
+  type CodebuddyElicitationAction,
+} from '../../infrastructure/ai/shared/codebuddyElicitations';
+import {
+  buildGrantsFromApproval,
+  resolveCapabilityId,
+} from '../../infrastructure/ai/harness/permissionGrants';
+import {
+  compactionStatusText,
+  resolveCompactionStatusText,
+  type ActiveCompactionUi,
+} from '../../application/state/useAgentCompactionUi';
+import {
+  getAIPanelDiagnosticHiddenParts,
+  getAIPanelProfilerProps,
+  isAIPanelDiagnosticPartHidden,
+} from './aiPanelDiagnostics';
+import {
+  buildChatJumpEntries,
+  chatMessageDomId,
+  resolveTailCountForJumpTarget,
+} from '../../domain/chatJumpNav';
+import ChatJumpNav from './ChatJumpNav';
 
 interface ChatMessageListProps {
   messages: ChatMessage[];
   isStreaming?: boolean;
   /** Active chat session ID — used to filter standalone MCP approval blocks */
   activeSessionId?: string | null;
+  activeCompaction?: ActiveCompactionUi | null;
+  notes?: VaultNote[];
+  hosts?: Host[];
+  snippets?: Snippet[];
+  onOpenVaultNote?: (noteId: string) => void;
+  onOpenVaultHost?: (hostId: string) => void;
+  onOpenVaultSnippet?: (snippetId: string) => void;
+  onOpenVaultSection?: (section: VaultArtifactNavSection) => void;
 }
 
-const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming, activeSessionId }) => {
+interface VaultArtifactNavigationCallbackOptions {
+  onOpenVaultNote?: (noteId: string) => void;
+  onOpenVaultHost?: (hostId: string) => void;
+  onOpenVaultSnippet?: (snippetId: string) => void;
+  onOpenVaultSection?: (section: VaultArtifactNavSection) => void;
+}
+
+export function shouldProvideVaultArtifactNavigation({
+  onOpenVaultNote,
+  onOpenVaultHost,
+  onOpenVaultSnippet,
+  onOpenVaultSection,
+}: VaultArtifactNavigationCallbackOptions): boolean {
+  return Boolean(onOpenVaultNote || onOpenVaultHost || onOpenVaultSnippet || onOpenVaultSection);
+}
+
+export function shouldRenderAssistantAsPlainText(options: {
+  hideMarkdown: boolean;
+}): boolean {
+  // Streaming stays on Streamdown with isAnimating so incomplete markdown
+  // updates live. Only diagnostic hideMarkdown forces plain text.
+  return options.hideMarkdown;
+}
+
+const ASSISTANT_PLAIN_TEXT_CLASS = 'whitespace-pre-wrap break-words text-[13px] leading-[1.45]';
+
+export interface CodexApprovalRenderEntry {
+  approvalId: string;
+  request: ApprovalRequest;
+}
+
+export function buildCodexApprovalRenderPlan(
+  pendingApprovals: ReadonlyMap<string, ApprovalRequest>,
+  renderedPendingToolCallIds: ReadonlySet<string>,
+  activeSessionId?: string | null,
+): {
+  byItemId: Map<string, CodexApprovalRenderEntry[]>;
+  standalone: CodexApprovalRenderEntry[];
+} {
+  const byItemId = new Map<string, CodexApprovalRenderEntry[]>();
+  const standalone: CodexApprovalRenderEntry[] = [];
+  for (const [approvalId, request] of pendingApprovals) {
+    if (request.source !== 'codex-app-server') continue;
+    if (activeSessionId && request.chatSessionId !== activeSessionId) continue;
+    const entry = { approvalId, request };
+    if (request.itemId && renderedPendingToolCallIds.has(request.itemId)) {
+      const entries = byItemId.get(request.itemId) ?? [];
+      entries.push(entry);
+      byItemId.set(request.itemId, entries);
+    } else {
+      standalone.push(entry);
+    }
+  }
+  return { byItemId, standalone };
+}
+
+const MESSAGE_RENDER_BATCH = 50;
+const MESSAGE_RENDER_STEP = 50;
+
+export function pruneResolvedApprovals(
+  previous: ReadonlyMap<string, boolean>,
+  messages: readonly ChatMessage[],
+): Map<string, boolean> {
+  const visibleToolCallIds = new Set<string>();
+  for (const message of messages) {
+    for (const toolCall of message.toolCalls ?? []) visibleToolCallIds.add(toolCall.id);
+  }
+  const next = new Map<string, boolean>();
+  for (const [toolCallId, approved] of previous) {
+    if (visibleToolCallIds.has(toolCallId)) next.set(toolCallId, approved);
+  }
+  return next;
+}
+
+const ChatMessageList: React.FC<ChatMessageListProps> = ({
+  messages,
+  isStreaming,
+  activeSessionId,
+  activeCompaction = null,
+  notes = [],
+  hosts = [],
+  snippets = [],
+  onOpenVaultNote,
+  onOpenVaultHost,
+  onOpenVaultSnippet,
+  onOpenVaultSection,
+}) => {
   // Track pending approvals from the approval gate
   const [pendingApprovals, setPendingApprovals] = useState<Map<string, ApprovalRequest>>(new Map());
   const [resolvedApprovals, setResolvedApprovals] = useState<Map<string, boolean>>(new Map());
+  const [pendingCodexInteractions, setPendingCodexInteractions] = useState<Map<string, CodexAppServerInteraction>>(new Map());
+  const [pendingCodebuddyElicitations, setPendingCodebuddyElicitations] = useState<Map<string, CodebuddyElicitation>>(new Map());
+
+  useEffect(() => {
+    setResolvedApprovals((previous) => pruneResolvedApprovals(previous, messages));
+  }, [activeSessionId, messages]);
 
   // Subscribe to approval gate events (SDK + MCP tool calls)
   useEffect(() => {
@@ -61,17 +220,84 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
     });
   }, []);
 
-  const handleApprove = useCallback((toolCallId: string) => {
-    resolveApproval(toolCallId, true);
+  useEffect(() => {
+    const handler = (interaction: CodexAppServerInteraction) => {
+      setPendingCodexInteractions((current) => new Map(current).set(interaction.interactionId, interaction));
+    };
+    const unsubscribe = onCodexAppServerInteraction(handler);
+    replayPendingCodexAppServerInteractions(handler);
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => onCodexAppServerInteractionCleared((interactionIds) => {
+    setPendingCodexInteractions((current) => {
+      const next = new Map(current);
+      for (const interactionId of interactionIds) next.delete(interactionId);
+      return next;
+    });
+  }), []);
+
+  useEffect(() => {
+    const handler = (elicitation: CodebuddyElicitation) => {
+      setPendingCodebuddyElicitations((current) =>
+        new Map(current).set(elicitation.elicitationId, elicitation));
+    };
+    const unsubscribe = onCodebuddyElicitation(handler);
+    replayPendingCodebuddyElicitations(handler);
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => onCodebuddyElicitationCleared((elicitationIds) => {
+    setPendingCodebuddyElicitations((current) => {
+      const next = new Map(current);
+      for (const elicitationId of elicitationIds) next.delete(elicitationId);
+      return next;
+    });
+  }), []);
+
+  const handleApproveOnce = useCallback((toolCallId: string) => {
+    const request = pendingApprovals.get(toolCallId);
+    resolveApproval(toolCallId, request?.source === 'codex-app-server'
+      ? { approved: true, scope: 'once' }
+      : true);
+    setPendingApprovals(prev => { const m = new Map(prev); m.delete(toolCallId); return m; });
+    setResolvedApprovals(prev => new Map(prev).set(request?.itemId ?? toolCallId, true));
+  }, [pendingApprovals]);
+
+  const handleAlwaysAllow = useCallback((toolCallId: string, request: ApprovalRequest) => {
+    if (request.source === 'codex-app-server') {
+      resolveApproval(toolCallId, { approved: true, scope: 'session' });
+      setPendingApprovals(prev => { const m = new Map(prev); m.delete(toolCallId); return m; });
+      setResolvedApprovals(prev => new Map(prev).set(request.itemId ?? toolCallId, true));
+      return;
+    }
+    const capabilityId = request.capabilityId ?? resolveCapabilityId(request.toolName);
+    const persistGrants = buildGrantsFromApproval(capabilityId, request.args, request.chatSessionId);
+    resolveApproval(toolCallId, { approved: true, persistGrants });
     setPendingApprovals(prev => { const m = new Map(prev); m.delete(toolCallId); return m; });
     setResolvedApprovals(prev => new Map(prev).set(toolCallId, true));
   }, []);
 
   const handleReject = useCallback((toolCallId: string) => {
+    const request = pendingApprovals.get(toolCallId);
     resolveApproval(toolCallId, false);
     setPendingApprovals(prev => { const m = new Map(prev); m.delete(toolCallId); return m; });
-    setResolvedApprovals(prev => new Map(prev).set(toolCallId, false));
+    setResolvedApprovals(prev => new Map(prev).set(request?.itemId ?? toolCallId, false));
+  }, [pendingApprovals]);
+
+  const handleCodexUserInput = useCallback((
+    interactionId: string,
+    answers: Record<string, { answers: string[] }>,
+  ) => {
+    void respondCodexUserInput(interactionId, answers).catch((error) => {
+      console.error('[Codex App Server] Failed to answer request_user_input:', error);
+    });
   }, []);
+  const handleCodebuddyElicitation = useCallback((
+    elicitationId: string,
+    action: CodebuddyElicitationAction,
+    content?: Record<string, unknown>,
+  ) => respondCodebuddyElicitation(elicitationId, action, content), []);
   const [preview, setPreview] = useState<{ src: string; name: string } | null>(null);
   const [zoom, setZoom] = useState(100);
   const [dragged, setDragged] = useState(false);
@@ -137,17 +363,108 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
     dragStart.current = null;
   }, []);
   const { t } = useI18n();
-  const visibleMessages = messages.filter(m => m.role !== 'system');
+  const hiddenParts = getAIPanelDiagnosticHiddenParts();
+  const hideAttachments = isAIPanelDiagnosticPartHidden('attachments', hiddenParts);
+  const hideMarkdown = isAIPanelDiagnosticPartHidden('markdown', hiddenParts);
+  const hideToolCalls = isAIPanelDiagnosticPartHidden('toolcalls', hiddenParts);
+  const [renderedTailCount, setRenderedTailCount] = useState(MESSAGE_RENDER_BATCH);
+  const [activeJumpMessageId, setActiveJumpMessageId] = useState<string | null>(null);
+  const [pendingJumpMessageId, setPendingJumpMessageId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setRenderedTailCount(MESSAGE_RENDER_BATCH);
+    setActiveJumpMessageId(null);
+    setPendingJumpMessageId(null);
+  }, [activeSessionId]);
+
+  const hasAssistantMarkdown = useMemo(
+    () => messages.some((message) => message.role === 'assistant' && Boolean(message.content)),
+    [messages],
+  );
+
+  // Do not start Streamdown on expand. Import cannot be cancelled, and idle
+  // right after open collides with the first few keystrokes. History stays
+  // plaintext until send, composer blur, or a long unfocused delay.
+  useEffect(() => {
+    if (!hasAssistantMarkdown) return undefined;
+    return scheduleAiMarkdownWarmup({
+      isBusy: isAiComposerTyping,
+      initialDelayMs: AI_MARKDOWN_WARMUP_INITIAL_DELAY_MS,
+      resumeDelayMs: AI_MARKDOWN_WARMUP_RESUME_DELAY_MS,
+    });
+  }, [hasAssistantMarkdown]);
+
+  const visibleMessages = useMemo(
+    () => messages.filter((message) => message.role !== 'system'),
+    [messages],
+  );
+
+  // While a jump target is active, re-resolve the tail against the current list
+  // so streaming appends cannot slide the window past the selected message.
+  const effectiveTailCount = activeJumpMessageId
+    ? resolveTailCountForJumpTarget(visibleMessages, activeJumpMessageId, renderedTailCount)
+    : renderedTailCount;
+
+  const hiddenMessageCount = Math.max(0, visibleMessages.length - effectiveTailCount);
+  const displayedMessages = hiddenMessageCount > 0
+    ? visibleMessages.slice(-effectiveTailCount)
+    : visibleMessages;
+
+  const jumpEntries = useMemo(
+    () => buildChatJumpEntries(visibleMessages, {
+      emptyLabel: t('ai.chat.jumpUntitled'),
+    }),
+    [t, visibleMessages],
+  );
+
+  const handleJumpToMessage = useCallback((messageId: string) => {
+    setActiveJumpMessageId(messageId);
+    // Persist the expanded window so releasing the pin (or a spurious isAtBottom
+    // flip) cannot unmount the jump target. Load-earlier progress is preserved
+    // because we never reset renderedTailCount on pin release.
+    setRenderedTailCount((count) =>
+      resolveTailCountForJumpTarget(visibleMessages, messageId, count));
+    setPendingJumpMessageId(messageId);
+  }, [visibleMessages]);
+
+  const handleReleaseJumpPin = useCallback(() => {
+    setActiveJumpMessageId(null);
+    setPendingJumpMessageId(null);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingJumpMessageId) return;
+    const target = document.getElementById(chatMessageDomId(pendingJumpMessageId));
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setPendingJumpMessageId(null);
+  }, [displayedMessages, pendingJumpMessageId]);
+
   const resolvedToolCallIds = new Set(
-    visibleMessages
+    displayedMessages
       .filter((m) => m.role === 'tool')
       .flatMap((m) => m.toolResults?.map((tr) => tr.toolCallId) ?? []),
+  );
+  const renderedPendingToolCallIds = new Set(
+    displayedMessages
+      .filter((message) => message.role === 'assistant')
+      .flatMap((message) => (message.toolCalls ?? [])
+        .filter((toolCall) => !resolvedToolCallIds.has(toolCall.id))
+        .map((toolCall) => toolCall.id)),
+  );
+  const {
+    byItemId: codexApprovalsByItemId,
+    standalone: standaloneCodexApprovals,
+  } = buildCodexApprovalRenderPlan(
+    pendingApprovals,
+    renderedPendingToolCallIds,
+    activeSessionId,
   );
 
   // Build maps from toolCallId → toolName / toolArgs for display
   const toolCallNames = new Map<string, string>();
   const toolCallArgs = new Map<string, Record<string, unknown>>();
-  for (const m of visibleMessages) {
+  for (const m of displayedMessages) {
     if (m.role === 'assistant' && m.toolCalls) {
       for (const tc of m.toolCalls) {
         toolCallNames.set(tc.id, tc.name);
@@ -166,27 +483,180 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
     );
   }
 
-  const lastAssistantMessage = visibleMessages.findLast(m => m.role === 'assistant');
+  const lastAssistantMessage = displayedMessages.findLast(m => m.role === 'assistant');
+  const showCompactionStatus = Boolean(
+    activeCompaction
+    && activeSessionId
+    && activeCompaction.sessionId === activeSessionId,
+  );
 
-  return (
+  const renderPendingToolCallCards = (
+    toolCall: AgentToolCall,
+    options: { historical: boolean; isToolRunning?: boolean },
+  ): React.ReactElement[] => {
+    const codexApprovals = codexApprovalsByItemId.get(toolCall.id) ?? [];
+    if (codexApprovals.length > 0) {
+      return codexApprovals.map(({ approvalId, request }) => (
+        <div key={approvalId} className="px-2 py-1.5">
+          <ToolCall
+            name={toolCall.name}
+            args={request.args}
+            isInterrupted={false}
+            approvalStatus="pending"
+            approvalId={approvalId}
+            onApproveOnce={() => handleApproveOnce(approvalId)}
+            onAlwaysAllow={request.allowSession === false
+              ? undefined
+              : () => handleAlwaysAllow(approvalId, request)}
+            alwaysAllowLabel={request.allowSession === false
+              ? undefined
+              : t('ai.codex.appServer.approval.allowSession')}
+            onReject={() => handleReject(approvalId)}
+          />
+        </div>
+      ));
+    }
+
+    const pendingRequest = pendingApprovals.get(toolCall.id);
+    const isPending = Boolean(pendingRequest);
+    const resolved = resolvedApprovals.get(toolCall.id);
+    const approvalStatus = isPending
+      ? "pending" as const
+      : resolved === true
+        ? "approved" as const
+        : resolved === false
+          ? "denied" as const
+          : undefined;
+    return [(
+      <div key={toolCall.id} className="px-2 py-1.5">
+        <ToolCall
+          name={toolCall.name}
+          args={toolCall.arguments}
+          isInterrupted={options.historical ? !isPending : undefined}
+          isLoading={options.historical ? undefined : Boolean(options.isToolRunning && !isPending)}
+          approvalStatus={approvalStatus}
+          approvalId={isPending ? toolCall.id : undefined}
+          onApproveOnce={() => handleApproveOnce(toolCall.id)}
+          onAlwaysAllow={() => handleAlwaysAllow(toolCall.id, pendingRequest ?? {
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            args: toolCall.arguments ?? {},
+            chatSessionId: activeSessionId ?? undefined,
+          })}
+          onReject={() => handleReject(toolCall.id)}
+        />
+      </div>
+    )];
+  };
+
+  const conversation = (
     <>
     <Conversation className="flex-1">
       <ConversationContent className="gap-1.5 px-4 py-2">
-        {visibleMessages.map((message) => {
+        {hiddenMessageCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setRenderedTailCount((count) =>
+              Math.max(count, effectiveTailCount) + MESSAGE_RENDER_STEP)}
+            className="w-full py-2 text-center text-[12px] text-muted-foreground/50 hover:text-muted-foreground transition-colors cursor-pointer"
+          >
+            {t('ai.chat.loadEarlierMessages').replace('{n}', String(hiddenMessageCount))}
+          </button>
+        )}
+        {displayedMessages.map((message, idx) => {
           if (message.role === 'tool') {
-            return (
-              <React.Fragment key={message.id}>
-                {message.toolResults?.map((tr) => (
-                  <div key={tr.toolCallId}>
+            // Group consecutive tool messages into a collapsible section
+            // Skip if this is NOT the first in a consecutive run
+            const prevIsTool = idx > 0 && displayedMessages[idx - 1].role === "tool";
+            if (prevIsTool || hideToolCalls) return null;
+
+            // Collect this run of consecutive tool messages
+            let end = idx + 1;
+            while (end < displayedMessages.length && displayedMessages[end].role === "tool") end++;
+            const group = displayedMessages.slice(idx, end);
+            const toolResults = group.flatMap((toolMsg) =>
+              (toolMsg.toolResults ?? []).map((tr) => {
+                const args = toolCallArgs.get(tr.toolCallId);
+                const resultToolName = typeof tr.toolName === 'string' ? tr.toolName : undefined;
+                const pairedToolName = toolCallNames.get(tr.toolCallId);
+                const artifactToolName =
+                  inferArtifactToolNameFromCliArgs(args)
+                  ?? normalizeArtifactToolName(resultToolName)
+                  ?? normalizeArtifactToolName(pairedToolName);
+                return {
+                  toolCallId: tr.toolCallId,
+                  name: pairedToolName || resultToolName || tr.toolCallId,
+                  artifactToolName,
+                  args,
+                  content: tr.content,
+                  isError: tr.isError,
+                };
+              }),
+            );
+            const groupTotal = toolResults.length;
+
+            // Expanded while the agent is still working (no assistant response follows)
+            const hasAssistantAfter = end < displayedMessages.length
+              && displayedMessages[end].role === "assistant";
+
+            const renderToolResultItem = (item: typeof toolResults[number]) => {
+              const artifactToolName = item.artifactToolName ?? item.name;
+              const terminalArtifact = parseTerminalToolArtifact(artifactToolName, item.content);
+              if (terminalArtifact) {
+                return (
+                  <TerminalArtifactToolResult
+                    key={item.toolCallId}
+                    artifact={terminalArtifact}
+                    toolName={artifactToolName}
+                    args={item.args}
+                    result={item.content}
+                    isError={item.isError}
+                  />
+                );
+              }
+              const artifact = parseVaultToolArtifact(artifactToolName, item.content);
+              if (artifact) {
+                return (
+                  <VaultArtifactToolResult
+                    key={item.toolCallId}
+                    artifact={artifact}
+                    toolName={artifactToolName}
+                    args={item.args}
+                    result={item.content}
+                    isError={item.isError}
+                  />
+                );
+              }
+              return (
+                <React.Profiler key={item.toolCallId} {...getAIPanelProfilerProps("AIChatPanel.ToolCall.Result")}>
+                  <div>
                     <ToolCall
-                      name={toolCallNames.get(tr.toolCallId) || tr.toolCallId}
-                      args={toolCallArgs.get(tr.toolCallId)}
-                      result={tr.content}
-                      isError={tr.isError}
+                      name={item.name}
+                      args={item.args}
+                      result={item.content}
+                      isError={item.isError}
                     />
                   </div>
-                ))}
-              </React.Fragment>
+                </React.Profiler>
+              );
+            };
+
+            if (groupTotal === 1) {
+              return (
+                <div key={`tool-group-${message.id}`} className="py-0.5">
+                  {renderToolResultItem(toolResults[0])}
+                </div>
+              );
+            }
+
+            return (
+              <ToolCallGroup
+                key={`tool-group-${message.id}`}
+                count={groupTotal}
+                defaultExpanded={!hasAssistantAfter}
+              >
+                {toolResults.map(renderToolResultItem)}
+              </ToolCallGroup>
             );
           }
 
@@ -195,7 +665,11 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
           const isThisStreaming = isStreaming && isLastAssistant;
 
           return (
-            <Message key={message.id} from={message.role}>
+            <Message
+              key={message.id}
+              id={chatMessageDomId(message.id)}
+              from={message.role}
+            >
               <MessageContent from={message.role}>
                 {/* Thinking block */}
                 {!isUser && message.thinking && (
@@ -206,11 +680,36 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
                   />
                 )}
 
+                {!isUser && (message.agentActivities?.length || message.usage) && (
+                  <AgentActivityGroup
+                    activities={message.agentActivities}
+                    usage={message.usage}
+                    isStreaming={!!isThisStreaming}
+                    t={t}
+                  />
+                )}
+
                 {/* User attachments (images, files) — fallback to legacy `images` field */}
-                {isUser && (message.attachments ?? message.images)?.length && (
+                {isUser && !hideAttachments && (message.attachments ?? message.images)?.length && (
                   <div className="flex gap-1.5 flex-wrap mb-1">
                     {(message.attachments ?? message.images)!.map((att, i) => (
-                      att.mediaType.startsWith('image/') ? (
+                      att.terminalSelection ? (
+                        <div
+                          key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
+                          className="inline-flex items-center gap-1.5 h-7 px-2 rounded-md bg-muted/20 border border-border/20 text-[11px] text-foreground/70"
+                        >
+                          <SquareTerminal size={12} className="text-muted-foreground/60 shrink-0" />
+                          <span className="truncate max-w-[150px]">{att.filename || 'terminal selection'}</span>
+                        </div>
+                      ) : att.vaultNoteId ? (
+                        <div
+                          key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
+                          className="inline-flex items-center gap-1.5 h-7 px-2 rounded-md bg-muted/20 border border-border/20 text-[11px] text-foreground/70"
+                        >
+                          <BookOpen size={12} className="text-muted-foreground/60 shrink-0" />
+                          <span className="truncate max-w-[150px]">{att.vaultNoteTitle || att.filename || 'note'}</span>
+                        </div>
+                      ) : att.mediaType.startsWith('image/') ? (
                         <img
                           key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
                           src={`data:${att.mediaType};base64,${att.base64Data}`}
@@ -233,46 +732,55 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
 
                 {message.content && (
                   isUser
-                    ? <div className="whitespace-pre-wrap break-words text-[13px] leading-[1.45]">{message.content}</div>
-                    : <MessageResponse isAnimating={isThisStreaming}>
-                        {message.content}
-                      </MessageResponse>
+                    ? <div className={ASSISTANT_PLAIN_TEXT_CLASS}>{message.content}</div>
+                    : shouldRenderAssistantAsPlainText({ hideMarkdown })
+                      ? (
+                          <div
+                            className={ASSISTANT_PLAIN_TEXT_CLASS}
+                            data-ai-content="plain"
+                          >
+                            {message.content}
+                          </div>
+                        )
+                      : (
+                          <React.Profiler {...getAIPanelProfilerProps('AIChatPanel.Markdown')}>
+                            <div data-ai-content="markdown">
+                              <LazyMessageResponse deferUntilWarm isAnimating={!!isThisStreaming}>
+                                {message.content}
+                              </LazyMessageResponse>
+                            </div>
+                          </React.Profiler>
+                        )
                 )}
 
                 {/* Pending tool calls from the *last* assistant message are rendered
                     after all tool-result messages (see below) for chronological order.
                     Unresolved tool calls from earlier or cancelled messages are shown
                     inline — as interrupted, or with approval controls if still pending. */}
-                {(message !== lastAssistantMessage || message.executionStatus === 'cancelled') && message.toolCalls?.filter((tc) =>
-                  !resolvedToolCallIds.has(tc.id),
-                ).map((tc) => {
-                  const isPending = pendingApprovals.has(tc.id);
-                  const resolved = resolvedApprovals.get(tc.id);
-                  const approvalStatus = isPending
-                    ? 'pending' as const
-                    : resolved === true
-                      ? 'approved' as const
-                      : resolved === false
-                        ? 'denied' as const
-                        : undefined;
-                  return (
-                    <div key={tc.id}>
-                      <ToolCall
-                        name={tc.name}
-                        args={tc.arguments}
-                        isInterrupted={!isPending}
-                        approvalStatus={approvalStatus}
-                        onApprove={() => handleApprove(tc.id)}
-                        onReject={() => handleReject(tc.id)}
-                      />
-                    </div>
+{(() => {
+                  if (hideToolCalls) return null;
+                  if (message === lastAssistantMessage && message.executionStatus !== "cancelled") return null;
+                  const unresolvedTcs = message.toolCalls?.filter((tc) => !resolvedToolCallIds.has(tc.id)) ?? [];
+                  if (unresolvedTcs.length === 0) return null;
+                  const approvalCardCount = unresolvedTcs.reduce(
+                    (count, toolCall) => count + Math.max(1, codexApprovalsByItemId.get(toolCall.id)?.length ?? 0),
+                    0,
                   );
-                })}
+                  return (
+                    <ToolCallGroup count={approvalCardCount} defaultExpanded={false}>
+                      {unresolvedTcs.flatMap((toolCall) => renderPendingToolCallCards(toolCall, {
+                        historical: true,
+                      }))}
+                    </ToolCallGroup>
+                  );
+                })()}
 
                 {/* Status text with shimmer */}
                 {message.statusText && (
                   <div className="py-1">
-                    <span className="thinking-shimmer text-xs">{message.statusText}</span>
+                    <span className="thinking-shimmer text-xs">
+                      {resolveCompactionStatusText(message.statusText, t)}
+                    </span>
                   </div>
                 )}
 
@@ -297,50 +805,111 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
 
         {/* Pending tool calls from the last assistant message — rendered here
             (after all tool-result messages) so they appear at the bottom. */}
-        {lastAssistantMessage?.toolCalls?.filter((tc) =>
-          !resolvedToolCallIds.has(tc.id) && lastAssistantMessage.executionStatus !== 'cancelled',
-        ).map((tc) => {
-          const isPending = pendingApprovals.has(tc.id);
-          const resolved = resolvedApprovals.get(tc.id);
-          const approvalStatus = isPending
-            ? 'pending' as const
-            : resolved === true
-              ? 'approved' as const
-              : resolved === false
-                ? 'denied' as const
-                : undefined;
-          return (
-            <div key={tc.id}>
-              <ToolCall
-                name={tc.name}
-                args={tc.arguments}
-                isLoading={isStreaming && lastAssistantMessage.executionStatus === 'running' && !isPending}
-                approvalStatus={approvalStatus}
-                onApprove={() => handleApprove(tc.id)}
-                onReject={() => handleReject(tc.id)}
-              />
-            </div>
+{(() => {
+          if (hideToolCalls) return null;
+          const pendingTcs = lastAssistantMessage?.toolCalls?.filter((tc) =>
+            !resolvedToolCallIds.has(tc.id) && lastAssistantMessage.executionStatus !== "cancelled",
+          ) ?? [];
+          if (pendingTcs.length === 0) return null;
+          const isActive = lastAssistantMessage.executionStatus !== "error";
+          const isToolRunning = !!(isStreaming && lastAssistantMessage.executionStatus === "running");
+          const approvalCardCount = pendingTcs.reduce(
+            (count, toolCall) => count + Math.max(1, codexApprovalsByItemId.get(toolCall.id)?.length ?? 0),
+            0,
           );
-        })}
+          return (
+            <ToolCallGroup count={approvalCardCount} defaultExpanded={isActive}>
+              {pendingTcs.flatMap((toolCall) => renderPendingToolCallCards(toolCall, {
+                historical: false,
+                isToolRunning,
+              }))}
+            </ToolCallGroup>
+          );
+        })()}
 
-        {/* Standalone MCP/ACP approval requests (not tied to SDK tool calls) */}
-        {Array.from(pendingApprovals.entries())
-          .filter(([id, req]) => id.startsWith('mcp_approval_') && (!activeSessionId || req.chatSessionId === activeSessionId))
+        {/* Standalone MCP/SDK approval requests (not tied to SDK tool calls) */}
+        {!hideToolCalls && Array.from(pendingApprovals.entries())
+          .filter(([id, req]) => {
+            if (!id.startsWith('mcp_approval_')) return false;
+            // External MCP approvals render in ExternalMcpApprovalsHost so they
+            // remain visible even when the Catty AI panel is closed.
+            if (req.chatSessionId === '__external_mcp__') return false;
+            return !activeSessionId || req.chatSessionId === activeSessionId;
+          })
           .map(([id, req]) => {
             return (
-              <div key={id}>
-                <ToolCall
-                  name={req.toolName}
-                  args={req.args}
-                  isLoading={false}
-                  isInterrupted={false}
-                  approvalStatus={'pending'}
-                  onApprove={() => handleApprove(id)}
-                  onReject={() => handleReject(id)}
-                />
-              </div>
+              <React.Profiler key={id} {...getAIPanelProfilerProps('AIChatPanel.ToolCall.Approval')}>
+                <div>
+                  <ToolCall
+                    name={req.toolName}
+                    args={req.args}
+                    isLoading={false}
+                    isInterrupted={false}
+                    approvalStatus={'pending'}
+                    approvalId={id}
+                    onApproveOnce={() => handleApproveOnce(id)}
+                    onAlwaysAllow={() => handleAlwaysAllow(id, req)}
+                    onReject={() => handleReject(id)}
+                  />
+                </div>
+              </React.Profiler>
             );
           })}
+
+        {!hideToolCalls && standaloneCodexApprovals
+          .map(({ approvalId, request }) => (
+            <React.Profiler key={approvalId} {...getAIPanelProfilerProps('AIChatPanel.ToolCall.Approval')}>
+              <div>
+                <ToolCall
+                  name={request.toolName}
+                  args={request.args}
+                  isLoading={false}
+                  isInterrupted={false}
+                  approvalStatus="pending"
+                  approvalId={approvalId}
+                  onApproveOnce={() => handleApproveOnce(approvalId)}
+                  onAlwaysAllow={request.allowSession === false
+                    ? undefined
+                    : () => handleAlwaysAllow(approvalId, request)}
+                  alwaysAllowLabel={request.allowSession === false
+                    ? undefined
+                    : t('ai.codex.appServer.approval.allowSession')}
+                  onReject={() => handleReject(approvalId)}
+                />
+              </div>
+            </React.Profiler>
+          ))}
+
+        {Array.from(pendingCodexInteractions.values())
+          .filter((interaction): interaction is Extract<CodexAppServerInteraction, { kind: 'user-input' }> => interaction.kind === 'user-input')
+          .filter((interaction) => !activeSessionId || interaction.chatSessionId === activeSessionId)
+          .map((interaction) => (
+            <CodexUserInputCard
+              key={interaction.interactionId}
+              interaction={interaction}
+              onSubmit={(answers) => handleCodexUserInput(interaction.interactionId, answers)}
+              onSkip={() => handleCodexUserInput(interaction.interactionId, {})}
+            />
+          ))}
+        {(Array.from(pendingCodebuddyElicitations.values()) as CodebuddyElicitation[])
+          .filter((elicitation) => !activeSessionId || elicitation.chatSessionId === activeSessionId)
+          .map((elicitation) => (
+            <CodebuddyElicitationCard
+              key={`${elicitation.elicitationId}:${elicitation.requestInstanceId ?? 0}`}
+              elicitation={elicitation}
+              onRespond={(action, content) =>
+                handleCodebuddyElicitation(elicitation.elicitationId, action, content)}
+            />
+          ))}
+        {/* Transient compaction status — inline, no banner */}
+        {showCompactionStatus && activeCompaction && (
+          <div className="py-1">
+            <span className="thinking-shimmer text-xs text-muted-foreground">
+              {compactionStatusText(activeCompaction.trigger, t)}
+            </span>
+          </div>
+        )}
+
         {/* Streaming indicator — only when no content and no thinking yet */}
         {isStreaming && !lastAssistantMessage?.content && !lastAssistantMessage?.thinking && (
           <div className="flex items-center gap-1 py-2">
@@ -350,7 +919,14 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
           </div>
         )}
       </ConversationContent>
-      <ConversationScrollButton />
+      <ChatJumpNav
+        entries={jumpEntries}
+        activeMessageId={activeJumpMessageId}
+        isStreaming={!!isStreaming}
+        onSelect={handleJumpToMessage}
+        onReleasePin={handleReleaseJumpPin}
+      />
+      <ConversationScrollButton onClick={handleReleaseJumpPin} />
     </Conversation>
 
     {/* Image preview lightbox */}
@@ -430,11 +1006,41 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
     </Dialog>
     </>
   );
+
+  if (shouldProvideVaultArtifactNavigation({
+    onOpenVaultNote,
+    onOpenVaultHost,
+    onOpenVaultSnippet,
+    onOpenVaultSection,
+  })) {
+    return (
+      <VaultArtifactNavigationProvider
+        notes={notes}
+        hosts={hosts}
+        snippets={snippets}
+        onOpenVaultNote={onOpenVaultNote}
+        onOpenVaultHost={onOpenVaultHost}
+        onOpenVaultSnippet={onOpenVaultSnippet}
+        onOpenVaultSection={onOpenVaultSection}
+      >
+        {conversation}
+      </VaultArtifactNavigationProvider>
+    );
+  }
+
+  return conversation;
 };
 
 function areMessagesEqual(prev: ChatMessageListProps, next: ChatMessageListProps): boolean {
   if (prev.isStreaming !== next.isStreaming) return false;
   if (prev.activeSessionId !== next.activeSessionId) return false;
+  if (prev.notes !== next.notes) return false;
+  if (prev.hosts !== next.hosts) return false;
+  if (prev.snippets !== next.snippets) return false;
+  if (prev.onOpenVaultNote !== next.onOpenVaultNote) return false;
+  if (prev.onOpenVaultHost !== next.onOpenVaultHost) return false;
+  if (prev.onOpenVaultSnippet !== next.onOpenVaultSnippet) return false;
+  if (prev.onOpenVaultSection !== next.onOpenVaultSection) return false;
   if (prev.messages.length !== next.messages.length) return false;
   if (prev.messages === next.messages) return true;
 
@@ -454,7 +1060,9 @@ function areMessagesEqual(prev: ChatMessageListProps, next: ChatMessageListProps
         p.executionStatus !== n.executionStatus ||
         p.errorInfo !== n.errorInfo ||
         p.toolCalls !== n.toolCalls ||
-        p.toolResults !== n.toolResults
+        p.toolResults !== n.toolResults ||
+        p.agentActivities !== n.agentActivities ||
+        p.usage !== n.usage
       ) {
         return false;
       }

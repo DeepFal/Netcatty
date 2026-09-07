@@ -1,4 +1,8 @@
-import { classifyDistroId, detectVendorFromSshVersion } from "../../../domain/host";
+import {
+  classifyDistroId,
+  detectVendorFromSshVersion,
+  normalizeDistroId,
+} from "../../../domain/host";
 import { logger } from "../../../lib/logger";
 import type { TerminalSessionStartersContext } from "./createTerminalSessionStarters.types";
 
@@ -44,12 +48,9 @@ export const runDistroDetection = async (
   const isStillCurrent = () => isConnectionTokenCurrent(sessionId, connectionToken);
 
   if (!isStillCurrent()) return;
-  if (
+  const isKnownNetworkDevice =
     ctx.host.deviceType === "network" ||
-    classifyDistroId(ctx.host.distro) === "network-device"
-  ) {
-    return;
-  }
+    classifyDistroId(ctx.host.distro) === "network-device";
 
   // Step 1: try to classify from the SSH server identification string
   // captured at handshake time. This is free (no extra channel) and
@@ -62,6 +63,10 @@ export const runDistroDetection = async (
     if (ctx.terminalBackend.getSessionRemoteInfo && sessionId) {
       const info = await ctx.terminalBackend.getSessionRemoteInfo(sessionId);
       if (!isStillCurrent()) return;
+      if (!isKnownNetworkDevice && /^(?:SSH-(?:2\.0|1\.99)-)?OpenSSH_for_Windows(?:_|$)/i.test(info?.remoteSshVersion || '')) {
+        ctx.onOsDetected?.(ctx.host.id, 'windows');
+        return;
+      }
       const vendor = detectVendorFromSshVersion(info?.remoteSshVersion);
       if (vendor) {
         ctx.onOsDetected?.(ctx.host.id, vendor);
@@ -73,6 +78,7 @@ export const runDistroDetection = async (
   }
 
   if (!isStillCurrent()) return;
+  if (isKnownNetworkDevice) return;
 
   // Step 2: unknown or generic OpenSSH/Dropbear — fall back to the
   // /etc/os-release probe to pick a distro-specific icon. We deliberately
@@ -87,11 +93,13 @@ export const runDistroDetection = async (
       const res = await ctx.terminalBackend.getSessionDistroInfo(sessionId);
       if (!isStillCurrent()) return;
       if (!res?.success) return;
-      const data = `${res.stdout || ""}\n${res.stderr || ""}`;
+      const data = (res.stdout || "").trim();
       const idMatch = data.match(/^ID="?([\w-]+)"?$/im);
-      const distro = idMatch
+      const rawDistro = idMatch
         ? idMatch[1]
-        : (data.split(/\s+/)[0] || "").toLowerCase();
+        : (data.match(/^(Linux|Darwin|FreeBSD)\b/i)?.[1] || "").toLowerCase();
+      // An os-release ID confirms Linux even for distributions without a dedicated icon.
+      const distro = normalizeDistroId(rawDistro) || (idMatch ? 'linux' : '');
       if (distro) ctx.onOsDetected?.(ctx.host.id, distro);
     }
   } catch (err) {

@@ -5,7 +5,10 @@ const path = require("node:path");
 const {
   appendData,
   hasStream,
+  registerProgrammaticCommandLogRewrite,
+  registerSudoAutofillInput,
   startStream,
+  startStreamToFile,
   stopStream,
 } = require("./sessionLogStreamManager.cjs");
 
@@ -139,6 +142,543 @@ test("stopStream without a token still tears down the current stream (back-compa
   }
 });
 
+test("token-required explicit file streams ignore tokenless stale stops", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-token-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let token;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      stopRequiresToken: true,
+    });
+    assert.equal(result.ok, true);
+    token = result.token;
+
+    appendData(sessionId, "before-stale\n");
+    const staleResult = await stopStream(sessionId);
+    assert.equal(staleResult, null);
+    assert.equal(hasStream(sessionId), true);
+
+    appendData(sessionId, "after-stale\n");
+    const finalPath = await stopStream(sessionId, token);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "before-stale\nafter-stale\n");
+  } finally {
+    if (hasStream(sessionId)) {
+      await stopStream(sessionId, token);
+    }
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile writes to an explicit raw log file path", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      initialLine: "header\n",
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "body\n");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "header\nbody\n");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile keeps unterminated initial line joined to ordinary raw output", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-ordinary-raw-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      initialLine: "root@host:~# ",
+      separateInitialLineBeforeLeadingCarriageReturn: true,
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "ls\r\nfile\r\n");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "root@host:~# ls\r\nfile\r\n");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile separates unterminated initial line before leading carriage return", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-leading-cr-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      initialLine: "H3C>",
+      separateInitialLineBeforeLeadingCarriageReturn: true,
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "\rdisplay version\r\n");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "H3C>\n\rdisplay version\r\n");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile does not add a separator before leading CRLF", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-leading-crlf-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      initialLine: "root@host:~# command",
+      separateInitialLineBeforeLeadingCarriageReturn: true,
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "\r\noutput\r\n");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "root@host:~# command\r\noutput\r\n");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile does not add a separator before split leading CRLF", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-split-leading-crlf-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      initialLine: "root@host:~# command",
+      separateInitialLineBeforeLeadingCarriageReturn: true,
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "\r");
+    appendData(sessionId, "\noutput\r\n");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "root@host:~# command\r\noutput\r\n");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile flushes a pending leading carriage return on stop", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-pending-leading-cr-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "raw",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      initialLine: "H3C>",
+      separateInitialLineBeforeLeadingCarriageReturn: true,
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "\r");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "H3C>\n\r");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile can write human-readable text logs from ANSI terminal output", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-txt-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.log");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "txt",
+      hostLabel: "manual",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+
+    assert.equal(result.ok, true);
+    appendData(
+      sessionId,
+      "\x1b[01;32mroot@MyNAS\x1b[00m:\x1b[01;34m~\x1b[00m# ip a\r\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\r\n\x1b[01;32mroot@MyNAS\x1b[00m:\x1b[01;34m~\x1b[00m# ",
+    );
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(
+      fs.readFileSync(filePath, "utf8"),
+      "root@MyNAS:~# ip a\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\nroot@MyNAS:~#",
+    );
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("startStreamToFile seeds alternate-screen omission for late-started txt logs", async () => {
+  const directory = path.join(TEMP_ROOT, `manual-alt-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const filePath = path.join(directory, "manual.txt");
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const result = startStreamToFile(sessionId, {
+      filePath,
+      format: "txt",
+      hostLabel: "manual",
+      alternateScreenActive: true,
+    });
+
+    assert.equal(result.ok, true);
+    appendData(sessionId, "~\nstatus line\n\x1b[?1049l$ done\n");
+    const finalPath = await stopStream(sessionId);
+
+    assert.equal(finalPath, filePath);
+    assert.equal(fs.readFileSync(filePath, "utf8"), "$ done");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream hides sudo autofill prompt markers and rewritten command echoes", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_test__";
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' whoami`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, `${prepared}\r\n`);
+    appendData(sessionId, `[sudo] password for alice: ${marker}`);
+    appendData(sessionId, "\r\nroot\n");
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, "sudo whoami\r\n[sudo] password for alice: \r\nroot\n");
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+    assert.ok(!content.includes("sudo -p"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream rewrites protected snippet command echoes", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-protected-snippet-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sentCommand = "sh -c 'private setup' && eval 'wrapped command'";
+  const displayCommand = "sudo apt update && sudo apt upgrade -y";
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerProgrammaticCommandLogRewrite(sessionId, { sentCommand, displayCommand });
+    appendData(sessionId, sentCommand.slice(0, 12));
+    appendData(sessionId, `${sentCommand.slice(12)}\r\nok\r\n`);
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, `${displayCommand}\r\nok\r\n`);
+    assert.ok(!content.includes("private setup"));
+    assert.ok(!content.includes("wrapped command"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream keeps programmatic command rewrites isolated per session", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-protected-snippet-isolated-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const rewrittenSessionId = `session-a-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const plainSessionId = `session-b-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sentCommand = "sh -c 'private setup' && eval 'wrapped command'";
+  const displayCommand = "sudo apt update && sudo apt upgrade -y";
+
+  try {
+    startStream(rewrittenSessionId, {
+      hostLabel: "host-a",
+      hostname: "host-a.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    startStream(plainSessionId, {
+      hostLabel: "host-b",
+      hostname: "host-b.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 6),
+    });
+    registerProgrammaticCommandLogRewrite(rewrittenSessionId, { sentCommand, displayCommand });
+
+    appendData(rewrittenSessionId, `${sentCommand}\r\nok-a\r\n`);
+    appendData(plainSessionId, `${sentCommand}\r\nok-b\r\n`);
+
+    const rewrittenPath = await stopStream(rewrittenSessionId);
+    const plainPath = await stopStream(plainSessionId);
+    const rewrittenContent = fs.readFileSync(rewrittenPath, "utf8");
+    const plainContent = fs.readFileSync(plainPath, "utf8");
+
+    assert.equal(rewrittenContent, `${displayCommand}\r\nok-a\r\n`);
+    assert.equal(plainContent, `${sentCommand}\r\nok-b\r\n`);
+  } finally {
+    await stopStream(rewrittenSessionId);
+    await stopStream(plainSessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream hides split sudo autofill markers", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-split-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_split__";
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' id`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, "sudo -p '[sudo] password for %p: __NET");
+    appendData(sessionId, "CATTY_SUDO_split__' id\r\n[sudo] password for alice: __NET");
+    appendData(sessionId, "CATTY_SUDO_split__\r\nuid=0\n");
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, "sudo id\r\n[sudo] password for alice: \r\nuid=0\n");
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+    assert.ok(!content.includes("sudo -p"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream hides sudo autofill rewrites for long commands", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-long-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_long__";
+  const longArg = "a".repeat(6000);
+  const original = `sudo printf '${longArg}'`;
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' printf '${longArg}'`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, prepared.slice(0, 2500));
+    appendData(sessionId, prepared.slice(2500, 5200));
+    appendData(sessionId, `${prepared.slice(5200)}\r\n`);
+    appendData(sessionId, `[sudo] password for alice: ${marker}\r\n`);
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, `${original}\r\n[sudo] password for alice: \r\n`);
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+    assert.ok(!content.includes("sudo -p"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream releases non-prompt output after sudo autofill rewrite", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-warm-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_warm__";
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' printf ok`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, `${prepared}\r\n`);
+    appendData(sessionId, "ok");
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, "sudo printf ok\r\nok");
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+    assert.ok(!content.includes("sudo -p"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream keeps sudo autofill rewrite after ordinary output before prompt", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-notice-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_notice__";
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' whoami`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, "sudo: this is the first time notice");
+    appendData(sessionId, `[sudo] password for alice: ${marker}\r\nroot\n`);
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, "sudo: this is the first time notice[sudo] password for alice: \r\nroot\n");
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream releases prompt-shaped warm sudo output", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-warm-prompt-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_warm_prompt__";
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' printf '[sudo] password for alice: '`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, "[sudo] password for alice: ");
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, "[sudo] password for alice: ");
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream sanitizes later shell-history echoes after sudo autofill completes", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-sudo-history-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const marker = "__NETCATTY_SUDO_history__";
+  const prepared = `sudo -p '[sudo] password for %p: ${marker}' whoami`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+    });
+    registerSudoAutofillInput(sessionId, `\x15${prepared}\r`);
+    appendData(sessionId, `[sudo] password for alice: ${marker}\r\nroot\n`);
+    appendData(sessionId, `${prepared}\r\n`);
+
+    const finalPath = await stopStream(sessionId);
+    const content = fs.readFileSync(finalPath, "utf8");
+
+    assert.equal(content, "[sudo] password for alice: \r\nroot\nsudo whoami\r\n");
+    assert.ok(!content.includes("NETCATTY_SUDO"));
+    assert.ok(!content.includes("sudo -p"));
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("startStream host directory preserves valid Unicode labels and replaces path-unsafe characters", async () => {
   const directory = path.join(TEMP_ROOT, `stream-unicode-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -158,6 +698,180 @@ test("startStream host directory preserves valid Unicode labels and replaces pat
 
     assert.equal(path.basename(path.dirname(finalPath)), "生产_服务器_东京______");
     assert.equal(fs.readFileSync(finalPath, "utf8"), "data\n");
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("txt stream timestamps complete lines without duplicating split chunks", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-timestamps-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const times = [
+    new Date(2026, 0, 2, 3, 4, 5).getTime(),
+    new Date(2026, 0, 2, 3, 4, 6).getTime(),
+    new Date(2026, 0, 2, 3, 4, 7).getTime(),
+  ];
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "txt",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      timestampsEnabled: true,
+      timestampProvider: () => times.shift(),
+    });
+    appendData(sessionId, "first ");
+    appendData(sessionId, "line\nsecond line\npartial");
+
+    const filePath = await stopStream(sessionId);
+
+    assert.equal(
+      fs.readFileSync(filePath, "utf8"),
+      "[2026-01-02 03:04:05] first line\n[2026-01-02 03:04:06] second line\n[2026-01-02 03:04:07] partial",
+    );
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("txt stream timestamps rendered lines after carriage-return rewrites", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-timestamps-cr-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "txt",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      timestampsEnabled: true,
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+    });
+    appendData(sessionId, "old prompt\rdocker denied\n");
+
+    const filePath = await stopStream(sessionId);
+
+    assert.equal(
+      fs.readFileSync(filePath, "utf8"),
+      "[2026-01-02 03:04:05] docker denied",
+    );
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("txt stream updates a line timestamp when a later snapshot rewrites that line", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-timestamps-live-cr-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const times = [
+    new Date(2026, 0, 2, 3, 4, 5).getTime(),
+    new Date(2026, 0, 2, 3, 4, 6).getTime(),
+  ];
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "txt",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      timestampsEnabled: true,
+      timestampProvider: () => times.shift(),
+    });
+    appendData(sessionId, "old prompt");
+    await waitForFileContent(directory, "[2026-01-02 03:04:05] old prompt");
+    appendData(sessionId, "\rdocker denied");
+
+    const filePath = await stopStream(sessionId);
+
+    assert.equal(
+      fs.readFileSync(filePath, "utf8"),
+      "[2026-01-02 03:04:06] docker denied",
+    );
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("html stream includes line timestamps in rendered content", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-html-timestamps-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "html",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      timestampsEnabled: true,
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+    });
+    appendData(sessionId, "line\n");
+
+    const filePath = await stopStream(sessionId);
+    const html = fs.readFileSync(filePath, "utf8");
+
+    assert.match(html, /\[2026-01-02 03:04:05\] line/);
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("html stream timestamps rendered lines after carriage-return rewrites", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-html-timestamps-cr-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "html",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      timestampsEnabled: true,
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+    });
+    appendData(sessionId, "old prompt\rdocker denied\n");
+
+    const filePath = await stopStream(sessionId);
+    const html = fs.readFileSync(filePath, "utf8");
+
+    assert.match(html, /\[2026-01-02 03:04:05\] docker denied/);
+    assert.doesNotMatch(html, /old prompt/);
+  } finally {
+    await stopStream(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("raw stream keeps original bytes when timestamps are enabled", async () => {
+  const directory = path.join(TEMP_ROOT, `stream-raw-timestamps-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    startStream(sessionId, {
+      hostLabel: "host",
+      hostname: "host.example",
+      directory,
+      format: "raw",
+      startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      timestampsEnabled: true,
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+    });
+    appendData(sessionId, "line\n");
+
+    const filePath = await stopStream(sessionId);
+
+    assert.equal(fs.readFileSync(filePath, "utf8"), "line\n");
   } finally {
     await stopStream(sessionId);
     fs.rmSync(directory, { recursive: true, force: true });

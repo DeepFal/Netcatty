@@ -1,4 +1,74 @@
 /* eslint-disable no-undef */
+// Module-level require on purpose: code inside registerCattyExecHandlers
+// runs under `with (ctx)` where bare `require` resolves to ctx.require
+// (based in electron/bridges/). Requiring here keeps the path unambiguous.
+const { formatSyntheticEcho } = require("../ai/shellUtils.cjs");
+const { ensureSessionShellKindForExec } = require("../ai/sessionShellKind.cjs");
+
+function getWorkerExecutionMeta(mcpServerBridge, sessionId, chatSessionId) {
+  return mcpServerBridge.getSessionMeta?.(sessionId, chatSessionId) || {};
+}
+
+function isNetworkDeviceLike(meta) {
+  const protocol = meta?.protocol || "";
+  const isSshOrSerial = protocol === "ssh" || protocol === "serial";
+  return (meta?.deviceType === "network" && isSshOrSerial) || protocol === "serial";
+}
+
+async function proxyCattyExecToWorker({
+  event,
+  terminalWorkerManager,
+  mcpServerBridge,
+  sessionId,
+  command,
+  chatSessionId,
+}) {
+  if (!terminalWorkerManager?.request) {
+    return { ok: false, error: "Session not found" };
+  }
+
+  const busyErr = mcpServerBridge.getSessionBusyError?.(sessionId);
+  if (busyErr) return busyErr;
+
+  const meta = getWorkerExecutionMeta(mcpServerBridge, sessionId, chatSessionId);
+  if (!isNetworkDeviceLike(meta)) {
+    // No live session here: settings additions plus common defaults only; the
+    // terminal worker re-runs the shell-selected defaults on the live session.
+    const safety = meta.shellType
+      ? mcpServerBridge.checkCommandSafetyForShell(command, meta.shellType)
+      : mcpServerBridge.checkCommandSafetyCommonOnly(command);
+    if (safety.blocked) {
+      return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
+    }
+  }
+
+  const reservation = mcpServerBridge.reserveSessionExecution?.(sessionId, "exec");
+  if (reservation && !reservation.ok) return reservation;
+  const sessionToken = reservation?.token;
+  const releaseLock = () => {
+    if (sessionToken) {
+      try { mcpServerBridge.releaseSessionExecution?.(sessionId, sessionToken); } catch {}
+    }
+  };
+
+  try {
+    return await terminalWorkerManager.request("netcatty:ai:exec", {
+      sessionId,
+      command,
+      chatSessionId,
+      commandTimeoutMs: mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000,
+      sessionMeta: meta,
+      commandBlocklist: mcpServerBridge.getCommandBlocklist?.(),
+    }, {
+      webContentsId: event?.sender?.id,
+    });
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  } finally {
+    releaseLock();
+  }
+}
+
 function registerCattyExecHandlers(ctx) {
   with (ctx) {
   ipcMain.handle("netcatty:ai:exec", async (event, { sessionId, command, chatSessionId }) => {
@@ -12,7 +82,14 @@ function registerCattyExecHandlers(ctx) {
     }
     const session = sessions?.get(sessionId);
     if (!session) {
-      return { ok: false, error: "Session not found" };
+      return proxyCattyExecToWorker({
+        event,
+        terminalWorkerManager,
+        mcpServerBridge,
+        sessionId,
+        command,
+        chatSessionId,
+      });
     }
 
     // Honor the per-session execution lock so this IPC path does not race with
@@ -36,16 +113,6 @@ function registerCattyExecHandlers(ctx) {
     const sessionProtocol = session.protocol || session.type || meta.protocol || "";
     const isSshOrSerial = sessionProtocol === "ssh" || sessionProtocol === "serial";
     const isNetworkDevice = (meta.deviceType === "network" && isSshOrSerial) || sessionProtocol === "serial";
-
-    // Shell blocklist is meaningless on network device CLIs (e.g. "shutdown"
-    // disables an interface on Cisco). Skip for network devices and serial sessions.
-    if (!isNetworkDevice) {
-      const safety = mcpServerBridge.checkCommandSafety(command);
-      if (safety.blocked) {
-        releaseLock();
-        return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
-      }
-    }
 
     // Helper: ensure the session lock is released once the promise settles
     // (or immediately on a synchronous error/early return).
@@ -86,27 +153,51 @@ function registerCattyExecHandlers(ctx) {
       // Prefer PTY stream (visible in terminal)
       if (ptyStream && typeof ptyStream.write === "function") {
         const timeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
-        return withLockRelease(() => execViaPty(ptyStream, command, {
-          stripMarkers: true,
-          trackForCancellation: mcpServerBridge.activePtyExecs,
-          timeoutMs,
-          shellKind: session.shellKind,
-          chatSessionId,
-          expectedPrompt: getFreshIdlePrompt(session),
-          typedInput: true,
-          echoCommand: (rawCommand) => {
-            const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
-            safeSend(contents, "netcatty:data", {
-              sessionId,
-              data: `${rawCommand}\r\n`,
-              syntheticEcho: true,
-            });
-          },
-          // Catty Agent has no terminal_start fallback for long-running
-          // commands, so do NOT enforce a hard wall-clock timeout here.
-          // The inactivity timeout still applies, so genuinely hung
-          // processes are still terminated.
-        }));
+        // Remote sessions historically left shellKind unset → posix wrapper
+        // was typed into fish login shells (issue #1854). Probe once first,
+        // cancellably so Stop during the probe window does not still type
+        // the command after the probe resolves (Codex P2 on #2061).
+        return withLockRelease(async () => {
+          const probed = await ensureSessionShellKindForExec(session, {
+            trackForCancellation: mcpServerBridge.activePtyExecs,
+            chatSessionId,
+          });
+          if (!probed.ok) return probed;
+          const safety = mcpServerBridge.checkCommandSafetyForShell(
+            command,
+            mcpServerBridge.resolveSessionBlocklistShellKind(session),
+          );
+          if (safety.blocked) {
+            return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
+          }
+          return execViaPty(ptyStream, command, {
+            stripMarkers: true,
+            trackForCancellation: mcpServerBridge.activePtyExecs,
+            timeoutMs,
+            shellKind: session.shellKind,
+            loginShellHint: session._loginShellKind,
+            probeLiveShell: true,
+            onProbeAborted: (marker) => {
+              const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
+              safeSend(contents, "netcatty:data", { sessionId, data: `${marker}_R\n` });
+            },
+            chatSessionId,
+            expectedPrompt: getFreshIdlePrompt(session),
+            typedInput: true,
+            echoCommand: (rawCommand) => {
+              const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
+              safeSend(contents, "netcatty:data", {
+                sessionId,
+                data: formatSyntheticEcho(rawCommand),
+                syntheticEcho: true,
+              });
+            },
+            // Catty Agent has no terminal_start fallback for long-running
+            // commands, so do NOT enforce a hard wall-clock timeout here.
+            // The inactivity timeout still applies, so genuinely hung
+            // processes are still terminated.
+          });
+        });
       }
 
       // Network devices require an interactive PTY for raw command execution.
@@ -120,15 +211,33 @@ function registerCattyExecHandlers(ctx) {
       if (sshClient && typeof sshClient.exec === "function") {
         const { execViaChannel } = require("./ai/ptyExec.cjs");
         const channelTimeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
-        return withLockRelease(() => execViaChannel(sshClient, command, {
-          timeoutMs: channelTimeoutMs,
-          trackForCancellation: mcpServerBridge.activePtyExecs,
-          chatSessionId,
-        }));
+        return withLockRelease(async () => {
+          const probed = await ensureSessionShellKindForExec(session, {
+            trackForCancellation: mcpServerBridge.activePtyExecs,
+            chatSessionId,
+          });
+          if (!probed.ok) return probed;
+          const safety = mcpServerBridge.checkCommandSafetyForShell(
+            command,
+            mcpServerBridge.resolveSessionBlocklistShellKind(session),
+          );
+          if (safety.blocked) {
+            return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
+          }
+          return execViaChannel(sshClient, command, {
+            timeoutMs: channelTimeoutMs,
+            trackForCancellation: mcpServerBridge.activePtyExecs,
+            chatSessionId,
+          });
+        });
       }
 
       // Serial port: raw command execution (no shell wrapping)
       if (session.protocol === "serial" && session.serialPort && typeof session.serialPort.write === "function") {
+        if (session.ymodemActive || session.zmodemSentry?.isActive?.()) {
+          releaseLock();
+          return { ok: false, error: "Serial file transfer is already in progress" };
+        }
         const { execViaRawPty } = require("./ai/ptyExec.cjs");
         const serialTimeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
         return withLockRelease(() => execViaRawPty(session.serialPort, command, {
@@ -154,7 +263,45 @@ function registerCattyExecHandlers(ctx) {
     }
     mcpServerBridge.cancelPtyExecsForSession(chatSessionId);
     void mcpServerBridge.cancelSftpOpsForSession?.(chatSessionId);
+    if (typeof mcpServerBridge.cancelWorkerBackgroundJobsForSession === "function") {
+      mcpServerBridge.cancelWorkerBackgroundJobsForSession(chatSessionId);
+    } else {
+      try {
+        terminalWorkerManager?.send?.("netcatty:ai:catty:cancel", { chatSessionId }, {
+          webContentsId: event?.sender?.id,
+        });
+      } catch {
+        // Worker may already be gone while cancelling a torn-down terminal.
+      }
+    }
     return { ok: true };
+  });
+
+  ipcMain.handle("netcatty:ai:chat-session:set-cancelled", async (event, { chatSessionId, cancelled }) => {
+    if (!validateSender(event)) {
+      return { ok: false, error: "Unauthorized IPC sender" };
+    }
+    if (!chatSessionId || typeof chatSessionId !== "string") {
+      return { ok: false, error: "chatSessionId is required" };
+    }
+    try {
+      return await mcpServerBridge.applyChatSessionCancelled(chatSessionId, cancelled !== false);
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle("netcatty:ai:capability", async (event, { rpcMethod, params, chatSessionId }) => {
+    if (!validateSender(event)) {
+      return { ok: false, error: "Unauthorized IPC sender" };
+    }
+    if (!rpcMethod || typeof rpcMethod !== "string") {
+      return { ok: false, error: "rpcMethod is required" };
+    }
+    return mcpServerBridge.dispatchBuiltinRpc(rpcMethod, {
+      ...(params || {}),
+      chatSessionId,
+    });
   });
   }
 }

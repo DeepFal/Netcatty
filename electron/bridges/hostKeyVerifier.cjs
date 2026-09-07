@@ -207,7 +207,14 @@ const createHostVerifier = ({
   hostname,
   port = 22,
   knownHosts = [],
+  verifyHostKeys = true,
+  bootEpoch,
 }) => (rawKey, callback) => {
+  if (verifyHostKeys === false) {
+    callback(true);
+    return;
+  }
+
   const keyInfo = describeHostKey(rawKey);
   const decision = classifyHostKey({
     knownHosts,
@@ -232,6 +239,7 @@ const createHostVerifier = ({
     publicKey: keyInfo.publicKey,
     knownHostId: decision.knownHost?.id,
     knownFingerprint: decision.expectedFingerprint,
+    ...(Number.isFinite(bootEpoch) ? { bootEpoch: Number(bootEpoch) } : {}),
   }).then((response) => {
     callback(Boolean(response?.accept));
   }).catch(() => {
@@ -241,6 +249,11 @@ const createHostVerifier = ({
 
 const handleResponse = (_event, payload) => {
   const { requestId, accept, addToKnownHosts } = payload || {};
+  const pending = hostKeyRequests.get(requestId);
+  if (!pending) return { success: false, error: "Request not found" };
+  if (_event?.sender?.id !== pending.webContentsId) {
+    return { success: false, error: "Wrong sender" };
+  }
   return settleRequest(requestId, {
     accept: Boolean(accept),
     addToKnownHosts: Boolean(addToKnownHosts),

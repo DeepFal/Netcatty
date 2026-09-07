@@ -6,6 +6,8 @@
 const path = require("node:path");
 const fs = require("node:fs");
 
+const { safeSend } = require("./ipcUtils.cjs");
+
 const V8_CACHE_OPTIONS = "bypassHeatCheck";
 
 function getGlobalShortcutBridge() {
@@ -28,11 +30,20 @@ const THEME_COLORS = {
 
 // State
 let mainWindow = null;
+const mainWindows = new Set();
+const appContentWindows = new Set();
+const dirtyEditorWindows = new Set();
+let appContentWindowClosedHandler = null;
+let lastFocusedMainWindow = null;
 let settingsWindow = null;
 let currentTheme = "light";
 let currentLanguage = "en";
+let currentWindowOpacity = 1;
+let cachedNativeTheme = null;
+
 let handlersRegistered = false; // Prevent duplicate IPC handler registration
 let menuDeps = null;
+let pluginApplicationMenuProvider = null;
 let electronApp = null; // Reference to Electron app for userData path
 let isQuitting = false;
 // Set right before electron-updater's quitAndInstall() drives app.quit() for a
@@ -54,6 +65,7 @@ const DEBUG_WINDOWS = process.env.NETCATTY_DEBUG_WINDOWS === "1";
 const OAUTH_DEFAULT_WIDTH = 600;
 const OAUTH_DEFAULT_HEIGHT = 700;
 const OAUTH_OVERLAY_ID = "__netcatty_oauth_loading__";
+const WINDOW_COMMAND_CLOSE_CHANNEL = "netcatty:window:command-close";
 // The OAuth callback port is chosen dynamically by oauthBridge (prefers
 // 45678, falls back to an OS-assigned free port if that is in use, #823),
 // so the in-app popup allow-list has to consult the bridge at popup-open
@@ -79,6 +91,28 @@ function debugLog(...args) {
 
 function setIsQuitting(nextValue) {
   isQuitting = Boolean(nextValue);
+}
+
+function setAppContentWindowClosedHandler(handler) {
+  if (handler != null && typeof handler !== "function") {
+    throw new TypeError("App content window close handler must be a function");
+  }
+  appContentWindowClosedHandler = handler ?? null;
+}
+
+function notifyAppContentWindowClosed(win) {
+  appContentWindowClosedHandler?.(win);
+}
+
+function shouldCloseWindowFromInput(input) {
+  return Boolean(
+    input?.type === "keyDown" &&
+    input?.meta &&
+    !input?.control &&
+    !input?.alt &&
+    !input?.shift &&
+    String(input?.key || "").toLowerCase() === "w",
+  );
 }
 
 /**
@@ -107,8 +141,8 @@ function setQuittingForUpdate(nextValue) {
 
 /**
  * True when quitAndInstall() initiated the current quit. The before-quit guard
- * checks this to skip the dirty-editor round-trip and let the app exit so the
- * updater's installer can run.
+ * still performs the dirty-editor round-trip; if the user cancels to save, it
+ * uses this state to roll back the update quit flags.
  */
 function isQuittingForUpdate() {
   return quittingForUpdate;
@@ -228,8 +262,10 @@ function getWindowBoundsState(win, overrideBounds) {
 }
 
 const MENU_LABELS = {
-  en: { edit: "Edit", view: "View", window: "Window", reload: "Reload" },
-  "zh-CN": { edit: "编辑", view: "视图", window: "窗口", reload: "重新加载" },
+  en: { edit: "Edit", view: "View", plugins: "Plugins", window: "Window", reload: "Reload", closeWindow: "Close Window" },
+  ru: { edit: "Правка", view: "Вид", plugins: "Плагины", window: "Окно", reload: "Перезагрузить", closeWindow: "Закрыть окно" },
+  "zh-CN": { edit: "编辑", view: "视图", plugins: "插件", window: "窗口", reload: "重新加载", closeWindow: "关闭窗口" },
+  "zh-TW": { edit: "編輯", view: "檢視", plugins: "外掛程式", window: "視窗", reload: "重新載入", closeWindow: "關閉視窗" },
 };
 
 function tMenu(language, key) {
@@ -245,7 +281,19 @@ function tMenu(language, key) {
 function rebuildApplicationMenu() {
   if (!menuDeps?.Menu || !menuDeps?.app) return;
   const menu = buildAppMenu(menuDeps.Menu, menuDeps.app, menuDeps.isMac, currentLanguage);
-  menuDeps.Menu.setApplicationMenu(menu);
+  menuDeps.Menu.setApplicationMenu?.(menu);
+}
+
+function setPluginApplicationMenuProvider(provider) {
+  if (provider != null && typeof provider !== "function") {
+    throw new TypeError("Plugin application menu provider must be a function");
+  }
+  pluginApplicationMenuProvider = provider ?? null;
+  rebuildApplicationMenu();
+}
+
+function getCurrentLanguage() {
+  return currentLanguage;
 }
 
 function getWindowForIpcEvent(event) {
@@ -256,14 +304,155 @@ function getWindowForIpcEvent(event) {
   } catch {
     // ignore
   }
-  return mainWindow;
+  return getMainWindow();
+}
+
+function pruneMainWindows() {
+  for (const win of Array.from(mainWindows)) {
+    if (!win || win.isDestroyed?.()) {
+      mainWindows.delete(win);
+      if (lastFocusedMainWindow === win) lastFocusedMainWindow = null;
+      if (mainWindow === win) mainWindow = null;
+    }
+  }
+}
+
+function pruneAppContentWindows() {
+  for (const win of Array.from(appContentWindows)) {
+    if (!win || win.isDestroyed?.()) {
+      appContentWindows.delete(win);
+      dirtyEditorWindows.delete(win);
+    }
+  }
+  for (const win of Array.from(dirtyEditorWindows)) {
+    if (!appContentWindows.has(win)) dirtyEditorWindows.delete(win);
+  }
+}
+
+function getMainWindowList() {
+  pruneMainWindows();
+  return Array.from(mainWindows).filter((win) => isWindowUsable(win));
+}
+
+function getAppContentWindowList() {
+  pruneAppContentWindows();
+  return Array.from(appContentWindows).filter((win) => isWindowUsable(win));
+}
+
+function getDirtyEditorWindowList() {
+  pruneAppContentWindows();
+  return Array.from(dirtyEditorWindows).filter((win) => isWindowUsable(win));
+}
+
+function rememberMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return;
+  lastFocusedMainWindow = win;
+  mainWindow = win;
+}
+
+function registerAppContentWindow(win, options = {}) {
+  if (!win || win.isDestroyed?.()) return;
+  appContentWindows.add(win);
+  if (options.queryDirtyEditors === true) dirtyEditorWindows.add(win);
+}
+
+function unregisterAppContentWindow(win) {
+  if (!win) return;
+  appContentWindows.delete(win);
+  dirtyEditorWindows.delete(win);
+}
+
+function registerMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return;
+  registerAppContentWindow(win, { queryDirtyEditors: true });
+  mainWindows.add(win);
+  rememberMainWindow(win);
+  try {
+    win.on("focus", () => rememberMainWindow(win));
+  } catch {
+    // ignore
+  }
+}
+
+function unregisterMainWindow(win) {
+  if (!win) return;
+  mainWindows.delete(win);
+  unregisterAppContentWindow(win);
+  if (lastFocusedMainWindow === win) lastFocusedMainWindow = null;
+  if (mainWindow === win) mainWindow = null;
+  const fallback = getMainWindowList().at(-1) || null;
+  if (fallback) rememberMainWindow(fallback);
+}
+
+function forEachMainWindow(callback) {
+  for (const win of getMainWindowList()) {
+    try {
+      callback(win);
+    } catch {
+      // ignore per-window broadcast failures
+    }
+  }
+}
+
+function clampWindowOpacity(opacity) {
+  const value = Number(opacity);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(1, Math.max(0.5, value));
+}
+
+function applyWindowOpacityToWindow(win) {
+  if (!win || win.isDestroyed?.()) return;
+  try {
+    win.setOpacity?.(currentWindowOpacity);
+  } catch {
+    // ignore
+  }
+}
+
+function applyWindowOpacity(opacity) {
+  currentWindowOpacity = clampWindowOpacity(opacity);
+  forEachMainWindow(applyWindowOpacityToWindow);
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    applyWindowOpacityToWindow(settingsWindow);
+  }
+  return currentWindowOpacity;
+}
+
+function getMainWindowCount() {
+  return getMainWindowList().length;
+}
+
+function isMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  pruneMainWindows();
+  return mainWindows.has(win);
+}
+
+function closeBrowserWindow(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  try {
+    win.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function requestWindowCommandClose(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  try {
+    const webContents = win.webContents;
+    if (!webContents || webContents.isDestroyed?.()) return closeBrowserWindow(win);
+    webContents.send(WINDOW_COMMAND_CLOSE_CHANNEL);
+    return true;
+  } catch {
+    return closeBrowserWindow(win);
+  }
 }
 
 function broadcastLanguageChanged() {
   try {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents?.send?.("netcatty:languageChanged", currentLanguage);
-    }
+    forEachMainWindow((win) => win.webContents?.send?.("netcatty:languageChanged", currentLanguage));
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.webContents?.send?.("netcatty:languageChanged", currentLanguage);
     }
@@ -451,7 +640,7 @@ function attachOAuthLoadingOverlay(win) {
   });
 }
 
-function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true } = {}) {
+function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true, startHidden = false } = {}) {
   const webContentsId = (() => {
     try {
       return win?.webContents?.id;
@@ -471,6 +660,20 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true 
     if (timer) clearTimeout(timer);
     timer = null;
     if (webContentsId) rendererReadyCallbacksByWebContentsId.delete(webContentsId);
+    if (startHidden) {
+      // Cold start via the OS login item ("--hidden"): stay hidden. The tray
+      // icon is guaranteed (and pinned open regardless of close-to-tray)
+      // by mainWindow.cjs right after bridges register, which runs before
+      // this can fire (ready-to-show/renderer-ready always come later), so
+      // electronModule is safely initialized by then. Pin here too as a
+      // belt-and-suspenders fallback in case that ordering ever changes.
+      try {
+        getGlobalShortcutBridge().pinTrayForHiddenLaunch?.();
+      } catch (err) {
+        console.warn("[WindowManager] Failed to create tray for hidden launch:", err?.message || err);
+      }
+      return;
+    }
     try {
       if (!win.isDestroyed()) win.show();
     } catch {
@@ -532,6 +735,11 @@ function resolveRendererReady(wcId) {
       // ignore waiter errors
     }
   }
+}
+
+function clearRendererReadyForWebContents(wcId) {
+  if (!wcId) return;
+  rendererReadySeenByWebContentsId.delete(wcId);
 }
 
 function isWindowUsable(win, options = {}) {
@@ -639,9 +847,64 @@ function waitForRendererReady(win, { timeoutMs = 15000 } = {}) {
 }
 
 /**
+ * Wait for a freshly created window's renderer to report ready, then deliver an
+ * IPC message to it. The renderer only registers its IPC listeners (and reports
+ * ready) after React mounts, and Electron does not queue messages for listeners
+ * that do not exist yet. So if readiness times out we must NOT send — the
+ * message would be silently dropped, leaving the window blank while the caller
+ * still saw "success". Returning a failure here lets the caller surface the
+ * existing error path instead.
+ */
+async function sendWhenRendererReady(win, channel, payload, options = {}) {
+  const {
+    timeoutMs = 8000,
+    waitForReady = waitForRendererReady,
+    shouldSend,
+    cancelReason = "cancelled",
+  } = options;
+  try {
+    await waitForReady(win, { timeoutMs });
+  } catch (err) {
+    if (typeof shouldSend === "function" && shouldSend() === false) {
+      return { success: false, reason: cancelReason };
+    }
+    return {
+      success: false,
+      error: "New window did not become ready in time",
+      reason: err?.message || String(err),
+    };
+  }
+  if (win?.isDestroyed?.() || win?.webContents?.isDestroyed?.()) {
+    return { success: false, error: "Window closed before message could be delivered" };
+  }
+  if (typeof shouldSend === "function" && shouldSend() === false) {
+    return { success: false, reason: cancelReason };
+  }
+  win.webContents.send(channel, payload);
+  return { success: true };
+}
+
+function resolveLiveAppIcon(fallback = null) {
+  try {
+    const appIconManager = require("./appIconManager.cjs");
+    const appPath = electronApp?.getAppPath?.();
+    if (appPath) {
+      const iconPath = appIconManager.getAppIconPath(appPath);
+      if (iconPath) return iconPath;
+    }
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
+/**
  * Create the main application window
  */
-const { createMainWindowApi } = require("./windowManager/mainWindow.cjs");
+const {
+  createMainWindowApi,
+  setTerminalKeyboardFocusForWindow,
+} = require("./windowManager/mainWindow.cjs");
 const mainWindowApi = createMainWindowApi({
   get mainWindow() { return mainWindow; },
   set mainWindow(value) { mainWindow = value; },
@@ -678,10 +941,23 @@ const mainWindowApi = createMainWindowApi({
   queueWindowStateSave,
   saveWindowStateSync,
   setupDeferredShow,
+  clearRendererReadyForWebContents,
   createExternalOnlyWindowOpenHandler,
   createAppWindowOpenHandler,
   attachOAuthLoadingOverlay,
+  queryDirtyEditors: (...args) => require("./dirtyEditorGuard.cjs").queryDirtyEditors(...args),
   registerWindowHandlers,
+  requestWindowCommandClose,
+  shouldCloseWindowFromInput,
+  registerMainWindow,
+  unregisterMainWindow,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  notifyAppContentWindowClosed,
+  setAppContentWindowClosedHandler,
+  getMainWindowCount,
+  applyWindowOpacityToWindow,
+  resolveLiveAppIcon,
   closeSettingsWindow: (...args) => closeSettingsWindow(...args),
   hideSettingsWindow: (...args) => hideSettingsWindow(...args),
 });
@@ -724,7 +1000,9 @@ const settingsWindowApi = createSettingsWindowApi({
   resolveFrontendBackgroundColor,
   createAppWindowOpenHandler,
   createExternalOnlyWindowOpenHandler,
+  resolveLiveAppIcon,
   getDevRendererBaseUrl,
+  applyWindowOpacityToWindow,
 });
 const {
   restoreWindowInputFocus,
@@ -738,6 +1016,29 @@ const {
   prewarmSettingsWindow,
 } = settingsWindowApi;
 
+const { createTerminalPopupWindowApi } = require("./windowManager/terminalPopupWindow.cjs");
+const terminalPopupWindowApi = createTerminalPopupWindowApi({
+  get mainWindow() { return mainWindow; },
+  get currentTheme() { return currentTheme; },
+  V8_CACHE_OPTIONS,
+  __dirname,
+  resolveFrontendBackgroundColor,
+  createExternalOnlyWindowOpenHandler,
+  getDevRendererBaseUrl,
+  applyWindowOpacityToWindow,
+  sendWhenRendererReady,
+  showAndFocusWindow,
+  resolveSettingsWindowBounds,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  notifyAppContentWindowClosed,
+});
+const {
+  openTerminalPopupWindow,
+  closeTerminalPopupWindow,
+  getTerminalPopupWindows,
+} = terminalPopupWindowApi;
+
 /**
  * Register window control IPC handlers (only once)
  */
@@ -747,6 +1048,7 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
     return;
   }
   handlersRegistered = true;
+  cachedNativeTheme = nativeTheme;
 
   ipcMain.handle("netcatty:window:minimize", (event) => {
     const win = getWindowForIpcEvent(event);
@@ -772,6 +1074,13 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   });
 
   ipcMain.handle("netcatty:window:close", (event) => {
+    try {
+      if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) {
+        return { success: false, reason: "app-locked" };
+      }
+    } catch {
+      // ignore
+    }
     const win = getWindowForIpcEvent(event);
     if (win && !win.isDestroyed()) {
       debugLog("window:close", {
@@ -805,17 +1114,39 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
     return restoreWindowInputFocus(win);
   });
 
+  ipcMain.on("netcatty:window:set-terminal-keyboard-focus", (event, payload) => {
+    const win = getWindowForIpcEvent(event);
+    setTerminalKeyboardFocusForWindow(win, payload?.focused === true);
+  });
+
+  ipcMain.handle("netcatty:window:setTitle", (event, title) => {
+    const win = getWindowForIpcEvent(event);
+    if (!win || win.isDestroyed()) return false;
+    try {
+      if (typeof menuDeps?.setAppLockWindowTitle === "function") {
+        return menuDeps.setAppLockWindowTitle(win, title) === true;
+      }
+    } catch {
+      // Ignore title-guard failures and keep normal title behavior.
+    }
+    const value = typeof title === "string" ? title.trim() : "";
+    try {
+      win.setTitle(value || "Netcatty");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
   ipcMain.handle("netcatty:setTheme", (_event, theme) => {
     currentTheme = theme;
     nativeTheme.themeSource = theme;
+    rebuildApplicationMenu();
     const effectiveTheme = theme === "system"
       ? (nativeTheme?.shouldUseDarkColors ? "dark" : "light")
       : theme;
     const themeConfig = THEME_COLORS[effectiveTheme] || THEME_COLORS.light;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setBackgroundColor(themeConfig.background);
-    }
-    // Also update settings window if open
+    forEachMainWindow((win) => win.setBackgroundColor(themeConfig.background));
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.setBackgroundColor(themeConfig.background);
     }
@@ -825,13 +1156,28 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   ipcMain.handle("netcatty:setBackgroundColor", (_event, color) => {
     const normalized = normalizeBackgroundColor(color);
     if (!normalized) return false;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setBackgroundColor(normalized);
-    }
+    forEachMainWindow((win) => win.setBackgroundColor(normalized));
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.setBackgroundColor(normalized);
     }
     return true;
+  });
+
+  ipcMain.handle("netcatty:setWindowOpacity", (_event, opacity) => {
+    applyWindowOpacity(opacity);
+    return true;
+  });
+
+  ipcMain.handle("netcatty:setAppIconVariant", (_event, variant) => {
+    const { app, BrowserWindow, nativeImage } = require("electron");
+    const appIconManager = require("./appIconManager.cjs");
+    return appIconManager.applyAppIconVariant(variant, {
+      app,
+      BrowserWindow,
+      nativeImage,
+      appPath: app.getAppPath(),
+      isMac: process.platform === "darwin",
+    });
   });
 
   ipcMain.handle("netcatty:setLanguage", (_event, language) => {
@@ -874,12 +1220,30 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   // Broadcast settings changed to all windows (for cross-window sync)
   ipcMain.on("netcatty:settings:changed", (event, payload) => {
     const senderId = event?.sender?.id;
+    // Apply SSH transport idle park TTL in the main process (shared shell/SFTP/
+    // transfer/port-forward connections). Renderer owns persistence; main owns
+    // the registry timers.
+    try {
+      if (typeof payload?.value === "number" && Number.isFinite(payload.value) && payload.value >= 0) {
+        const {
+          setDefaultTransportIdleTtlMs,
+          STORAGE_KEY_SSH_TRANSPORT_IDLE_TTL_MS,
+        } = require("./sshConnectionPool.cjs");
+        if (payload?.key === STORAGE_KEY_SSH_TRANSPORT_IDLE_TTL_MS) {
+          setDefaultTransportIdleTtlMs(payload.value);
+        }
+      }
+    } catch {
+      // ignore — pool may be unavailable in tests
+    }
     // Notify all windows except the sender
     // Check both isDestroyed() and webContents.isDestroyed() to handle HMR refresh
     try {
-      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed() && mainWindow.webContents.id !== senderId) {
-        mainWindow.webContents.send("netcatty:settings:changed", payload);
-      }
+      forEachMainWindow((win) => {
+        if (!win.webContents.isDestroyed() && win.webContents.id !== senderId) {
+          win.webContents.send("netcatty:settings:changed", payload);
+        }
+      });
       if (settingsWindow && !settingsWindow.isDestroyed() && !settingsWindow.webContents.isDestroyed() && settingsWindow.webContents.id !== senderId) {
         settingsWindow.webContents.send("netcatty:settings:changed", payload);
       }
@@ -899,9 +1263,46 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
 /**
  * Build the application menu
  */
-function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
+function buildAppMenu(Menu, app, isMac, language = currentLanguage, options = {}) {
   // Save deps so later language changes can rebuild the menu.
-  menuDeps = { Menu, app, isMac };
+  menuDeps = {
+    Menu,
+    app,
+    isMac,
+    isAppLocked: typeof options.isAppLocked === "function"
+      ? options.isAppLocked
+      : (typeof menuDeps?.isAppLocked === "function" ? menuDeps.isAppLocked : undefined),
+    setAppLockWindowTitle: typeof options.setAppLockWindowTitle === "function"
+      ? options.setAppLockWindowTitle
+      : (typeof menuDeps?.setAppLockWindowTitle === "function"
+        ? menuDeps.setAppLockWindowTitle
+        : undefined),
+  };
+  const closeFocusedWindow = (_menuItem, browserWindow, event) => {
+    // Block native Close while app lock is visible so popups/sessions are not
+    // torn down behind the overlay (Codex P2 on 79603979).
+    try {
+      if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) return;
+    } catch {
+      // ignore
+    }
+    // 只有主窗口/设置窗口会接收 command-close；其他 BrowserWindow 直接关闭。
+    if (browserWindow && !isMainWindow(browserWindow) && browserWindow !== settingsWindow) {
+      closeBrowserWindow(browserWindow);
+      return;
+    }
+
+    // Selecting Close Window with the mouse remains an explicit window-close
+    // action. Only the menu accelerator is routed through the configurable
+    // close-tab shortcut in the renderer.
+    if (event?.triggeredByAccelerator === false) {
+      closeBrowserWindow(browserWindow || getMainWindow());
+      return;
+    }
+
+    // macOS 的 Cmd+W 先交给渲染层关闭标签页；没有标签页时渲染层再关闭窗口。
+    requestWindowCommandClose(browserWindow) || requestWindowCommandClose(getMainWindow());
+  };
   const template = [
     ...(isMac
       ? [
@@ -934,9 +1335,26 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
     {
       label: tMenu(language, "view"),
       submenu: [
-        { label: tMenu(language, "reload"), click: (_, win) => { if (win) win.reload(); } },
-        { role: "forceReload" },
-        { role: "toggleDevTools" },
+        {
+          label: tMenu(language, "reload"),
+          click: (_, win) => {
+            // Block reload while app lock is up so lock cannot be bypassed.
+            try {
+              if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) return;
+            } catch { /* ignore */ }
+            if (win) win.reload();
+          },
+        },
+        {
+          label: "Toggle Developer Tools",
+          accelerator: "Alt+CommandOrControl+I",
+          click: (_, win) => {
+            try {
+              if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) return;
+            } catch { /* ignore */ }
+            if (win && !win.isDestroyed?.()) win.webContents?.toggleDevTools?.();
+          },
+        },
         { type: "separator" },
         { role: "resetZoom" },
         { role: "zoomIn" },
@@ -945,13 +1363,52 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
         { role: "togglefullscreen" },
       ],
     },
+    ...(() => {
+      let items = [];
+      try { items = pluginApplicationMenuProvider?.() ?? []; } catch {}
+      if (!Array.isArray(items) || items.length === 0) return [];
+      const sortedItems = [...items].sort((left, right) => (
+        String(left.group ?? "").localeCompare(String(right.group ?? ""))
+        || Number(left.order ?? 0) - Number(right.order ?? 0)
+        || String(left.id ?? "").localeCompare(String(right.id ?? ""))
+      ));
+      const submenu = [];
+      let previousGroup = null;
+      for (const item of sortedItems) {
+        const group = String(item.group ?? "");
+        if (previousGroup != null && group !== previousGroup) submenu.push({ type: "separator" });
+        previousGroup = group;
+        submenu.push({
+          id: item.id,
+          label: item.label,
+          enabled: item.enabled !== false,
+          type: item.checked == null ? "normal" : "checkbox",
+          checked: item.checked === true,
+          accelerator: item.accelerator,
+          icon: item.icon,
+          click: item.click,
+        });
+      }
+      return [{
+        label: tMenu(language, "plugins"),
+        submenu,
+      }];
+    })(),
     {
       label: tMenu(language, "window"),
       submenu: [
         { role: "minimize" },
         { role: "zoom" },
         ...(isMac
-          ? [{ type: "separator" }, { role: "front" }]
+          ? [
+            { type: "separator" },
+            {
+              label: tMenu(language, "closeWindow"),
+              accelerator: "CommandOrControl+W",
+              click: closeFocusedWindow,
+            },
+            { role: "front" },
+          ]
           : [{ role: "close" }]),
       ],
     },
@@ -964,7 +1421,14 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
  * Get the main window instance
  */
 function getMainWindow() {
-  return mainWindow;
+  const candidates = getMainWindowList();
+  if (lastFocusedMainWindow && candidates.includes(lastFocusedMainWindow)) {
+    return lastFocusedMainWindow;
+  }
+  if (mainWindow && candidates.includes(mainWindow)) {
+    return mainWindow;
+  }
+  return candidates.at(-1) || null;
 }
 
 /**
@@ -974,18 +1438,78 @@ function getSettingsWindow() {
   return settingsWindow;
 }
 
+/**
+ * Show the main window and restore reliable keyboard/caret routing (#760, #1722).
+ * Global hotkeys and tray entry points invoke this from non-foreground contexts
+ * where bare BrowserWindow.focus() is silently rejected on Windows.
+ */
+function showAndFocusMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  if (win.isMinimized?.()) {
+    try {
+      win.restore();
+    } catch {
+      // ignore
+    }
+  }
+  const restored = restoreWindowInputFocus(win, { show: true });
+  if (restored) notifyWindowFocusRequested(win);
+  return restored;
+}
+
+/**
+ * Renderer input-focus recovery is only valid after an explicit foreground
+ * request (hotkey, tray, Dock, deep link). Plain BrowserWindow "show" events
+ * can also come from OS window/space transitions and must not steal focus.
+ */
+function notifyWindowFocusRequested(win) {
+  if (!win || win.isDestroyed?.()) return;
+  safeSend(win.webContents, "netcatty:window:focus-requested");
+}
+
+/**
+ * Tell the renderer to dismiss transient overlays before the native hide (#1722).
+ * Must run before BrowserWindow.hide(), not from Electron's post-hide event.
+ */
+function notifyWindowWillHide(win) {
+  if (!win || win.isDestroyed?.()) return;
+  safeSend(win.webContents, "netcatty:window:will-hide");
+}
+
 module.exports = {
   createWindow,
   openSettingsWindow,
   closeSettingsWindow,
+  openTerminalPopupWindow,
+  closeTerminalPopupWindow,
+  getTerminalPopupWindows,
   prewarmSettingsWindow,
   buildAppMenu,
+  getCurrentLanguage,
+  setPluginApplicationMenuProvider,
   getMainWindow,
+  getMainWindows: getMainWindowList,
+  getAppContentWindows: getAppContentWindowList,
+  getDirtyEditorWindows: getDirtyEditorWindowList,
+  getMainWindowCount,
+  isMainWindow,
+  registerMainWindow,
+  unregisterMainWindow,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  setAppContentWindowClosedHandler,
   getSettingsWindow,
   isWindowUsable,
   registerWindowHandlers,
   restoreWindowInputFocus,
+  showAndFocusMainWindow,
+  notifyWindowFocusRequested,
+  notifyWindowWillHide,
+  requestWindowCommandClose,
+  shouldCloseWindowFromInput,
+  WINDOW_COMMAND_CLOSE_CHANNEL,
   waitForRendererReady,
+  sendWhenRendererReady,
   setIsQuitting,
   getIsQuitting,
   setQuittingForUpdate,
@@ -994,4 +1518,7 @@ module.exports = {
   tryOpenExternalWithFallback,
   resolveSettingsWindowBounds,
   THEME_COLORS,
+  clampWindowOpacity,
+  applyWindowOpacity,
+  applyWindowOpacityToWindow,
 };

@@ -1,12 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { AlertCircle, Import, Minus, Palette, Pencil, Plus, Trash2 } from "lucide-react";
 import type {
+  AutocompleteHistoryScope,
   CursorShape,
+  HostInfoBarTitleMode,
+  PasswordPromptAssistMode,
   TerminalEmulationType,
   TerminalSettings,
 } from "../../../domain/models";
 import { useI18n } from "../../../application/i18n/I18nProvider";
-import { MAX_FONT_SIZE, MIN_FONT_SIZE, type TerminalFont } from "../../../infrastructure/config/fonts";
+import { MAX_FONT_SIZE, MIN_FONT_SIZE, resolveTerminalFontFamilyId, type TerminalFont } from "../../../infrastructure/config/fonts";
 import { TERMINAL_THEMES } from "../../../infrastructure/config/terminalThemes";
 import { customThemeStore, useCustomThemes } from "../../../application/state/customThemeStore";
 import { parseItermcolors } from "../../../infrastructure/parsers/itermcolorsParser";
@@ -17,19 +20,45 @@ import { Button } from "../../ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "../../ui/dialog";
 import { Input } from "../../ui/input";
 import { Select as ShadcnSelect, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../ui/select";
-import { SectionHeader, Select, SettingsTabContent, SettingRow, Toggle } from "../settings-ui";
+import { SectionHeader, Select, SettingsAnchor, SettingsTabContent, SettingRow, Toggle } from "../settings-ui";
 import { ThemeSelectModal } from "../ThemeSelectModal";
 import { TerminalFontSelect } from "../TerminalFontSelect";
 import { TerminalCjkFontSelect } from "../TerminalCjkFontSelect";
 import { CustomThemeModal } from "../../terminal/CustomThemeModal";
 import type { TerminalTheme } from "../../../domain/models";
-import { resolveFollowedTerminalThemeId, TERMINAL_THEME_AUTO } from "../../../domain/terminalAppearance";
+import { resolveFollowedTerminalThemeId, resolveManualTerminalThemeId } from "../../../domain/terminalAppearance";
 
 import { KeywordHighlightRulesEditor, ThemePreviewButton } from "./SettingsTerminalTabControls";
 import { TerminalBehaviorSettings } from "./TerminalBehaviorSettings";
-export default function SettingsTerminalTab(props: {
+import {
+  TERMINAL_SIDE_PANEL_AUTO_OPEN_TABS,
+  type TerminalSidePanelAutoOpenTab,
+} from "../../../domain/terminalSidePanelAutoOpen";
+import {
+  TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_MAX,
+  TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_MIN,
+  TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_MAX,
+  TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_MIN,
+  TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MAX,
+  TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MIN,
+} from "../../../domain/terminalInlineImages";
+
+const FONT_WEIGHT_OPTIONS = [
+  { value: "100", labelKey: "settings.terminal.font.weight.thin" },
+  { value: "200", labelKey: "settings.terminal.font.weight.extraLight" },
+  { value: "300", labelKey: "settings.terminal.font.weight.light" },
+  { value: "400", labelKey: "settings.terminal.font.weight.normal" },
+  { value: "500", labelKey: "settings.terminal.font.weight.medium" },
+  { value: "600", labelKey: "settings.terminal.font.weight.semiBold" },
+  { value: "700", labelKey: "settings.terminal.font.weight.bold" },
+  { value: "800", labelKey: "settings.terminal.font.weight.extraBold" },
+  { value: "900", labelKey: "settings.terminal.font.weight.black" },
+];
+
+function SettingsTerminalTab(props: {
   terminalThemeId: string;
   setTerminalThemeId: (id: string) => void;
+  resolvedTheme: "dark" | "light";
   followAppTerminalTheme: boolean;
   setFollowAppTerminalTheme: (value: boolean) => void;
   terminalThemeDarkId: string;
@@ -47,6 +76,10 @@ export default function SettingsTerminalTab(props: {
     key: K,
     value: TerminalSettings[K],
   ) => void;
+  terminalSidePanelAutoOpen: boolean;
+  setTerminalSidePanelAutoOpen: (enabled: boolean) => void;
+  terminalSidePanelAutoOpenTab: TerminalSidePanelAutoOpenTab;
+  setTerminalSidePanelAutoOpenTab: (tab: TerminalSidePanelAutoOpenTab) => void;
   availableFonts: TerminalFont[];
   workspaceFocusStyle: 'dim' | 'border';
   setWorkspaceFocusStyle: (style: 'dim' | 'border') => void;
@@ -54,6 +87,7 @@ export default function SettingsTerminalTab(props: {
   const {
     terminalThemeId,
     setTerminalThemeId,
+    resolvedTheme,
     followAppTerminalTheme,
     setFollowAppTerminalTheme,
     terminalThemeDarkId,
@@ -68,6 +102,10 @@ export default function SettingsTerminalTab(props: {
     setTerminalFontSize,
     terminalSettings,
     updateTerminalSetting,
+    terminalSidePanelAutoOpen,
+    setTerminalSidePanelAutoOpen,
+    terminalSidePanelAutoOpenTab,
+    setTerminalSidePanelAutoOpenTab,
     availableFonts,
     workspaceFocusStyle,
     setWorkspaceFocusStyle,
@@ -101,50 +139,66 @@ export default function SettingsTerminalTab(props: {
     setCustomArgsDraft(formatShellArgs(terminalSettings.localShellArgs ?? []));
     setCustomShellModalOpen(true);
   }, [terminalSettings.localShell, terminalSettings.localShellArgs]);
-  const [themeModalOpen, setThemeModalOpen] = useState(false);
   const [themeModalSlot, setThemeModalSlot] = useState<'dark' | 'light' | null>(null);
 
   // Subscribe to custom theme changes so editing in-place triggers re-render
   const customThemes = useCustomThemes();
 
-  // Get current selected theme
-  const currentTheme = useMemo(() => {
-    return TERMINAL_THEMES.find(t => t.id === terminalThemeId)
-      || customThemes.find(t => t.id === terminalThemeId)
-      || TERMINAL_THEMES[0];
-  }, [terminalThemeId, customThemes]);
+  const findTerminalTheme = useCallback((id: string) => (
+    TERMINAL_THEMES.find(t => t.id === id)
+      || customThemes.find(t => t.id === id)
+      || null
+  ), [customThemes]);
 
-  // Preview themes for the follow-app per-mode pickers. resolvedTheme is
-  // forced per slot so each preview reflects exactly that mode's selection.
-  const darkPreviewTheme = useMemo(() => {
+  const followedPreviewTheme = useMemo(() => {
     const id = resolveFollowedTerminalThemeId({
+      resolvedTheme,
+      lightUiThemeId,
+      darkUiThemeId,
+      fallbackThemeId: terminalThemeId,
+    });
+    return findTerminalTheme(id) || findTerminalTheme(terminalThemeId) || TERMINAL_THEMES[0];
+  }, [darkUiThemeId, findTerminalTheme, lightUiThemeId, resolvedTheme, terminalThemeId]);
+
+  const darkPreviewTheme = useMemo(() => {
+    const id = resolveManualTerminalThemeId({
       resolvedTheme: 'dark',
       terminalThemeDarkId, terminalThemeLightId,
       lightUiThemeId, darkUiThemeId, fallbackThemeId: terminalThemeId,
     });
-    return TERMINAL_THEMES.find(t => t.id === id)
-      || customThemes.find(t => t.id === id)
-      // Mirror the runtime fallback in useSettingsState.currentTerminalTheme:
-      // a deleted per-mode override falls back to the manual theme, not [0].
-      || TERMINAL_THEMES.find(t => t.id === terminalThemeId)
-      || customThemes.find(t => t.id === terminalThemeId)
-      || TERMINAL_THEMES[0];
-  }, [terminalThemeDarkId, terminalThemeLightId, lightUiThemeId, darkUiThemeId, terminalThemeId, customThemes]);
+    return findTerminalTheme(id) || findTerminalTheme(terminalThemeId) || TERMINAL_THEMES[0];
+  }, [darkUiThemeId, findTerminalTheme, lightUiThemeId, terminalThemeDarkId, terminalThemeId, terminalThemeLightId]);
 
   const lightPreviewTheme = useMemo(() => {
-    const id = resolveFollowedTerminalThemeId({
+    const id = resolveManualTerminalThemeId({
       resolvedTheme: 'light',
       terminalThemeDarkId, terminalThemeLightId,
       lightUiThemeId, darkUiThemeId, fallbackThemeId: terminalThemeId,
     });
-    return TERMINAL_THEMES.find(t => t.id === id)
-      || customThemes.find(t => t.id === id)
-      // Mirror the runtime fallback in useSettingsState.currentTerminalTheme:
-      // a deleted per-mode override falls back to the manual theme, not [0].
-      || TERMINAL_THEMES.find(t => t.id === terminalThemeId)
-      || customThemes.find(t => t.id === terminalThemeId)
-      || TERMINAL_THEMES[0];
-  }, [terminalThemeDarkId, terminalThemeLightId, lightUiThemeId, darkUiThemeId, terminalThemeId, customThemes]);
+    return findTerminalTheme(id) || findTerminalTheme(terminalThemeId) || TERMINAL_THEMES[0];
+  }, [darkUiThemeId, findTerminalTheme, lightUiThemeId, terminalThemeDarkId, terminalThemeId, terminalThemeLightId]);
+
+  const currentTheme = followAppTerminalTheme
+    ? followedPreviewTheme
+    : resolvedTheme === 'dark'
+      ? darkPreviewTheme
+      : lightPreviewTheme;
+
+  const setManualThemeForResolvedMode = useCallback((themeId: string) => {
+    if (resolvedTheme === 'dark') {
+      setTerminalThemeDarkId(themeId);
+    } else {
+      setTerminalThemeLightId(themeId);
+    }
+    setTerminalThemeId(themeId);
+  }, [resolvedTheme, setTerminalThemeDarkId, setTerminalThemeId, setTerminalThemeLightId]);
+
+  const fontWeightOptions = useMemo(() => (
+    FONT_WEIGHT_OPTIONS.map((option) => ({
+      value: option.value,
+      label: `${option.value} - ${t(option.labelKey)}`,
+    }))
+  ), [t]);
 
   const handleAutocompleteGhostTextChange = useCallback((enabled: boolean) => {
     updateTerminalSetting("autocompleteGhostText", enabled);
@@ -174,7 +228,7 @@ export default function SettingsTerminalTab(props: {
       const parsed = parseItermcolors(xml, name);
       if (parsed) {
         customThemeStore.addTheme(parsed);
-        setTerminalThemeId(parsed.id);
+        setManualThemeForResolvedMode(parsed.id);
       } else {
         console.error('[Settings] Failed to parse .itermcolors file:', file.name);
         window.alert(t('terminal.customTheme.importError') || 'Failed to parse the selected file. Please ensure it is a valid .itermcolors XML file.');
@@ -185,7 +239,7 @@ export default function SettingsTerminalTab(props: {
     };
     reader.readAsText(file);
     e.target.value = '';
-  }, [setTerminalThemeId, t]);
+  }, [setManualThemeForResolvedMode, t]);
 
   // New custom theme modal
   const [customThemeModalOpen, setCustomThemeModalOpen] = useState(false);
@@ -198,9 +252,7 @@ export default function SettingsTerminalTab(props: {
   }, [currentTheme]);
 
   const handleNewCustomTheme = useCallback(() => {
-    const base = TERMINAL_THEMES.find(t => t.id === terminalThemeId)
-      || customThemeStore.getThemeById(terminalThemeId)
-      || TERMINAL_THEMES[0];
+    const base = currentTheme || TERMINAL_THEMES[0];
     const newTheme: TerminalTheme = {
       ...base,
       id: `custom-${Date.now()}`,
@@ -211,7 +263,7 @@ export default function SettingsTerminalTab(props: {
     setCustomThemeData(newTheme);
     setIsEditingTheme(false);
     setCustomThemeModalOpen(true);
-  }, [terminalThemeId]);
+  }, [currentTheme]);
 
   const handleEditCustomTheme = useCallback(() => {
     if (!currentTheme?.isCustom) return;
@@ -223,8 +275,8 @@ export default function SettingsTerminalTab(props: {
   const handleDeleteCustomTheme = useCallback(() => {
     if (!currentTheme?.isCustom) return;
     customThemeStore.deleteTheme(currentTheme.id);
-    setTerminalThemeId(TERMINAL_THEMES[0].id);
-  }, [currentTheme, setTerminalThemeId]);
+    setManualThemeForResolvedMode(followedPreviewTheme.id);
+  }, [currentTheme, followedPreviewTheme.id, setManualThemeForResolvedMode]);
 
   // Fetch default shell on mount
   useEffect(() => {
@@ -318,6 +370,7 @@ export default function SettingsTerminalTab(props: {
       <SectionHeader title={t("settings.terminal.section.theme")} />
       <div className="rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-theme-follow-app"
           label={t("settings.terminal.theme.followApp")}
           description={t("settings.terminal.theme.followApp.desc")}
         >
@@ -327,7 +380,7 @@ export default function SettingsTerminalTab(props: {
           />
         </SettingRow>
       </div>
-      {followAppTerminalTheme ? (
+      {!followAppTerminalTheme && (
         <div className="space-y-2">
           <div>
             <div className="text-xs text-muted-foreground mb-1.5 px-1">
@@ -336,9 +389,7 @@ export default function SettingsTerminalTab(props: {
             <ThemePreviewButton
               theme={darkPreviewTheme}
               onClick={() => setThemeModalSlot('dark')}
-              buttonLabel={terminalThemeDarkId === TERMINAL_THEME_AUTO
-                ? t("settings.terminal.theme.auto")
-                : t("settings.terminal.theme.selectButton")}
+              buttonLabel={t("settings.terminal.theme.selectButton")}
             />
           </div>
           <div>
@@ -348,88 +399,80 @@ export default function SettingsTerminalTab(props: {
             <ThemePreviewButton
               theme={lightPreviewTheme}
               onClick={() => setThemeModalSlot('light')}
-              buttonLabel={terminalThemeLightId === TERMINAL_THEME_AUTO
-                ? t("settings.terminal.theme.auto")
-                : t("settings.terminal.theme.selectButton")}
+              buttonLabel={t("settings.terminal.theme.selectButton")}
             />
           </div>
         </div>
-      ) : (
-        <ThemePreviewButton
-          theme={currentTheme}
-          onClick={() => setThemeModalOpen(true)}
-          buttonLabel={t("settings.terminal.theme.selectButton")}
-        />
       )}
 
       <ThemeSelectModal
-        open={themeModalOpen}
-        onClose={() => setThemeModalOpen(false)}
-        selectedThemeId={terminalThemeId}
-        onSelect={setTerminalThemeId}
-      />
-      <ThemeSelectModal
         open={themeModalSlot !== null}
         onClose={() => setThemeModalSlot(null)}
-        selectedThemeId={themeModalSlot === 'dark' ? terminalThemeDarkId : terminalThemeLightId}
+        selectedThemeId={themeModalSlot === 'dark' ? darkPreviewTheme.id : lightPreviewTheme.id}
         onSelect={(id) => {
-          if (themeModalSlot === 'dark') setTerminalThemeDarkId(id);
-          else if (themeModalSlot === 'light') setTerminalThemeLightId(id);
+          if (themeModalSlot === 'dark') {
+            setTerminalThemeDarkId(id);
+          } else if (themeModalSlot === 'light') {
+            setTerminalThemeLightId(id);
+          }
+          if (themeModalSlot === resolvedTheme) {
+            setTerminalThemeId(id);
+          }
         }}
         filterType={themeModalSlot === 'light' ? 'light' : 'dark'}
-        showAutoOption
       />
 
-      {/* Theme action buttons */}
-      <div className="flex items-center gap-2 -mt-1">
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1.5"
-          onClick={handleNewCustomTheme}
-        >
-          <Palette size={14} />
-          {t('terminal.customTheme.new')}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1.5"
-          onClick={() => importFileRef.current?.click()}
-        >
-          <Import size={14} />
-          {t('terminal.customTheme.import')}
-        </Button>
-        {isCustomTheme && (
-          <>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5"
-              onClick={handleEditCustomTheme}
-            >
-              <Pencil size={14} />
-              {t('common.edit')}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5 text-destructive hover:text-destructive"
-              onClick={handleDeleteCustomTheme}
-            >
-              <Trash2 size={14} />
-              {t('common.delete')}
-            </Button>
-          </>
-        )}
-        <input
-          ref={importFileRef}
-          type="file"
-          accept=".itermcolors"
-          className="hidden"
-          onChange={handleImportItermcolors}
-        />
-      </div>
+      {!followAppTerminalTheme && (
+        <div className="flex items-center gap-2 -mt-1">
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={handleNewCustomTheme}
+          >
+            <Palette size={14} />
+            {t('terminal.customTheme.new')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={() => importFileRef.current?.click()}
+          >
+            <Import size={14} />
+            {t('terminal.customTheme.import')}
+          </Button>
+          {isCustomTheme && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={handleEditCustomTheme}
+              >
+                <Pencil size={14} />
+                {t('common.edit')}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-destructive hover:text-destructive"
+                onClick={handleDeleteCustomTheme}
+              >
+                <Trash2 size={14} />
+                {t('common.delete')}
+              </Button>
+            </>
+          )}
+          <input
+            ref={importFileRef}
+            type="file"
+            accept=".itermcolors"
+            className="hidden"
+            onChange={handleImportItermcolors}
+          />
+        </div>
+      )}
 
       {/* Custom Theme Modal */}
       {customThemeData && (
@@ -443,13 +486,13 @@ export default function SettingsTerminalTab(props: {
             } else {
               customThemeStore.addTheme(theme);
             }
-            setTerminalThemeId(theme.id);
+            setManualThemeForResolvedMode(theme.id);
             setCustomThemeModalOpen(false);
             setCustomThemeData(null);
           }}
           onDelete={isEditingTheme ? (themeId) => {
             customThemeStore.deleteTheme(themeId);
-            setTerminalThemeId(TERMINAL_THEMES[0].id);
+            setManualThemeForResolvedMode(followedPreviewTheme.id);
             setCustomThemeModalOpen(false);
             setCustomThemeData(null);
           } : undefined}
@@ -463,29 +506,33 @@ export default function SettingsTerminalTab(props: {
       <SectionHeader title={t("settings.terminal.section.font")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-font-family"
           label={t("settings.terminal.font.family")}
           description={t("settings.terminal.font.family.desc")}
         >
           <TerminalFontSelect
-            value={terminalFontFamilyId}
+            value={resolveTerminalFontFamilyId(
+              terminalFontFamilyId,
+              typeof navigator !== "undefined" ? navigator.platform : "",
+            )}
             fonts={availableFonts}
             onChange={(id) => setTerminalFontFamilyId(id)}
             className="w-48"
+            ariaLabel={t("settings.terminal.font.family")}
           />
         </SettingRow>
 
-        <SettingRow
-          label={t("settings.terminal.font.cjk")}
-          description={t("settings.terminal.font.cjk.desc")}
-        >
+        <SettingsAnchor anchorId="terminal-font-cjk">
           <TerminalCjkFontSelect
+            label={t("settings.terminal.font.cjk")}
+            description={t("settings.terminal.font.cjk.desc")}
             value={terminalSettings.fallbackFont ?? ""}
             onChange={(next) => updateTerminalSetting("fallbackFont", next)}
-            className="w-48"
           />
-        </SettingRow>
+        </SettingsAnchor>
 
         <SettingRow
+          anchorId="terminal-font-size"
           label={t("settings.terminal.font.size")}
           description={t("settings.terminal.font.size.desc")}
         >
@@ -511,50 +558,44 @@ export default function SettingsTerminalTab(props: {
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-font-weight"
           label={t("settings.terminal.font.weight")}
           description={t("settings.terminal.font.weight.desc")}
         >
           <Select
             value={String(terminalSettings.fontWeight)}
-            options={[
-              { value: "100", label: "100 - Thin" },
-              { value: "200", label: "200 - Extra Light" },
-              { value: "300", label: "300 - Light" },
-              { value: "400", label: "400 - Normal" },
-              { value: "500", label: "500 - Medium" },
-              { value: "600", label: "600 - Semi Bold" },
-              { value: "700", label: "700 - Bold" },
-              { value: "800", label: "800 - Extra Bold" },
-              { value: "900", label: "900 - Black" },
-            ]}
+            options={fontWeightOptions}
             onChange={(v) => updateTerminalSetting("fontWeight", parseInt(v))}
             className="w-40"
           />
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-font-weight-bold"
           label={t("settings.terminal.font.weightBold")}
           description={t("settings.terminal.font.weightBold.desc")}
         >
           <Select
             value={String(terminalSettings.fontWeightBold)}
-            options={[
-              { value: "100", label: "100 - Thin" },
-              { value: "200", label: "200 - Extra Light" },
-              { value: "300", label: "300 - Light" },
-              { value: "400", label: "400 - Normal" },
-              { value: "500", label: "500 - Medium" },
-              { value: "600", label: "600 - Semi Bold" },
-              { value: "700", label: "700 - Bold" },
-              { value: "800", label: "800 - Extra Bold" },
-              { value: "900", label: "900 - Black" },
-            ]}
+            options={fontWeightOptions}
             onChange={(v) => updateTerminalSetting("fontWeightBold", parseInt(v))}
             className="w-40"
           />
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-font-smoothing"
+          label={t("settings.terminal.font.smoothing")}
+          description={t("settings.terminal.font.smoothing.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.fontSmoothing}
+            onChange={(v) => updateTerminalSetting("fontSmoothing", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-font-line-padding"
           label={t("settings.terminal.font.linePadding")}
           description={t("settings.terminal.font.linePadding.desc")}
         >
@@ -572,7 +613,7 @@ export default function SettingsTerminalTab(props: {
           </div>
         </SettingRow>
 
-        <SettingRow label={t("settings.terminal.font.emulationType")}>
+        <SettingRow anchorId="terminal-emulation-type" label={t("settings.terminal.font.emulationType")}>
           <Select
             value={terminalSettings.terminalEmulationType}
             options={[
@@ -590,7 +631,7 @@ export default function SettingsTerminalTab(props: {
 
       <SectionHeader title={t("settings.terminal.section.cursor")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
-        <SettingRow label={t("settings.terminal.cursor.style")}>
+        <SettingRow anchorId="terminal-cursor-style" label={t("settings.terminal.cursor.style")}>
           <Select
             value={terminalSettings.cursorShape}
             options={[
@@ -603,10 +644,21 @@ export default function SettingsTerminalTab(props: {
           />
         </SettingRow>
 
-        <SettingRow label={t("settings.terminal.cursor.blink")}>
+        <SettingRow anchorId="terminal-cursor-blink" label={t("settings.terminal.cursor.blink")}>
           <Toggle
             checked={terminalSettings.cursorBlink}
             onChange={(v) => updateTerminalSetting("cursorBlink", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-cursor-highlight-line"
+          label={t("settings.terminal.cursor.highlightLine")}
+          description={t("settings.terminal.cursor.highlightLine.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.highlightCursorLine}
+            onChange={(v) => updateTerminalSetting("highlightCursorLine", v)}
           />
         </SettingRow>
       </div>
@@ -614,22 +666,35 @@ export default function SettingsTerminalTab(props: {
       <SectionHeader title={t("settings.terminal.section.keyboard")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-alt-as-meta"
           label={t("settings.terminal.keyboard.altAsMeta")}
           description={t("settings.terminal.keyboard.altAsMeta.desc")}
         >
           <Toggle checked={terminalSettings.altAsMeta} onChange={(v) => updateTerminalSetting("altAsMeta", v)} />
         </SettingRow>
         <SettingRow
+          anchorId="terminal-option-arrow-word-jump"
           label={t("settings.terminal.keyboard.optionArrowWordJump")}
           description={t("settings.terminal.keyboard.optionArrowWordJump.desc")}
         >
           <Toggle checked={terminalSettings.optionArrowWordJump} onChange={(v) => updateTerminalSetting("optionArrowWordJump", v)} />
+        </SettingRow>
+        <SettingRow
+          anchorId="terminal-kitty-protocol"
+          label={t("settings.terminal.keyboard.kittyProtocol")}
+          description={t("settings.terminal.keyboard.kittyProtocol.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.kittyKeyboardProtocolEnabled}
+            onChange={(v) => updateTerminalSetting("kittyKeyboardProtocolEnabled", v)}
+          />
         </SettingRow>
       </div>
 
       <SectionHeader title={t("settings.terminal.section.accessibility")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-min-contrast"
           label={t("settings.terminal.accessibility.minimumContrastRatio")}
           description={t("settings.terminal.accessibility.minimumContrastRatio.desc")}
         >
@@ -658,8 +723,35 @@ export default function SettingsTerminalTab(props: {
         updateTerminalSetting={updateTerminalSetting}
       />
 
+      <SectionHeader title={t("settings.terminal.section.sidePanel")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          anchorId="terminal-side-panel-auto-open"
+          label={t("settings.terminal.sidePanel.autoOpen")}
+          description={t("settings.terminal.sidePanel.autoOpen.desc")}
+        >
+          <Toggle checked={terminalSidePanelAutoOpen} onChange={setTerminalSidePanelAutoOpen} />
+        </SettingRow>
+
+        <SettingRow
+          label={t("settings.terminal.sidePanel.autoOpenPane")}
+          description={t("settings.terminal.sidePanel.autoOpenPane.desc")}
+        >
+          <Select
+            value={terminalSidePanelAutoOpenTab}
+            options={TERMINAL_SIDE_PANEL_AUTO_OPEN_TABS.map((tab) => ({
+              value: tab,
+              label: t(`settings.terminal.sidePanel.pane.${tab}`),
+            }))}
+            onChange={(value) => setTerminalSidePanelAutoOpenTab(value as TerminalSidePanelAutoOpenTab)}
+            disabled={!terminalSidePanelAutoOpen}
+            className="w-36"
+          />
+        </SettingRow>
+      </div>
+
       <SectionHeader title={t("settings.terminal.section.keywordHighlight")} />
-      <div className="rounded-lg border bg-card p-4">
+      <SettingsAnchor anchorId="terminal-keyword-highlight" className="rounded-lg border bg-card p-4">
         <div className="flex items-center justify-between mb-4">
           <span className="text-sm font-medium">
             {t("settings.terminal.keywordHighlight.title")}
@@ -675,11 +767,12 @@ export default function SettingsTerminalTab(props: {
             onChange={(rules) => updateTerminalSetting("keywordHighlightRules", rules)}
           />
         )}
-      </div>
+      </SettingsAnchor>
 
       <SectionHeader title={t("settings.terminal.section.localShell")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-local-shell"
           label={t("settings.terminal.localShell.shell")}
           description={t("settings.terminal.localShell.shell.desc")}
         >
@@ -771,6 +864,27 @@ export default function SettingsTerminalTab(props: {
       <SectionHeader title={t("settings.terminal.section.connection")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-verify-host-keys"
+          label={t("settings.terminal.connection.verifyHostKeys")}
+          description={t("settings.terminal.connection.verifyHostKeys.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.verifyHostKeys}
+            onChange={(v) => updateTerminalSetting("verifyHostKeys", v)}
+          />
+        </SettingRow>
+        <SettingRow
+          anchorId="terminal-ssh-auto-reconnect"
+          label={t("settings.terminal.connection.sshAutoReconnectEnabled")}
+          description={t("settings.terminal.connection.sshAutoReconnectEnabled.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.sshAutoReconnectEnabled}
+            onChange={(v) => updateTerminalSetting("sshAutoReconnectEnabled", v)}
+          />
+        </SettingRow>
+        <SettingRow
+          anchorId="terminal-keepalive-interval"
           label={t("settings.terminal.connection.keepaliveInterval")}
           description={t("settings.terminal.connection.keepaliveInterval.desc")}
         >
@@ -807,6 +921,7 @@ export default function SettingsTerminalTab(props: {
           />
         </SettingRow>
         <SettingRow
+          anchorId="terminal-x11-display"
           label={t("settings.terminal.connection.x11Display")}
           description={t("settings.terminal.connection.x11Display.desc")}
         >
@@ -822,6 +937,32 @@ export default function SettingsTerminalTab(props: {
       <SectionHeader title={t("settings.terminal.section.serverStats")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          label={t("settings.terminal.hostInfoBar.show")}
+          description={t("settings.terminal.hostInfoBar.show.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.showHostInfoBar}
+            onChange={(v) => updateTerminalSetting("showHostInfoBar", v)}
+          />
+        </SettingRow>
+        {terminalSettings.showHostInfoBar && (
+          <SettingRow
+            label={t("settings.terminal.hostInfoBar.titleMode")}
+            description={t("settings.terminal.hostInfoBar.titleMode.desc")}
+          >
+            <Select
+              value={terminalSettings.hostInfoBarTitleMode ?? "address"}
+              options={[
+                { value: "address", label: t("settings.terminal.hostInfoBar.titleMode.address") },
+                { value: "label", label: t("settings.terminal.hostInfoBar.titleMode.label") },
+              ]}
+              onChange={(v) => updateTerminalSetting("hostInfoBarTitleMode", v as HostInfoBarTitleMode)}
+              className="w-44"
+            />
+          </SettingRow>
+        )}
+        <SettingRow
+          anchorId="terminal-server-stats-show"
           label={t("settings.terminal.serverStats.show")}
           description={t("settings.terminal.serverStats.show.desc")}
         >
@@ -856,9 +997,98 @@ export default function SettingsTerminalTab(props: {
         )}
       </div>
 
+      <SectionHeader title={t("settings.terminal.section.systemManager")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          label={t("settings.terminal.systemManager.processRefreshInterval")}
+          description={t("settings.terminal.systemManager.processRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={2}
+              max={60}
+              value={terminalSettings.systemManagerProcessRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 3;
+                if (val >= 2 && val <= 60) {
+                  updateTerminalSetting("systemManagerProcessRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.systemManager.tmuxRefreshInterval")}
+          description={t("settings.terminal.systemManager.tmuxRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={2}
+              max={60}
+              value={terminalSettings.systemManagerTmuxRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 3;
+                if (val >= 2 && val <= 60) {
+                  updateTerminalSetting("systemManagerTmuxRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.systemManager.dockerListRefreshInterval")}
+          description={t("settings.terminal.systemManager.dockerListRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={3}
+              max={120}
+              value={terminalSettings.systemManagerDockerListRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 5;
+                if (val >= 3 && val <= 120) {
+                  updateTerminalSetting("systemManagerDockerListRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.systemManager.dockerStatsRefreshInterval")}
+          description={t("settings.terminal.systemManager.dockerStatsRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={2}
+              max={60}
+              value={terminalSettings.systemManagerDockerStatsRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 3;
+                if (val >= 2 && val <= 60) {
+                  updateTerminalSetting("systemManagerDockerStatsRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+      </div>
+
       <SectionHeader title={t("settings.terminal.section.rendering")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-renderer"
           label={t("settings.terminal.rendering.renderer")}
           description={t("settings.terminal.rendering.renderer.desc")}
         >
@@ -873,11 +1103,226 @@ export default function SettingsTerminalTab(props: {
             className="w-32"
           />
         </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.rendering.hibernateHiddenTabs")}
+          description={t("settings.terminal.rendering.hibernateHiddenTabs.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.hibernateHiddenTabs}
+            onChange={(v) => updateTerminalSetting("hibernateHiddenTabs", v)}
+          />
+        </SettingRow>
+        {terminalSettings.hibernateHiddenTabs && (
+          <>
+          <SettingRow
+            label={t("settings.terminal.rendering.hibernateHiddenTabsDelay")}
+            description={t("settings.terminal.rendering.hibernateHiddenTabsDelay.desc")}
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={5}
+                max={600}
+                value={terminalSettings.hibernateHiddenTabsDelaySec}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(val) && val >= 5 && val <= 600) {
+                    updateTerminalSetting("hibernateHiddenTabsDelaySec", val);
+                  }
+                }}
+                className="w-20"
+              />
+              <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+            </div>
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.rendering.hibernateSkipAltScreen")}
+            description={t("settings.terminal.rendering.hibernateSkipAltScreen.desc")}
+          >
+            <Toggle
+              checked={terminalSettings.hibernateSkipAltScreen}
+              onChange={(v) => updateTerminalSetting("hibernateSkipAltScreen", v)}
+            />
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.rendering.hibernateKeepRendererCount")}
+            description={t("settings.terminal.rendering.hibernateKeepRendererCount.desc")}
+          >
+            <Input
+              type="number"
+              min={0}
+              max={12}
+              value={terminalSettings.hibernateKeepRendererCount}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10);
+                if (!Number.isNaN(val) && val >= 0 && val <= 12) {
+                  updateTerminalSetting("hibernateKeepRendererCount", val);
+                }
+              }}
+              className="w-20"
+            />
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.rendering.hibernateReplayChunkBytes")}
+            description={t("settings.terminal.rendering.hibernateReplayChunkBytes.desc")}
+          >
+            <Input
+              type="number"
+              min={4096}
+              max={65536}
+              step={1024}
+              value={terminalSettings.hibernateReplayChunkBytes}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10);
+                if (!Number.isNaN(val) && val >= 4096 && val <= 65536) {
+                  updateTerminalSetting("hibernateReplayChunkBytes", val);
+                }
+              }}
+              className="w-28"
+            />
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.rendering.hibernatePreferWasmSerialize")}
+            description={t("settings.terminal.rendering.hibernatePreferWasmSerialize.desc")}
+          >
+            <Toggle
+              checked={terminalSettings.hibernatePreferWasmSerialize}
+              onChange={(v) => updateTerminalSetting("hibernatePreferWasmSerialize", v)}
+            />
+          </SettingRow>
+          </>
+        )}
+      </div>
+
+      <SectionHeader title={t("settings.terminal.section.inlineImages")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          anchorId="terminal-inline-images-enabled"
+          label={t("settings.terminal.inlineImages.enabled")}
+          description={t("settings.terminal.inlineImages.enabled.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.inlineImagesEnabled}
+            onChange={(v) => updateTerminalSetting("inlineImagesEnabled", v)}
+          />
+        </SettingRow>
+        {terminalSettings.inlineImagesEnabled && (
+          <>
+          <SettingRow
+            label={t("settings.terminal.inlineImages.kitty")}
+            description={t("settings.terminal.inlineImages.kitty.desc")}
+          >
+            <Toggle
+              checked={terminalSettings.inlineImageKittyEnabled}
+              onChange={(v) => updateTerminalSetting("inlineImageKittyEnabled", v)}
+            />
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.inlineImages.sixel")}
+            description={t("settings.terminal.inlineImages.sixel.desc")}
+          >
+            <Toggle
+              checked={terminalSettings.inlineImageSixelEnabled}
+              onChange={(v) => updateTerminalSetting("inlineImageSixelEnabled", v)}
+            />
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.inlineImages.iip")}
+            description={t("settings.terminal.inlineImages.iip.desc")}
+          >
+            <Toggle
+              checked={terminalSettings.inlineImageIipEnabled}
+              onChange={(v) => updateTerminalSetting("inlineImageIipEnabled", v)}
+            />
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.inlineImages.storageLimit")}
+            description={t("settings.terminal.inlineImages.storageLimit.desc")}
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MIN}
+                max={TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MAX}
+                value={terminalSettings.inlineImageStorageLimitMb}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (
+                    !Number.isNaN(val)
+                    && val >= TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MIN
+                    && val <= TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MAX
+                  ) {
+                    updateTerminalSetting("inlineImageStorageLimitMb", val);
+                  }
+                }}
+                className="w-20"
+              />
+              <span className="text-sm text-muted-foreground">{t("settings.terminal.inlineImages.unit.mb")}</span>
+            </div>
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.inlineImages.maxMegapixels")}
+            description={t("settings.terminal.inlineImages.maxMegapixels.desc")}
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_MIN}
+                max={TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_MAX}
+                value={terminalSettings.inlineImageMaxMegapixels}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (
+                    !Number.isNaN(val)
+                    && val >= TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_MIN
+                    && val <= TERMINAL_INLINE_IMAGE_MAX_MEGAPIXELS_MAX
+                  ) {
+                    updateTerminalSetting("inlineImageMaxMegapixels", val);
+                  }
+                }}
+                className="w-20"
+              />
+              <span className="text-sm text-muted-foreground">{t("settings.terminal.inlineImages.unit.megapixels")}</span>
+            </div>
+          </SettingRow>
+          <SettingRow
+            label={t("settings.terminal.inlineImages.sequenceLimit")}
+            description={t("settings.terminal.inlineImages.sequenceLimit.desc")}
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_MIN}
+                max={TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_MAX}
+                value={terminalSettings.inlineImageSequenceLimitMb}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (
+                    !Number.isNaN(val)
+                    && val >= TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_MIN
+                    && val <= TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_MAX
+                  ) {
+                    updateTerminalSetting("inlineImageSequenceLimitMb", val);
+                  }
+                }}
+                className="w-20"
+              />
+              <span className="text-sm text-muted-foreground">{t("settings.terminal.inlineImages.unit.mb")}</span>
+            </div>
+          </SettingRow>
+          {terminalSettings.hibernateHiddenTabs && (
+            <div className="py-3 text-xs text-muted-foreground">
+              {t("settings.terminal.inlineImages.hibernateNote")}
+            </div>
+          )}
+          </>
+        )}
       </div>
       {/* Autocomplete */}
       <SectionHeader title={t("settings.terminal.section.workspaceFocus")} />
-      <div className="space-y-1">
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-workspace-focus-style"
           label={t("settings.terminal.workspaceFocus.style")}
           description={t("settings.terminal.workspaceFocus.style.desc")}
         >
@@ -888,6 +1333,7 @@ export default function SettingsTerminalTab(props: {
               { value: 'dim', label: t("settings.terminal.workspaceFocus.dim") },
               { value: 'border', label: t("settings.terminal.workspaceFocus.border") },
             ]}
+            className="w-40"
           />
         </SettingRow>
       </div>
@@ -895,6 +1341,7 @@ export default function SettingsTerminalTab(props: {
       <SectionHeader title={t("settings.terminal.section.autocomplete")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-autocomplete-enabled"
           label={t("settings.terminal.autocomplete.enabled")}
           description={t("settings.terminal.autocomplete.enabled.desc")}
         >
@@ -921,6 +1368,54 @@ export default function SettingsTerminalTab(props: {
             checked={terminalSettings.autocompletePopupMenu}
             onChange={handleAutocompletePopupMenuChange}
             disabled={!terminalSettings.autocompleteEnabled}
+          />
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.autocomplete.historyScope")}
+          description={t("settings.terminal.autocomplete.historyScope.desc")}
+        >
+          <Select
+            value={terminalSettings.autocompleteHistoryScope ?? "host"}
+            onChange={(v) =>
+              updateTerminalSetting(
+                "autocompleteHistoryScope",
+                v as AutocompleteHistoryScope,
+              )
+            }
+            options={[
+              {
+                value: "host",
+                label: t("settings.terminal.autocomplete.historyScope.host"),
+              },
+              {
+                value: "global",
+                label: t("settings.terminal.autocomplete.historyScope.global"),
+              },
+            ]}
+            className="w-48"
+            disabled={!terminalSettings.autocompleteEnabled}
+          />
+        </SettingRow>
+      </div>
+
+      <SectionHeader title={t("settings.terminal.section.passwordPromptAssist")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          anchorId="terminal-password-prompt-assist"
+          label={t("settings.terminal.passwordPromptAssist.mode")}
+          description={t("settings.terminal.passwordPromptAssist.mode.desc")}
+        >
+          <Select
+            value={terminalSettings.passwordPromptAssist ?? "hint"}
+            onChange={(v) =>
+              updateTerminalSetting("passwordPromptAssist", v as PasswordPromptAssistMode)
+            }
+            options={[
+              { value: "off", label: t("settings.terminal.passwordPromptAssist.off") },
+              { value: "hint", label: t("settings.terminal.passwordPromptAssist.hint") },
+              { value: "picker", label: t("settings.terminal.passwordPromptAssist.picker") },
+            ]}
+            className="w-48"
           />
         </SettingRow>
       </div>
@@ -1005,3 +1500,5 @@ export default function SettingsTerminalTab(props: {
     </SettingsTabContent>
   );
 }
+
+export default React.memo(SettingsTerminalTab);

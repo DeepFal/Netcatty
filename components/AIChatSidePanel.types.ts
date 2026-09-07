@@ -10,7 +10,9 @@ import type {
   ProviderConfig,
   WebSearchConfig,
 } from '../infrastructure/ai/types';
+import type { AIQuickMessage } from '../infrastructure/ai/quickMessages';
 import type { ExecutorContext } from '../infrastructure/ai/cattyAgent/executor';
+import type { Host, Snippet, VaultNote } from '../types';
 
 // -------------------------------------------------------------------
 // Props
@@ -48,6 +50,10 @@ export interface AIChatSidePanelProps {
     messageId: string,
     updater: (msg: ChatMessage) => ChatMessage,
   ) => void;
+  persistContextCompaction: (
+    sessionId: string,
+    compaction: import('../infrastructure/ai/types').AISessionContextCompaction,
+  ) => void;
   // Provider config
   providers: ProviderConfig[];
   activeProviderId: string;
@@ -62,21 +68,31 @@ export interface AIChatSidePanelProps {
   setAgentModel: (agentId: string, modelId: string) => void;
   agentProviderMap: Record<string, string>;
   setAgentProvider: (agentId: string, providerId: string) => void;
+  agentThinkingMap: Record<string, string>;
+  setAgentThinking: (agentId: string, thinkingLevel: string) => void;
+  updateProvider?: (id: string, updates: Partial<ProviderConfig>) => void;
 
   // Safety
   globalPermissionMode: AIPermissionMode;
   setGlobalPermissionMode?: (mode: AIPermissionMode) => void;
   commandBlocklist?: string[];
+  commandTimeout?: number;
+  responseIdleTimeout?: number;
   maxIterations?: number;
 
   // Web search
   webSearchConfig?: WebSearchConfig | null;
+
+  // Quick messages (slash prompts)
+  quickMessages?: AIQuickMessage[];
 
   // Context
   scopeType: 'terminal' | 'workspace';
   scopeTargetId?: string;
   scopeHostIds?: string[];
   scopeLabel?: string;
+  /** Workspace focused pane; preferred when inheriting AI chat after merge. */
+  focusedSessionId?: string;
 
   // Terminal session context (from parent)
   terminalSessions?: Array<{
@@ -99,6 +115,15 @@ export interface AIChatSidePanelProps {
 
   // Visibility
   isVisible?: boolean;
+
+  // Vault artifact navigation (from AI chat tool results)
+  notes?: VaultNote[];
+  hosts?: Host[];
+  snippets?: Snippet[];
+  onOpenVaultNote?: (noteId: string) => void;
+  onOpenVaultHost?: (hostId: string) => void;
+  onOpenVaultSnippet?: (snippetId: string) => void;
+  onOpenVaultSection?: (section: 'notes' | 'hosts' | 'snippets') => void;
 }
 
 // -------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import React from 'react';
 import { ChevronRight, CornerUpLeft, Folder, FolderOpen, Loader2 } from 'lucide-react';
 import type { SftpFileEntry } from '../../types';
-import { formatBytes, formatDate, getFileIcon, isNavigableDirectory } from './utils';
+import { formatBytes, formatDate, getFileIcon, isNavigableDirectory, type SftpColumnVisibility } from './utils';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { cn } from '../../lib/utils';
 
@@ -16,6 +16,7 @@ interface TreeNodeProps {
   entryPath: string;
   depth: number;
   columnTemplate: string;
+  visibleColumns: SftpColumnVisibility;
   isSelected: boolean;
   isExpanded: boolean;
   isLoading: boolean;
@@ -34,7 +35,7 @@ interface TreeNodeProps {
 export const TREE_ROW_HEIGHT = 28;
 
 export const TreeNode = React.memo<TreeNodeProps>(({
-  entry, entryPath, depth, columnTemplate, isSelected,
+  entry, entryPath, depth, columnTemplate, visibleColumns, isSelected,
   isExpanded, isLoading, isDragOver,
   onToggleExpand, onNodeClick, onOpenEntry, onDragStart, onDragEnd,
   onDragOverEntry, onDropEntry, onDragLeaveEntry,
@@ -51,6 +52,12 @@ export const TreeNode = React.memo<TreeNodeProps>(({
 
   return (
     <div
+      data-section="terminal-sftp-tree-row"
+      data-entry-name={entry.name}
+      data-entry-type={isDir ? 'directory' : entry.type}
+      data-selected={isSelected ? 'true' : 'false'}
+      data-expanded={isDir ? (isExpanded ? 'true' : 'false') : undefined}
+      data-drag-over={isDragOver ? 'true' : 'false'}
       className={cn(
         'grid items-center gap-x-1 px-2 cursor-pointer select-none text-sm',
         isSelected
@@ -60,11 +67,7 @@ export const TreeNode = React.memo<TreeNodeProps>(({
       )}
       style={{ gridTemplateColumns: columnTemplate, height: TREE_ROW_HEIGHT }}
       onClick={e => onNodeClick(entry, entryPath, e)}
-      onDoubleClick={() => {
-        if (isParentEntry) { onOpenEntry(entry, entryPath); return; }
-        if (isDir) void onToggleExpand(entry, entryPath);
-        else onOpenEntry(entry, entryPath);
-      }}
+      onDoubleClick={() => onOpenEntry(entry, entryPath)}
       onContextMenu={e => {
         if (!isParentEntry) {
           onContextMenu(entry, entryPath, e);
@@ -99,15 +102,26 @@ export const TreeNode = React.memo<TreeNodeProps>(({
         {!isParentEntry && <span className="shrink-0">{icon}</span>}
         <span className="min-w-0 flex-1 truncate">{entry.name}</span>
       </div>
-      <span className="min-w-0 text-muted-foreground text-xs truncate">
-        {isParentEntry ? '' : formatDate(entry.lastModified)}
-      </span>
-      <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
-        {isParentEntry ? '' : (isDir ? '--' : formatBytes(entry.size ?? 0))}
-      </span>
-      <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
-        {isParentEntry ? '' : (isDir ? t('sftp.kind.folder') : (entry.name.split('.').pop()?.toUpperCase() ?? '--'))}
-      </span>
+      {visibleColumns.modified && (
+        <span className="min-w-0 text-muted-foreground text-xs truncate">
+          {isParentEntry ? '' : formatDate(entry.lastModified)}
+        </span>
+      )}
+      {visibleColumns.size && (
+        <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
+          {isParentEntry ? '' : (isDir ? '--' : formatBytes(entry.size ?? 0))}
+        </span>
+      )}
+      {visibleColumns.type && (
+        <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
+          {isParentEntry ? '' : (isDir ? t('sftp.kind.folder') : (entry.name.split('.').pop()?.toUpperCase() ?? '--'))}
+        </span>
+      )}
+      {visibleColumns.owner && (
+        <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
+          {isParentEntry ? '' : (entry.owner || '--')}
+        </span>
+      )}
     </div>
   );
 });

@@ -1,24 +1,50 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import React, { Suspense, lazy } from 'react';
+import React, { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Download, Trash2 } from 'lucide-react';
-import { activeTabStore, toEditorTabId } from '../state/activeTabStore';
+import { activeTabStore, toEditorTabId, useIsEditorTabActive } from '../state/activeTabStore';
 import { editorTabStore } from '../state/editorTabStore';
 import { releaseEditorTabSaveCoordinator, saveEditorTab } from '../state/editorTabSave';
+import { useTerminalHostTreeLayoutWidth } from '../state/terminalHostTreeStore';
 import { TopTabs } from '../../components/TopTabs';
 import { VaultView } from '../../components/VaultView';
 import { QuickAddSnippetDialog } from '../../components/QuickAddSnippetDialog';
+import { QuickScriptEditorDialog } from '../../components/scripts/QuickScriptEditorDialog';
 import { AddToWorkspaceDialog } from '../../components/workspace/AddToWorkspaceDialog';
 import { KeyboardInteractiveModal } from '../../components/KeyboardInteractiveModal';
 import { PassphraseModal } from '../../components/PassphraseModal';
-import { TextEditorTabView } from '../../components/editor/TextEditorTabView';
-import { UnsavedChangesProvider } from '../../components/editor/UnsavedChangesDialog';
+import { UnsavedChangesProvider, promptUnsavedChanges } from '../../components/editor/UnsavedChangesDialog';
 import { SnippetExecutionProvider } from '../../components/SnippetExecutionProvider';
 import { Button } from '../../components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../../components/ui/dialog';
 import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
+import { LazyLoadBoundary } from '../../components/ui/lazy-load-boundary';
 import { toast } from '../../components/ui/toast';
-import { cn } from '../../lib/utils';
+import { AppHostTreeLayer } from './AppHostTreeLayer';
+import { AppHostEditorLayer } from './AppHostEditorLayer';
+import { AppPluginKeybindingHost } from './AppPluginKeybindingHost';
+import { shouldOpenHostEditOnWorkSurface } from './workTabSurface';
+import { useConnectionLogsStore } from '../state/connectionLogsStore';
+import {
+  useSettingsChromeActions,
+  useSettingsChromeStore,
+} from '../state/settingsChromeStore';
+import { getAppAppLockRuntime, useAppLockChrome } from '../state/appRuntimeBridge';
+import { useAppThemeStyle } from './useAppThemeStyle';
+import { useMainWindowInputFocusRecovery } from '../state/useMainWindowInputFocusRecovery';
+import { useExternalMcpToggleState } from '../state/useExternalMcpToggleState';
+import { selectPluginThemeTokens } from '../state/pluginContributionEnvironment';
+import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
+import { resolveEffectiveTerminalHost } from '../../domain/terminalHostResolution';
+import { getAvailablePaneMagnificationController } from '../../domain/paneMagnification';
+import { pluginViewTabStore, usePluginViewTabs } from '../state/pluginViewTabStore';
+import { buildPluginSettingScopeCatalog } from '../state/usePluginSettingScopeCatalog';
+import { useWorkSurfaceHostEditor } from '../state/useWorkSurfaceHostEditor';
+import {
+  appViewDomainsEqual,
+  mergeAppViewDomains,
+  type AppViewDomains,
+} from './appViewDomains';
 
 const LazyProtocolSelectDialog = lazy(() => import('../../components/ProtocolSelectDialog'));
 const LazyQuickSwitcher = lazy(() =>
@@ -27,86 +53,445 @@ const LazyQuickSwitcher = lazy(() =>
 const LazyCreateWorkspaceDialog = lazy(() =>
   import('../../components/CreateWorkspaceDialog').then((m) => ({ default: m.CreateWorkspaceDialog })),
 );
+const LazyTextEditorTabView = lazy(() =>
+  import('../../components/editor/TextEditorTabView').then((m) => ({ default: m.TextEditorTabView })),
+);
 
-type AppViewContext = Record<string, any>;
+const TextEditorTabFallback = ({ tabId }: { tabId: string }) => {
+  const isVisible = useIsEditorTabActive(tabId);
+  const hostTreeLayoutWidth = useTerminalHostTreeLayoutWidth();
+  return (
+    <div
+      style={{
+        ...(isVisible ? null : { pointerEvents: 'none', visibility: 'hidden' }),
+        zIndex: 20,
+        left: hostTreeLayoutWidth,
+      }}
+      className="netcatty-lazy-fade-in absolute top-0 right-0 bottom-0 min-h-0 flex flex-col bg-background"
+      aria-hidden="true"
+    />
+  );
+};
 
-export function AppView({ ctx }: { ctx: AppViewContext }) {
+/** Local draft so keystrokes do not rebuild App chrome domain every character. */
+function RenameDraftDialog({
+  open,
+  inputId,
+  initialName,
+  title,
+  nameLabel,
+  placeholder,
+  cancelLabel,
+  saveLabel,
+  onCancel,
+  onSave,
+}: {
+  open: boolean;
+  inputId: string;
+  initialName: string;
+  title: string;
+  nameLabel: string;
+  placeholder: string;
+  cancelLabel: string;
+  saveLabel: string;
+  onCancel: () => void;
+  onSave: (name: string) => void;
+}) {
+  const [draft, setDraft] = useState(initialName);
+  useEffect(() => {
+    if (open) setDraft(initialName);
+  }, [open, initialName]);
+
+  return (
+    <Dialog open={open} onOpenChange={(nextOpen) => {
+      if (!nextOpen) onCancel();
+    }}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-2 py-2">
+          <Label htmlFor={inputId}>{nameLabel}</Label>
+          <Input
+            id={inputId}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return;
+              if (!draft.trim()) return;
+              onSave(draft);
+            }}
+            autoFocus
+            placeholder={placeholder}
+          />
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onCancel}>{cancelLabel}</Button>
+          <Button onClick={() => onSave(draft)} disabled={!draft.trim()}>{saveLabel}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+/**
+ * Applies app theme CSS vars to the vault surface. Subscribing here (instead of
+ * in AppView) keeps accent-picker drags from rebuilding the whole shell; the
+ * `children` element identity is unchanged so VaultView bails out.
+ */
+function AppVaultThemeSurface({
+  VaultViewContainer,
+  children,
+}: {
+  VaultViewContainer: React.ComponentType<any>;
+  children: React.ReactNode;
+}) {
+  const appThemeStyle = useAppThemeStyle();
+  return (
+    <VaultViewContainer appThemeStyle={appThemeStyle}>
+      {children}
+    </VaultViewContainer>
+  );
+}
+
+/** Plugin keybinding host with locally derived theme tokens and locale. */
+function AppPluginKeybindingThemeHost({
+  sessions,
+  workspaces,
+}: {
+  sessions: any[];
+  workspaces: any[];
+}) {
+  const appThemeStyle = useAppThemeStyle();
+  const { resolvedTheme, uiLanguage } = useSettingsChromeStore();
+  const pluginThemeTokens = useMemo(
+    () => selectPluginThemeTokens(appThemeStyle as Record<string, unknown>),
+    [appThemeStyle],
+  );
+  return (
+    <AppPluginKeybindingHost
+      locale={uiLanguage}
+      theme={resolvedTheme}
+      themeTokens={pluginThemeTokens}
+      sessions={sessions}
+      workspaces={workspaces}
+    />
+  );
+}
+
+/**
+ * Log replay surface reads the latest log body from connectionLogsStore, so
+ * terminal-data appends never touch the App domain bags.
+ */
+function AppLogViewSurface({
+  LogViewWrapper,
+  logView,
+  defaultTerminalTheme,
+  defaultFontSize,
+  onClose,
+}: {
+  LogViewWrapper: React.ComponentType<any>;
+  logView: any;
+  defaultTerminalTheme: any;
+  defaultFontSize: number;
+  onClose: () => void;
+}) {
+  const { connectionLogs, updateConnectionLog } = useConnectionLogsStore();
+  const latestLog =
+    connectionLogs.find((log) => log.id === logView.connectionLogId) ?? logView.log;
+  return (
+    <LogViewWrapper
+      logView={{ ...logView, log: latestLog }}
+      defaultTerminalTheme={defaultTerminalTheme}
+      defaultFontSize={defaultFontSize}
+      onClose={onClose}
+      onUpdateLog={updateConnectionLog}
+    />
+  );
+}
+
+export type AppViewProps = {
+  domains: AppViewDomains;
+};
+
+function AppViewInner({ domains }: AppViewProps) {
+  // Intentionally does NOT subscribe to activeTabId — leaf surfaces
+  // (TopTabs items, mounts, host tree, chrome, plugin keybindings) own that
+  // subscription so top-tab switches do not rebuild the App shell.
+  const pluginViewTabs = usePluginViewTabs();
+  // Merge domain slices once per AppView render. AppView only re-renders when a
+  // domain slice identity changes (see appViewDomainsEqual). Depend on the
+  // domain bag so the hook graph stays honest; bag identity only changes when
+  // App rebuilds a domain slice.
+  const ctx = useMemo(
+    () => mergeAppViewDomains(domains),
+    [domains],
+  ) as Record<string, any>;
   const {
-    accentMode, activeTabId, activeTerminalTheme, addShellHistoryEntry, addSessionToWorkspace, addToWorkspaceDialog, appendHostToWorkspace, appendLocalTerminalToWorkspace,
-    clearAndRemoveSource, clearAndRemoveSources, clearUnsavedConnectionLogs, closeLogView, closeSession, closeTabsBatch, closeWorkspace, copySessionWithCurrentShell,
-    connectionLogs, convertKnownHostToHost, createWorkspaceFromSessions, createWorkspaceFromTargets, createWorkspaceWithHosts, customAccent,
-    customGroups, currentTerminalTheme, deleteConnectionLog, draggingSessionId, effectiveKnownHosts, editorTabs, editorWordWrap, emptyVaultConflict,
-    followAppTerminalTheme, groupConfigs, handleAddKnownHost, handleConnectSerial, handleConnectToHost, handleCreateLocalTerminal, handleDeleteHost,
-    handleEndSessionDrag, handleHostConnectWithProtocolCheck, handleHotkeyAction, handleKeyboardInteractiveCancel, handleKeyboardInteractiveSubmit,
-    handleOpenQuickSwitcher, handleOpenSettings, handleRootContextMenu, handlePassphraseCancel, handlePassphraseSkip, handlePassphraseSubmit, handleProtocolSelect,
-    handleRequestCloseEditorTabRef, handleSessionStatusChange, handleSyncNowManual, handleTerminalDataCapture, handleToggleTheme, handleUpdateHostFromTerminal,
-    hostById, hosts, hotkeyScheme, identities, importOrReuseKey, isBroadcastEnabled, isCreateWorkspaceOpen, isMacClient, isQuickSwitcherOpen,
-    keyBindings, keyboardInteractiveQueue, keys, logViews, managedSources, navigateToSection, openLogView, orderedTabsWithEditors, orphanSessions,
-    passphraseQueue, protocolSelectHost, proxyProfiles, quickResults, quickSearch, reorderTabs, reorderWorkspaceSessions, resetSessionRename,
-    resetWorkspaceRename, resolveEmptyVaultConflict, resolvedTheme, runSnippet, sessionLogsDir, sessionLogsEnabled, sessionLogsFormat, sessionRenameTarget, sshDebugLogsEnabled,
-    sessionRenameValue, sessions, setActiveTabId, setAddToWorkspaceDialog, setDraggingSessionId, setEditorWordWrap, setIsCreateWorkspaceOpen, setIsQuickSwitcherOpen,
-    setNavigateToSection, setProtocolSelectHost, setQuickSearch, setSessionRenameValue, setTerminalFontFamilyId, setTerminalFontSize, setTerminalThemeId,
-    setWorkspaceFocusedSession, setWorkspaceRenameValue, settings, sftpAutoOpenSidebar, sftpAutoSync, sftpDefaultViewMode, sftpDoubleClickBehavior,
-    sftpShowHiddenFiles, sftpUseCompressedUpload, shellHistory, snippetPackages, snippets, splitSessionWithCurrentShell, startSessionRename,
-    startWorkspaceRename, submitSessionRename, submitWorkspaceRename, t, terminalFontFamilyId, terminalFontSize, terminalSettings, terminalThemeId,
-    toggleBroadcast, toggleConnectionLogSaved, toggleScriptsSidePanelRef, toggleSidePanelRef, toggleWorkspaceViewMode, unmanageSource, updateConnectionLog,
-    updateCustomGroups, updateGroupConfigs, updateHostDistro, updateHosts, updateIdentities, updateKeys, updateKnownHosts, updateManagedSources,
-    updateProxyProfiles, updateSnippetPackages, updateSnippets, updateSplitSizes, updateTerminalSetting, workspaceRenameTarget, workspaceRenameValue, workspaces,
+    resetSessionRename,
+    resetWorkspaceRename,
+    setAddToWorkspaceDialog,
+    setIsCreateWorkspaceOpen,
+    setIsQuickSwitcherOpen,
+    setProtocolSelectHost,
+    setQuickSearch,
+  } = ctx;
+
+  const dismissTransientOverlays = useCallback(() => {
+    setIsQuickSwitcherOpen(false);
+    setQuickSearch('');
+    setIsCreateWorkspaceOpen(false);
+    setProtocolSelectHost(null);
+    setAddToWorkspaceDialog(null);
+    resetSessionRename();
+    resetWorkspaceRename();
+  }, [
+    resetSessionRename,
+    resetWorkspaceRename,
+    setAddToWorkspaceDialog,
+    setIsCreateWorkspaceOpen,
+    setIsQuickSwitcherOpen,
+    setProtocolSelectHost,
+    setQuickSearch,
+  ]);
+
+  useMainWindowInputFocusRecovery({ onPageHidden: dismissTransientOverlays });
+
+  const {
+    addShellHistoryEntry, removeShellHistoryEntry, addSessionToWorkspace, addToWorkspaceDialog, appendHostToWorkspace, appendLocalTerminalToWorkspace,
+    clearAndRemoveSource, clearAndRemoveSources, closeLogView, closeSession, closeTabsBatch, closeWorkspace, commitPluginImporterData, commitVaultImportTransaction, commitVaultGroupMutation, copySessionToNewWindowWithCurrentShell, copySessionWithCurrentShell, duplicateSessionWithCurrentShell, copyWorkspaceWithCurrentShell,
+    convertKnownHostToHost, createWorkspaceFromSessions, createWorkspaceFromTargets, createWorkspaceWithHosts,
+    customGroups, currentTerminalTheme, deepLinkHostDraft, draggingSessionId, effectiveKnownHosts, editorTabs, editorWordWrap, emptyVaultConflict,
+    followAppTerminalTheme,
+    groupConfigs, handleAddKnownHost, handleConnectSerial, handleConnectToHost, handleCreateLocalTerminal, handleDefaultTerminalThemeChange, handleDeleteHost,
+    handleEndSessionDrag, handleFollowAppTerminalThemeChange, handleHostConnectWithProtocolCheck, handleHotkeyAction, handleKeyboardInteractiveCancel, handleKeyboardInteractiveSubmit,
+    handleOpenHostFromVaultNote, handleOpenQuickSwitcher, handleOpenSettings, handleOpenVaultHostFromChat, handleOpenVaultNoteFromChat, handleOpenVaultSectionFromChat, handleOpenVaultSnippetFromChat, handleRootContextMenu, handlePassphraseCancel, handlePassphraseSkip, handlePassphraseSubmit, handleProtocolSelect,
+    handleRequestCloseEditorTabRef, handleSessionStatusChange, handleSyncNowManual, handleTerminalDataCapture, handleUpdateHostFromTerminal,
+    hostById, hosts, terminalHosts, updateTerminalHosts, hotkeyScheme, identities, importOrReuseKey, isBroadcastEnabled, isGlobalBroadcastEnabled, onToggleGlobalBroadcast, canUseGlobalBroadcast, isCreateWorkspaceOpen, isMacClient, isQuickSwitcherOpen,
+    keyBindings, keyboardInteractiveQueue, keys, logViews, managedSources, navigateToSection, openLogView, openNoteRequest, orderedTabsWithEditors, orphanSessions,
+    passphraseQueue, protocolSelectHost, proxyProfiles, portForwardingRules, quickResults, quickSearch, removeSessionFromWorkspace, reorderWorkTabs, reorderWorkspaceSessions,
+    resolveEmptyVaultConflict, resolveSessionAppearance, runSnippet, sessionLogsDir, sessionLogsEnabled, sessionLogsFormat, sessionLogsTimestampsEnabled, sessionRenameTarget, sshDebugLogsEnabled,
+    sessions, setActiveTabId, setDeepLinkHostDraft, setDraggingSessionId, setEditorWordWrap,
+    setNavigateToSection, setTerminalFontFamilyId, setTerminalFontSize, setVaultFocusRequest, updateSessionFontSize, updateSessionRestoreCwd, updateSessionDynamicTitle, updateSessionCodingCliProvider, clearSessionFontSizeOverride,
+    setWorkspaceFocusedSession, sftpAutoOpenSidebar, sftpFollowTerminalCwd, setSftpFollowTerminalCwd, sftpAutoSync, sftpDefaultViewMode, sftpDoubleClickBehavior,
+    sftpShowHiddenFiles, sftpUseCompressedUpload, snippetPackages, snippets, splitSessionWithCurrentShell, startSessionRename,
+    startWorkspaceRename, submitSessionRename, submitWorkspaceRename, t, terminalFontFamilyId, terminalFontSize, terminalSettings, terminalThemeId, themeById,
+    toggleBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, terminalPaneMagnificationRef, sftpPaneMagnificationRef, toggleWorkspaceViewMode, unmanageSource,
+    readPersistedHosts, readPersistedManagedSources, updateCustomGroups, updateGroupConfigs, updateHostDistro, updateHosts, updateIdentities, updateKeys, updateKnownHosts, updateManagedSources,
+    updateProxyProfiles, updateSnippetPackages, updateSnippets, updateSplitSizes, updateTerminalSetting, vaultFocusRequest, workspaceRenameTarget, workspaces,
     VaultViewContainer, SftpViewMount, TerminalLayerMount, LogViewWrapper,
   } = ctx;
+
+  // Chrome-visible settings slice comes from settingsChromeStore, not from the
+  // App chrome domain bag — the whole `settings` object changes identity on
+  // every settings render and would rebuild the shell.
+  const {
+    theme: themePreference,
+    resolvedTheme,
+    windowOpacity,
+    showSftpTab,
+    showHostTreeSidebar,
+    showRecentHosts,
+    hostClickBehavior,
+    showOnlyUngroupedHostsInRoot,
+    dynamicTabTitleMode,
+    disableTerminalFontZoom,
+    restoreTerminalCwd,
+    terminalSidePanelAutoOpen,
+    terminalSidePanelAutoOpenTab,
+  } = useSettingsChromeStore();
+  const { setTheme, setWindowOpacity } = useSettingsChromeActions();
+
+  const paneMagnificationController = getAvailablePaneMagnificationController([
+    sftpPaneMagnificationRef?.current,
+    terminalPaneMagnificationRef?.current,
+  ]);
+  const paneMagnificationState = paneMagnificationController?.getState() ?? 'unavailable';
+  const handleMagnifyCurrentPane = () => {
+    getAvailablePaneMagnificationController([
+      sftpPaneMagnificationRef?.current,
+      terminalPaneMagnificationRef?.current,
+    ])?.focus();
+  };
+  const handleRestoreMagnifiedPane = () => {
+    getAvailablePaneMagnificationController([
+      sftpPaneMagnificationRef?.current,
+      terminalPaneMagnificationRef?.current,
+    ])?.restore();
+  };
+
+  // App Lock chrome: narrow slice published by AppLockRuntimePublisher; the
+  // lock action reads the full runtime imperatively so the callback stays
+  // stable across gate re-renders.
+  const { appLockEnabled } = useAppLockChrome();
+  const handleLockApp = useCallback(() => {
+    getAppAppLockRuntime()?.lockNow('manual');
+  }, []);
+
+  const handleTerminalCommandExecuted = useCallback((
+    command: string,
+    hostId: string,
+    hostLabel: string,
+    sessionId: string,
+  ) => {
+    addShellHistoryEntry({ command, hostId, hostLabel, sessionId });
+  }, [addShellHistoryEntry]);
+
+  const handleUpdateTerminalFontWeight = useCallback((weight: number) => {
+    updateTerminalSetting('fontWeight', weight);
+  }, [updateTerminalSetting]);
+
+  const handleRequestAddToWorkspace = useCallback((workspaceId: string) => {
+    setAddToWorkspaceDialog({ mode: 'append', workspaceId });
+  }, [setAddToWorkspaceDialog]);
+
+  const validProxyProfileIds = useMemo(
+    () => new Set(proxyProfiles.map((profile) => profile.id)),
+    [proxyProfiles],
+  );
+
+  const resolveWorkspaceAppendHost = useCallback((host: typeof hosts[number]) => (
+    resolveEffectiveTerminalHost({
+      host,
+      groupConfigs,
+      proxyProfiles,
+      validProxyProfileIds,
+    })
+  ), [groupConfigs, proxyProfiles, validProxyProfileIds]);
+
+  const handleAppendHostToWorkspace = useCallback((workspaceId: string, hostId: string) => {
+    const host = hosts.find((entry) => entry.id === hostId);
+    if (!host) return;
+    const ws = workspaces.find((entry) => entry.id === workspaceId);
+    if (!ws) return;
+    const rootDir = ws.root.type === 'split' ? ws.root.direction : 'vertical';
+    appendHostToWorkspace(workspaceId, resolveWorkspaceAppendHost(host), rootDir);
+  }, [appendHostToWorkspace, hosts, resolveWorkspaceAppendHost, workspaces]);
+
+  const isPeerSessionWindow = typeof window !== 'undefined'
+    && window.location.hash.startsWith('#/session-window');
+  const externalMcpToggle = useExternalMcpToggleState();
+  const handleWorkSurfaceHostSaved = useCallback((mode: 'new' | 'edit') => {
+    if (mode === 'edit') {
+      toast.success(t('terminal.layer.hostTree.hostSavedNextConnection'));
+    }
+  }, [t]);
+  const workSurfaceHostEditor = useWorkSurfaceHostEditor({
+    hosts,
+    onUpdateHosts: updateHosts,
+    onSaved: handleWorkSurfaceHostSaved,
+  });
+  const openWorkSurfaceHostEdit = workSurfaceHostEditor.openEdit;
+  const handleEditHostFromOverlay = useCallback((host: (typeof hosts)[number]) => {
+    if (shouldOpenHostEditOnWorkSurface(activeTabStore.getActiveTabId())) {
+      openWorkSurfaceHostEdit(host);
+      return;
+    }
+    setDeepLinkHostDraft(host);
+    setNavigateToSection('hosts');
+    setActiveTabId('vault');
+  }, [
+    openWorkSurfaceHostEdit,
+    setActiveTabId,
+    setDeepLinkHostDraft,
+    setNavigateToSection,
+  ]);
+  const handleCreateWorkSurfaceHostGroup = useCallback((groupPath: string) => {
+    updateCustomGroups(Array.from(new Set([...customGroups, groupPath])));
+  }, [customGroups, updateCustomGroups]);
+
+  const closePluginViewTab = useCallback((tabId: string) => {
+    const index = orderedTabsWithEditors.indexOf(tabId);
+    if (activeTabStore.getActiveTabId() === tabId) {
+      const next = orderedTabsWithEditors[index - 1] ?? orderedTabsWithEditors[index + 1] ?? 'vault';
+      activeTabStore.setActiveTabId(next === tabId ? 'vault' : next);
+    }
+    pluginViewTabStore.close(tabId);
+  }, [orderedTabsWithEditors]);
+
+  const orderedTabsWithEditorsRef = useRef(orderedTabsWithEditors);
+  orderedTabsWithEditorsRef.current = orderedTabsWithEditors;
+
+  // Stable for TopTabs memo: read ordered tabs via ref; prompt via module singleton.
+  const handleRequestCloseEditorTab = useCallback(async (id: string): Promise<boolean> => {
+    const tab = editorTabStore.getTab(id);
+    if (!tab) return false;
+
+    const closeEditorAndActivateNeighbor = () => {
+      const closingTabId = toEditorTabId(id);
+      const list = orderedTabsWithEditorsRef.current;
+      const idx = list.indexOf(closingTabId);
+      releaseEditorTabSaveCoordinator(id);
+      editorTabStore.close(id);
+      if (activeTabStore.getActiveTabId() !== closingTabId) return;
+      const next = list[idx - 1] ?? list[idx + 1] ?? 'vault';
+      activeTabStore.setActiveTabId(next === closingTabId ? 'vault' : next);
+    };
+
+    const dirty = tab.content !== tab.baselineContent;
+    if (!dirty) {
+      closeEditorAndActivateNeighbor();
+      return true;
+    }
+    const choice = await promptUnsavedChanges(tab.fileName);
+    if (choice === 'cancel') return false;
+    if (choice === 'discard') {
+      closeEditorAndActivateNeighbor();
+      return true;
+    }
+    if (choice === 'save') {
+      const ok = await saveEditorTab(id);
+      if (!ok) {
+        const msg = editorTabStore.getTab(id)?.saveError ?? 'Save failed';
+        toast.error(msg, 'SFTP');
+        return false;
+      }
+      const latest = editorTabStore.getTab(id);
+      if (!latest || latest.content !== latest.baselineContent) return false;
+      closeEditorAndActivateNeighbor();
+      return true;
+    }
+
+    return false;
+  }, []);
+
+  // Keep the hotkey ref current during render so Cmd/Ctrl+W never sees the
+  // App.tsx stub `() => false` between commit and useEffect.
+  handleRequestCloseEditorTabRef.current = handleRequestCloseEditorTab;
+
+  const handleSaveSessionRename = useCallback((name: string) => {
+    if (!sessionRenameTarget) return;
+    if (!name.trim()) return;
+    submitSessionRename(sessionRenameTarget.id, name);
+    resetSessionRename();
+  }, [resetSessionRename, sessionRenameTarget, submitSessionRename]);
+
+  const handleSaveWorkspaceRename = useCallback((name: string) => {
+    if (!workspaceRenameTarget) return;
+    if (!name.trim()) return;
+    submitWorkspaceRename(workspaceRenameTarget.id, name);
+    resetWorkspaceRename();
+  }, [resetWorkspaceRename, submitWorkspaceRename, workspaceRenameTarget]);
+
+  useEffect(() => {
+    const catalog = buildPluginSettingScopeCatalog({
+      hosts,
+      workspaces,
+      sessions,
+      deviceLabel: t('settings.plugins.thisDevice'),
+    });
+    void netcattyBridge.get()?.setPluginScopeCatalog?.(catalog).catch(() => {});
+  }, [hosts, sessions, t, workspaces]);
 
   return (
     <SnippetExecutionProvider>
     <UnsavedChangesProvider>
-      {({ prompt }) => {
-        // Helper: close an editor tab and activate the neighbor (left-preference), or vault.
-        const closeEditorAndActivateNeighbor = (id: string) => {
-          const closingTabId = toEditorTabId(id);
-          const list = orderedTabsWithEditors;
-          const idx = list.indexOf(closingTabId);
-          releaseEditorTabSaveCoordinator(id);
-          editorTabStore.close(id);
-          if (activeTabStore.getActiveTabId() !== closingTabId) return;
-          const next = list[idx - 1] ?? list[idx + 1] ?? 'vault';
-          activeTabStore.setActiveTabId(next === closingTabId ? 'vault' : next);
-        };
-
-        // Real dirty-confirm close handler.
-        const handleRequestCloseEditorTab = async (id: string) => {
-          const tab = editorTabStore.getTab(id);
-          if (!tab) return;
-          const dirty = tab.content !== tab.baselineContent;
-          if (!dirty) {
-            closeEditorAndActivateNeighbor(id);
-            return;
-          }
-          const choice = await prompt(tab.fileName);
-          if (choice === 'cancel') return;
-          if (choice === 'discard') {
-            closeEditorAndActivateNeighbor(id);
-            return;
-          }
-          if (choice === 'save') {
-            const ok = await saveEditorTab(id);
-            if (!ok) {
-              const msg = editorTabStore.getTab(id)?.saveError ?? 'Save failed';
-              toast.error(msg, 'SFTP');
-              return;
-            }
-            const latest = editorTabStore.getTab(id);
-            if (!latest || latest.content !== latest.baselineContent) return;
-            closeEditorAndActivateNeighbor(id);
-          }
-        };
-
-        // Expose to the hotkey dispatcher (Cmd/Ctrl+W).
-        handleRequestCloseEditorTabRef.current = handleRequestCloseEditorTab;
-
-        return (
-    <div className={cn("flex flex-col h-screen text-foreground font-sans netcatty-shell", activeTerminalTheme && "immersive-transition")} onContextMenu={handleRootContextMenu}>
+      {() => (
+    <div className="flex flex-col h-screen text-foreground font-sans netcatty-shell" data-terminal-appearance-root onContextMenu={handleRootContextMenu}>
       <TopTabs
         theme={resolvedTheme}
-        followAppTerminalTheme={followAppTerminalTheme}
+        themePreference={themePreference}
         hosts={hosts}
         sessions={sessions}
         orphanSessions={orphanSessions}
@@ -118,26 +503,88 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
         onCloseSession={closeSession}
         onRenameSession={startSessionRename}
         onCopySession={copySessionWithCurrentShell}
+        onDuplicateSession={duplicateSessionWithCurrentShell}
+        onCopySessionToNewWindow={copySessionToNewWindowWithCurrentShell}
+        onEditHost={handleEditHostFromOverlay}
         onRenameWorkspace={startWorkspaceRename}
+        onCopyWorkspace={copyWorkspaceWithCurrentShell}
         onCloseWorkspace={closeWorkspace}
         onCloseLogView={closeLogView}
         onCloseTabsBatch={closeTabsBatch}
         onOpenQuickSwitcher={handleOpenQuickSwitcher}
-        onToggleTheme={handleToggleTheme}
+        onThemeChange={setTheme}
         onOpenSettings={handleOpenSettings}
+        onLockApp={handleLockApp}
+        appLockEnabled={appLockEnabled}
+        externalMcpEnabled={externalMcpToggle.enabled}
+        onToggleExternalMcp={externalMcpToggle.setEnabled}
+        showExternalMcpToggle={!isPeerSessionWindow}
+        windowOpacity={windowOpacity}
+        setWindowOpacity={setWindowOpacity}
         onSyncNow={handleSyncNowManual}
-        isImmersiveActive={activeTerminalTheme !== null}
         onStartSessionDrag={setDraggingSessionId}
         onEndSessionDrag={handleEndSessionDrag}
-        onReorderTabs={reorderTabs}
-        showSftpTab={settings.showSftpTab}
+        onReorderTabs={reorderWorkTabs}
+        onRemoveSessionFromWorkspace={removeSessionFromWorkspace}
+        onAppendHostToWorkspace={handleAppendHostToWorkspace}
+        showSftpTab={showSftpTab}
+        showHostTreeSidebar={showHostTreeSidebar}
+        switchTabKeyBinding={keyBindings.find((binding) => binding.action === 'switchToTab') ?? null}
+        dynamicTabTitleMode={dynamicTabTitleMode}
         editorTabs={editorTabs}
+        pluginViewTabs={pluginViewTabs}
+        onClosePluginViewTab={closePluginViewTab}
         onRequestCloseEditorTab={handleRequestCloseEditorTab}
         hostById={hostById}
       />
 
       <div className="flex-1 relative min-h-0">
-        <VaultViewContainer>
+        <AppHostTreeLayer
+          enabled={showHostTreeSidebar}
+          hosts={hosts}
+          customGroups={customGroups}
+          groupConfigs={groupConfigs}
+          sessions={sessions}
+          workspaces={workspaces}
+          editorTabs={editorTabs}
+          logViews={logViews}
+          orderedTabs={orderedTabsWithEditors}
+          currentTerminalTheme={currentTerminalTheme}
+          followAppTerminalTheme={followAppTerminalTheme}
+          hostById={hostById}
+          themeById={themeById}
+          resolveSessionAppearance={resolveSessionAppearance}
+          onConnect={handleConnectToHost}
+          onNewHost={workSurfaceHostEditor.openNew}
+          onEditHost={workSurfaceHostEditor.openEdit}
+          onCreateLocalTerminal={handleCreateLocalTerminal}
+        />
+        <AppHostEditorLayer
+          target={workSurfaceHostEditor.target}
+          editorKey={workSurfaceHostEditor.editorKey}
+          hosts={hosts}
+          customGroups={customGroups}
+          groupConfigs={groupConfigs}
+          keys={keys}
+          identities={identities}
+          proxyProfiles={proxyProfiles}
+          managedSources={managedSources}
+          snippets={snippets}
+          terminalThemeId={terminalThemeId}
+          terminalFontSize={terminalFontSize}
+          sessions={sessions}
+          workspaces={workspaces}
+          logViews={logViews}
+          orderedTabs={orderedTabsWithEditors}
+          onSave={workSurfaceHostEditor.save}
+          onCancel={workSurfaceHostEditor.close}
+          onCreateGroup={handleCreateWorkSurfaceHostGroup}
+          onImportOrReuseKey={importOrReuseKey}
+          onUpdateSnippets={updateSnippets}
+          onUpdateHosts={updateHosts}
+        />
+
+        <AppVaultThemeSurface VaultViewContainer={VaultViewContainer}>
           <VaultView
             hosts={hosts}
             keys={keys}
@@ -147,10 +594,8 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
             snippetPackages={snippetPackages}
             customGroups={customGroups}
             knownHosts={effectiveKnownHosts}
-            shellHistory={shellHistory}
-            connectionLogs={connectionLogs}
             managedSources={managedSources}
-            sessionCount={sessions.length}
+            sessionCount={sessions.filter((s) => !s.hiddenFromTabs).length}
             hotkeyScheme={hotkeyScheme}
             keyBindings={keyBindings}
             terminalThemeId={terminalThemeId}
@@ -161,9 +606,11 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
             onConnectSerial={handleConnectSerial}
             onDeleteHost={handleDeleteHost}
             onConnect={handleConnectToHost}
+            onOpenHostFromNote={handleOpenHostFromVaultNote}
             groupConfigs={groupConfigs}
             onUpdateGroupConfigs={updateGroupConfigs}
             onUpdateHosts={updateHosts}
+            onReadPersistedHosts={readPersistedHosts}
             onUpdateKeys={updateKeys}
             onImportOrReuseKey={importOrReuseKey}
             onUpdateIdentities={updateIdentities}
@@ -171,32 +618,42 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
             onUpdateSnippets={updateSnippets}
             onUpdateSnippetPackages={updateSnippetPackages}
             onUpdateCustomGroups={updateCustomGroups}
+            onCommitPluginImporterData={commitPluginImporterData}
             onUpdateKnownHosts={updateKnownHosts}
             onUpdateManagedSources={updateManagedSources}
+            onReadPersistedManagedSources={readPersistedManagedSources}
+            onCommitVaultImportTransaction={commitVaultImportTransaction}
+            onCommitVaultGroupMutation={commitVaultGroupMutation}
             onClearAndRemoveManagedSource={clearAndRemoveSource}
             onClearAndRemoveManagedSources={clearAndRemoveSources}
             onUnmanageSource={unmanageSource}
             onConvertKnownHost={convertKnownHostToHost}
-            onToggleConnectionLogSaved={toggleConnectionLogSaved}
-            onDeleteConnectionLog={deleteConnectionLog}
-            onClearUnsavedConnectionLogs={clearUnsavedConnectionLogs}
             onRunSnippet={runSnippet}
             onOpenLogView={openLogView}
-            showRecentHosts={settings.showRecentHosts}
-            showOnlyUngroupedHostsInRoot={settings.showOnlyUngroupedHostsInRoot}
+            showRecentHosts={showRecentHosts}
+            hostClickBehavior={hostClickBehavior}
+            showOnlyUngroupedHostsInRoot={showOnlyUngroupedHostsInRoot}
             navigateToSection={navigateToSection}
             onNavigateToSectionHandled={() => setNavigateToSection(null)}
+            deepLinkHostDraft={deepLinkHostDraft}
+            onDeepLinkHostDraftHandled={() => setDeepLinkHostDraft(null)}
+            vaultFocusRequest={vaultFocusRequest}
+            onVaultFocusRequestHandled={() => setVaultFocusRequest(null)}
             terminalSettings={terminalSettings}
           />
-        </VaultViewContainer>
+        </AppVaultThemeSurface>
 
         <SftpViewMount
-          hosts={hosts}
+          hosts={terminalHosts}
+          writableHosts={hosts}
+          sessions={sessions}
           keys={keys}
           identities={identities}
+          knownHosts={effectiveKnownHosts}
           proxyProfiles={proxyProfiles}
           groupConfigs={groupConfigs}
-          updateHosts={updateHosts}
+          updateHosts={updateTerminalHosts}
+          onAddKnownHost={handleAddKnownHost}
           sftpDefaultViewMode={sftpDefaultViewMode}
           sftpDoubleClickBehavior={sftpDoubleClickBehavior}
           sftpAutoSync={sftpAutoSync}
@@ -207,10 +664,13 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
           editorWordWrap={editorWordWrap}
           setEditorWordWrap={setEditorWordWrap}
           terminalSettings={terminalSettings}
+          paneMagnificationRef={sftpPaneMagnificationRef}
         />
 
         <TerminalLayerMount
-          hosts={hosts}
+          hosts={terminalHosts}
+          portForwardingRules={portForwardingRules}
+          customGroups={customGroups}
           groupConfigs={groupConfigs}
           proxyProfiles={proxyProfiles}
           keys={keys}
@@ -222,95 +682,136 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
           knownHosts={effectiveKnownHosts}
           draggingSessionId={draggingSessionId}
           terminalTheme={currentTerminalTheme}
+          terminalThemeId={terminalThemeId}
           followAppTerminalTheme={followAppTerminalTheme}
-          accentMode={accentMode}
-          customAccent={customAccent}
+          pickTerminalTheme={ctx.pickTerminalTheme}
+          clearThemeIntent={ctx.clearThemeIntent}
+          settleManualThemeIntent={ctx.settleManualThemeIntent}
+          resolveSessionAppearance={ctx.resolveSessionAppearance}
           terminalSettings={terminalSettings}
           terminalFontFamilyId={terminalFontFamilyId}
           fontSize={terminalFontSize}
           hotkeyScheme={hotkeyScheme}
+          disableTerminalFontZoom={disableTerminalFontZoom}
+          restoreTerminalCwd={restoreTerminalCwd}
           keyBindings={keyBindings}
           onHotkeyAction={handleHotkeyAction}
-          onUpdateTerminalThemeId={setTerminalThemeId}
+          onUpdateTerminalThemeId={handleDefaultTerminalThemeChange}
+          onUpdateFollowAppTerminalThemeId={handleFollowAppTerminalThemeChange}
           onUpdateTerminalFontFamilyId={setTerminalFontFamilyId}
           onUpdateTerminalFontSize={setTerminalFontSize}
-          onUpdateTerminalFontWeight={(w) => updateTerminalSetting('fontWeight', w)}
+          onUpdateSessionFontSize={updateSessionFontSize}
+          onUpdateSessionRestoreCwd={updateSessionRestoreCwd}
+          onUpdateSessionDynamicTitle={updateSessionDynamicTitle}
+          onUpdateSessionCodingCliProvider={updateSessionCodingCliProvider}
+          onClearSessionFontSizeOverride={clearSessionFontSizeOverride}
+          onUpdateTerminalFontWeight={handleUpdateTerminalFontWeight}
           onCloseSession={closeSession}
           onUpdateSessionStatus={handleSessionStatusChange}
           onUpdateHostDistro={updateHostDistro}
           onUpdateHost={handleUpdateHostFromTerminal}
           onAddKnownHost={handleAddKnownHost}
-          onCommandExecuted={(command, hostId, hostLabel, sessionId) => {
-            addShellHistoryEntry({ command, hostId, hostLabel, sessionId });
-          }}
+          onCommandExecuted={handleTerminalCommandExecuted}
+          onDeleteShellHistoryEntry={removeShellHistoryEntry}
           onTerminalDataCapture={handleTerminalDataCapture}
           onCreateWorkspaceFromSessions={createWorkspaceFromSessions}
           onAddSessionToWorkspace={addSessionToWorkspace}
-          onRequestAddToWorkspace={(workspaceId) =>
-            setAddToWorkspaceDialog({ mode: 'append', workspaceId })
-          }
+          onRequestAddToWorkspace={handleRequestAddToWorkspace}
+          onAppendHostToWorkspace={handleAppendHostToWorkspace}
           onUpdateSplitSizes={updateSplitSizes}
           onSetDraggingSessionId={setDraggingSessionId}
           onToggleWorkspaceViewMode={toggleWorkspaceViewMode}
           onSetWorkspaceFocusedSession={setWorkspaceFocusedSession}
           onReorderWorkspaceSessions={reorderWorkspaceSessions}
+          onReorderTabs={reorderWorkTabs}
+          onCopySession={copySessionWithCurrentShell}
+          onDuplicateSession={duplicateSessionWithCurrentShell}
+          onCopySessionToNewWindow={copySessionToNewWindowWithCurrentShell}
           onSplitSession={splitSessionWithCurrentShell}
+          onConnectToHost={handleConnectToHost}
+          openNoteRequest={openNoteRequest}
+          onOpenVaultNoteFromChat={handleOpenVaultNoteFromChat}
+          onOpenVaultHostFromChat={handleOpenVaultHostFromChat}
+          onOpenVaultSectionFromChat={handleOpenVaultSectionFromChat}
+          onOpenVaultSnippetFromChat={handleOpenVaultSnippetFromChat}
+          onCreateLocalTerminal={handleCreateLocalTerminal}
           isBroadcastEnabled={isBroadcastEnabled}
           onToggleBroadcast={toggleBroadcast}
-          updateHosts={updateHosts}
+          isGlobalBroadcastEnabled={isGlobalBroadcastEnabled}
+          onToggleGlobalBroadcast={onToggleGlobalBroadcast}
+          canUseGlobalBroadcast={canUseGlobalBroadcast}
+          updateHosts={updateTerminalHosts}
+          updateSnippets={updateSnippets}
+          updateSnippetPackages={updateSnippetPackages}
           sftpDefaultViewMode={sftpDefaultViewMode}
           sftpDoubleClickBehavior={sftpDoubleClickBehavior}
           sftpAutoSync={sftpAutoSync}
           sftpShowHiddenFiles={sftpShowHiddenFiles}
           sftpUseCompressedUpload={sftpUseCompressedUpload}
           sftpAutoOpenSidebar={sftpAutoOpenSidebar}
+          terminalSidePanelAutoOpen={terminalSidePanelAutoOpen}
+          terminalSidePanelAutoOpenTab={terminalSidePanelAutoOpenTab}
+          sftpFollowTerminalCwd={sftpFollowTerminalCwd}
+          setSftpFollowTerminalCwd={setSftpFollowTerminalCwd}
           editorWordWrap={editorWordWrap}
           setEditorWordWrap={setEditorWordWrap}
           sessionLogsEnabled={sessionLogsEnabled}
           sessionLogsDir={sessionLogsDir}
           sessionLogsFormat={sessionLogsFormat}
+          sessionLogsTimestampsEnabled={sessionLogsTimestampsEnabled}
           sshDebugLogsEnabled={sshDebugLogsEnabled}
+          showHostTreeSidebar={showHostTreeSidebar}
           toggleScriptsSidePanelRef={toggleScriptsSidePanelRef}
           toggleSidePanelRef={toggleSidePanelRef}
+          paneMagnificationRef={terminalPaneMagnificationRef}
+          onStartSessionRename={startSessionRename}
+          onSubmitSessionRename={submitSessionRename}
+          onRemoveSessionFromWorkspace={removeSessionFromWorkspace}
         />
 
-        {/* Log Views - readonly terminal replays */}
-        {logViews.map(logView => {
-          // Get the latest log data from connectionLogs to reflect updates
-          const latestLog = connectionLogs.find(l => l.id === logView.connectionLogId) || logView.log;
-          return (
-            <LogViewWrapper
-              key={logView.id}
-              logView={{ ...logView, log: latestLog }}
-              defaultTerminalTheme={currentTerminalTheme}
-              defaultFontSize={terminalFontSize}
-              onClose={() => closeLogView(logView.id)}
-              onUpdateLog={updateConnectionLog}
-            />
-          );
-        })}
+        {/* Log Views - readonly terminal replays. The latest log body comes
+            from connectionLogsStore inside AppLogViewSurface. */}
+        {logViews.map((logView: any) => (
+          <AppLogViewSurface
+            key={logView.id}
+            LogViewWrapper={LogViewWrapper}
+            logView={logView}
+            defaultTerminalTheme={currentTerminalTheme}
+            defaultFontSize={terminalFontSize}
+            onClose={() => closeLogView(logView.id)}
+          />
+        ))}
 
         {/* Editor Tabs — kept mounted for Monaco instance persistence; visibility toggled via CSS */}
         {editorTabs.map((tab) => (
-          <TextEditorTabView
-            key={tab.id}
-            tabId={tab.id}
-            isVisible={activeTabId === toEditorTabId(tab.id)}
-            hotkeyScheme={hotkeyScheme}
-            keyBindings={keyBindings}
-            hostById={hostById}
-            onRequestClose={(id) => handleRequestCloseEditorTabRef.current(id)}
-          />
+          <LazyLoadBoundary key={tab.id} name="Editor" resetKey={tab.id}>
+            <Suspense fallback={<TextEditorTabFallback tabId={tab.id} />}>
+              <LazyTextEditorTabView
+                tabId={tab.id}
+                hotkeyScheme={hotkeyScheme}
+                keyBindings={keyBindings}
+                hostById={hostById}
+                onRequestClose={(id) => handleRequestCloseEditorTabRef.current(id)}
+              />
+            </Suspense>
+          </LazyLoadBoundary>
         ))}
+
+        <AppPluginKeybindingThemeHost
+          sessions={sessions}
+          workspaces={workspaces}
+        />
       </div>
 
-      {/* Global "quick add / edit snippet" dialog, triggered by the
+      {/* Global "quick add / edit snippet" modal, triggered by the
           netcatty:snippets:add and :edit window events (from ScriptsSidePanel
           "+" button and right-click menu). Delete is handled by a sibling
           useEffect above — it does not need a dialog. */}
       <QuickAddSnippetDialog
         snippets={snippets}
         packages={snippetPackages}
+        hotkeyScheme={hotkeyScheme}
+        keyBindings={keyBindings}
         onCreateSnippet={(snippet) => updateSnippets([...snippets, snippet])}
         onUpdateSnippet={(snippet) =>
           updateSnippets(snippets.map((s) => (s.id === snippet.id ? snippet : s)))
@@ -318,6 +819,21 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
         onCreatePackage={(pkg) =>
           updateSnippetPackages(Array.from(new Set([...snippetPackages, pkg])))
         }
+      />
+      <QuickScriptEditorDialog
+        snippets={snippets}
+        packages={snippetPackages}
+        hosts={hosts}
+        customGroups={customGroups}
+        onCreateSnippet={(snippet) => updateSnippets([...snippets, snippet])}
+        onUpdateSnippet={(snippet) =>
+          updateSnippets(snippets.map((s) => (s.id === snippet.id ? snippet : s)))
+        }
+        onCreatePackage={(pkg) =>
+          updateSnippetPackages(Array.from(new Set([...snippetPackages, pkg])))
+        }
+        onUpdateHosts={updateHosts}
+        onRunSnippet={runSnippet}
       />
 
       {/* Root-mounted AddToWorkspaceDialog — triggered by the focus-mode
@@ -328,13 +844,7 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
         <AddToWorkspaceDialog
           open
           onOpenChange={(open) => { if (!open) setAddToWorkspaceDialog(null); }}
-          // Filter serial hosts only in append mode — appendHostToWorkspace
-          // has no serial code path. Create mode goes through
-          // createWorkspaceFromTargets, which builds a SerialConfig-backed
-          // session for serial hosts, so those should remain pickable.
-          hosts={addToWorkspaceDialog.mode === 'append'
-            ? hosts.filter((h) => h.protocol !== 'serial')
-            : hosts}
+          hosts={hosts}
           workspaceTitle={
             addToWorkspaceDialog.mode === 'append'
               ? workspaces.find((w) => w.id === addToWorkspaceDialog.workspaceId)?.title
@@ -353,7 +863,11 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
                 if (target.kind === 'local') {
                   appendLocalTerminalToWorkspace(addToWorkspaceDialog.workspaceId, undefined, rootDir);
                 } else {
-                  appendHostToWorkspace(addToWorkspaceDialog.workspaceId, target.host, rootDir);
+                  appendHostToWorkspace(
+                    addToWorkspaceDialog.workspaceId,
+                    resolveWorkspaceAppendHost(target.host),
+                    rootDir,
+                  );
                 }
               }
             } else {
@@ -364,114 +878,102 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
       )}
 
       {isQuickSwitcherOpen && (
-        <Suspense fallback={null}>
-          <LazyQuickSwitcher
-            isOpen={isQuickSwitcherOpen}
-            query={quickSearch}
-            results={quickResults}
-            sessions={sessions}
-            workspaces={workspaces}
-            showSftpTab={settings.showSftpTab}
-            onQueryChange={setQuickSearch}
-            onSelect={handleHostConnectWithProtocolCheck}
-            onSelectTab={(tabId) => {
-              setActiveTabId(tabId);
-              setIsQuickSwitcherOpen(false);
-              setQuickSearch('');
-            }}
-            onCreateLocalTerminal={(shell) => {
-              handleCreateLocalTerminal(shell);
-              setIsQuickSwitcherOpen(false);
-              setQuickSearch('');
-            }}
-            onCreateWorkspace={() => {
-              setIsQuickSwitcherOpen(false);
-              setQuickSearch('');
-              setAddToWorkspaceDialog({ mode: 'create' });
-            }}
-            onClose={() => {
-              setIsQuickSwitcherOpen(false);
-              setQuickSearch('');
-            }}
-            keyBindings={keyBindings}
-          />
-        </Suspense>
+        <LazyLoadBoundary name="Quick switcher" resetKey={quickSearch}>
+          <Suspense fallback={null}>
+            <LazyQuickSwitcher
+              isOpen={isQuickSwitcherOpen}
+              query={quickSearch}
+              results={quickResults}
+              sessions={sessions}
+              workspaces={workspaces}
+              showSftpTab={showSftpTab}
+              onQueryChange={setQuickSearch}
+              onSelect={handleHostConnectWithProtocolCheck}
+              onEditHost={(host) => {
+                setIsQuickSwitcherOpen(false);
+                setQuickSearch('');
+                handleEditHostFromOverlay(host);
+              }}
+              onSelectTab={(tabId) => {
+                setActiveTabId(tabId);
+                setIsQuickSwitcherOpen(false);
+                setQuickSearch('');
+              }}
+              onCreateLocalTerminal={(shell) => {
+                handleCreateLocalTerminal(shell);
+                setIsQuickSwitcherOpen(false);
+                setQuickSearch('');
+              }}
+              onCreateWorkspace={() => {
+                setIsQuickSwitcherOpen(false);
+                setQuickSearch('');
+                setAddToWorkspaceDialog({ mode: 'create' });
+              }}
+              onClose={() => {
+                setIsQuickSwitcherOpen(false);
+                setQuickSearch('');
+              }}
+              keyBindings={keyBindings}
+              terminalSettings={terminalSettings}
+              paneMagnificationState={paneMagnificationState}
+              onMagnifyCurrentPane={handleMagnifyCurrentPane}
+              onRestoreMagnifiedPane={handleRestoreMagnifiedPane}
+            />
+          </Suspense>
+        </LazyLoadBoundary>
       )}
 
-      <Dialog open={!!sessionRenameTarget} onOpenChange={(open) => {
-        if (!open) {
-          resetSessionRename();
-        }
-      }}>
-        <DialogContent className="max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{t('dialog.renameSession.title')}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2 py-2">
-            <Label htmlFor="session-name">{t('field.name')}</Label>
-            <Input
-              id="session-name"
-              value={sessionRenameValue}
-              onChange={(e) => setSessionRenameValue(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submitSessionRename(); }}
-              autoFocus
-              placeholder={t('placeholder.sessionName')}
-            />
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={resetSessionRename}>{t('common.cancel')}</Button>
-            <Button onClick={submitSessionRename} disabled={!sessionRenameValue.trim()}>{t('common.save')}</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <RenameDraftDialog
+        open={!!sessionRenameTarget}
+        inputId="session-name"
+        initialName={sessionRenameTarget ? (sessionRenameTarget.customName || sessionRenameTarget.hostLabel) : ''}
+        title={t('dialog.renameSession.title')}
+        nameLabel={t('field.name')}
+        placeholder={t('placeholder.sessionName')}
+        cancelLabel={t('common.cancel')}
+        saveLabel={t('common.save')}
+        onCancel={resetSessionRename}
+        onSave={handleSaveSessionRename}
+      />
 
-      <Dialog open={!!workspaceRenameTarget} onOpenChange={(open) => {
-        if (!open) {
-          resetWorkspaceRename();
-        }
-      }}>
-        <DialogContent className="max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{t('dialog.renameWorkspace.title')}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2 py-2">
-            <Label htmlFor="workspace-name">{t('field.name')}</Label>
-            <Input
-              id="workspace-name"
-              value={workspaceRenameValue}
-              onChange={(e) => setWorkspaceRenameValue(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submitWorkspaceRename(); }}
-              autoFocus
-              placeholder={t('placeholder.workspaceName')}
-            />
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={resetWorkspaceRename}>{t('common.cancel')}</Button>
-            <Button onClick={submitWorkspaceRename} disabled={!workspaceRenameValue.trim()}>{t('common.save')}</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <RenameDraftDialog
+        open={!!workspaceRenameTarget}
+        inputId="workspace-name"
+        initialName={workspaceRenameTarget ? workspaceRenameTarget.title : ''}
+        title={t('dialog.renameWorkspace.title')}
+        nameLabel={t('field.name')}
+        placeholder={t('placeholder.workspaceName')}
+        cancelLabel={t('common.cancel')}
+        saveLabel={t('common.save')}
+        onCancel={resetWorkspaceRename}
+        onSave={handleSaveWorkspaceRename}
+      />
+
 
       {isCreateWorkspaceOpen && (
-        <Suspense fallback={null}>
-          <LazyCreateWorkspaceDialog
-            isOpen={isCreateWorkspaceOpen}
-            onClose={() => setIsCreateWorkspaceOpen(false)}
-            hosts={hosts}
-            onCreate={createWorkspaceWithHosts}
-          />
-        </Suspense>
+        <LazyLoadBoundary name="Create workspace" resetKey="create-workspace">
+          <Suspense fallback={null}>
+            <LazyCreateWorkspaceDialog
+              isOpen={isCreateWorkspaceOpen}
+              onClose={() => setIsCreateWorkspaceOpen(false)}
+              hosts={hosts}
+              onCreate={createWorkspaceWithHosts}
+            />
+          </Suspense>
+        </LazyLoadBoundary>
       )}
 
       {/* Protocol Select Dialog for QuickSwitcher */}
       {protocolSelectHost && (
-        <Suspense fallback={null}>
-          <LazyProtocolSelectDialog
-            host={protocolSelectHost}
-            onSelect={handleProtocolSelect}
-            onCancel={() => setProtocolSelectHost(null)}
-          />
-        </Suspense>
+        <LazyLoadBoundary name="Protocol selector" resetKey={protocolSelectHost.id}>
+          <Suspense fallback={null}>
+            <LazyProtocolSelectDialog
+              host={protocolSelectHost}
+              onSelect={handleProtocolSelect}
+              onCancel={() => setProtocolSelectHost(null)}
+            />
+          </Suspense>
+        </LazyLoadBoundary>
       )}
 
       {/* Global Keyboard-Interactive Authentication Modal (2FA/MFA) - processes queue */}
@@ -519,6 +1021,7 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
                 hosts: emptyVaultConflict.hostCount,
                 keys: emptyVaultConflict.keyCount,
                 snippets: emptyVaultConflict.snippetCount,
+                notes: emptyVaultConflict.noteCount,
                 proxyProfiles: emptyVaultConflict.proxyProfileCount,
               })}</div>
             </div>
@@ -549,9 +1052,13 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
         </DialogContent>
       </Dialog>
     </div>
-        );
-      }}
+      )}
     </UnsavedChangesProvider>
     </SnippetExecutionProvider>
   );
 }
+
+export const AppView = memo(AppViewInner, (prev, next) => (
+  appViewDomainsEqual(prev.domains, next.domains)
+));
+AppView.displayName = 'AppView';

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { matchesManagedAgentConfig } from './managedAgents';
+import { getExternalAgentSdkBackend, matchesManagedAgentConfig } from './managedAgents';
 
-test('managed Claude matching ignores claude-agent-acp command-only configs', () => {
+test('managed Claude matching ignores legacy adapter command-only configs', () => {
   assert.equal(
     matchesManagedAgentConfig(
       {
@@ -16,7 +16,7 @@ test('managed Claude matching ignores claude-agent-acp command-only configs', ()
   );
 });
 
-test('managed Claude matching ignores claude-agent-acp adapter configs', () => {
+test('managed Claude matching ignores legacy adapter configs', () => {
   assert.equal(
     matchesManagedAgentConfig(
       {
@@ -27,5 +27,56 @@ test('managed Claude matching ignores claude-agent-acp adapter configs', () => {
       'claude',
     ),
     false,
+  );
+});
+
+test('codex managed config no longer matches legacy adapter backend values', () => {
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'x', command: 'codex', sdkBackend: 'codex' }, 'codex'),
+    true,
+  );
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'x', command: 'other', acpCommand: 'codex-acp' }, 'codex'),
+    false,
+  );
+});
+
+test('cursor managed config matches by sdk backend and discovered id', () => {
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'discovered_cursor', command: 'cursor', sdkBackend: 'cursor' }, 'cursor'),
+    true,
+  );
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'x', command: 'other', sdkBackend: 'cursor' }, 'cursor'),
+    true,
+  );
+});
+
+test('claude managed config matches by sdk backend value', () => {
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'discovered_claude', command: 'claude', sdkBackend: 'claude' }, 'claude'),
+    true,
+  );
+});
+
+test('legacy backend field is still accepted for saved settings', () => {
+  assert.equal(
+    getExternalAgentSdkBackend({ acpCommand: 'codex' }),
+    'codex',
+  );
+});
+
+test('grok managed config matches by sdk backend and discovered id', () => {
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'discovered_grok', command: 'grok', sdkBackend: 'grok' }, 'grok'),
+    true,
+  );
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'x', command: 'other', sdkBackend: 'grok' }, 'grok'),
+    true,
+  );
+  assert.equal(
+    matchesManagedAgentConfig({ id: 'x', command: 'C:\\\\Tools\\\\grok.exe', sdkBackend: 'grok' }, 'grok'),
+    true,
   );
 });

@@ -1,8 +1,29 @@
 /* eslint-disable no-undef */
+const { StringDecoder } = require("node:string_decoder");
+
+const DEFAULT_CODEX_CLI_TIMEOUT_MS = 10_000;
+const CODEX_AUTH_VALIDATION_TIMEOUT_MS = 10_000;
+const MAX_AGENT_CLI_BUFFER_CHARS = 10 * 1024 * 1024;
+
 function createAgentCliHelpers(ctx) {
   with (ctx) {
+  const codexAuthValidationInFlight = new Map();
   async function runCommand(command, args, options) {
     return await new Promise((resolve, reject) => {
+      let settled = false;
+      let closed = false;
+      let timeoutId = null;
+      let killId = null;
+      function clearTimers() {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        if (killId) {
+          clearTimeout(killId);
+          killId = null;
+        }
+      }
       const spawnSpec = prepareCommandForSpawn(command, args || []);
       const child = spawn(spawnSpec.command, spawnSpec.args, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -14,31 +35,73 @@ function createAgentCliHelpers(ctx) {
 
       let stdout = "";
       let stderr = "";
-      const MAX_BUFFER = 10 * 1024 * 1024; // 10MB
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
+      const timeoutMs = Number.isFinite(options?.timeoutMs) ? Number(options.timeoutMs) : 0;
 
       child.stdout.on("data", (chunk) => {
-        if (stdout.length < MAX_BUFFER) {
-          stdout += chunk.toString("utf8");
-        }
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        const remaining = Math.max(0, MAX_AGENT_CLI_BUFFER_CHARS - stdoutBytes);
+        const accepted = buffer.length <= remaining ? buffer : buffer.subarray(0, remaining);
+        if (accepted.length > 0) stdout += stdoutDecoder.write(accepted);
+        stdoutBytes += accepted.length;
+        if (accepted.length < buffer.length) stdoutTruncated = true;
       });
 
       child.stderr.on("data", (chunk) => {
-        if (stderr.length < MAX_BUFFER) {
-          stderr += chunk.toString("utf8");
-        }
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        const remaining = Math.max(0, MAX_AGENT_CLI_BUFFER_CHARS - stderrBytes);
+        const accepted = buffer.length <= remaining ? buffer : buffer.subarray(0, remaining);
+        if (accepted.length > 0) stderr += stderrDecoder.write(accepted);
+        stderrBytes += accepted.length;
+        if (accepted.length < buffer.length) stderrTruncated = true;
       });
 
       child.once("error", (error) => {
+        closed = true;
+        if (settled) return;
+        settled = true;
+        clearTimers();
         reject(error);
       });
 
       child.once("close", (exitCode) => {
+        closed = true;
+        clearTimers();
+        if (settled) return;
+        settled = true;
+        if (!stdoutTruncated || stdoutDecoder.lastNeed === 0) stdout += stdoutDecoder.end();
+        if (!stderrTruncated || stderrDecoder.lastNeed === 0) stderr += stderrDecoder.end();
         resolve({
           stdout: stripAnsi(stdout),
           stderr: stripAnsi(stderr),
           exitCode,
         });
       });
+
+      if (timeoutMs > 0) {
+        timeoutId = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          const error = new Error(`Command timed out after ${timeoutMs}ms`);
+          error.code = "ETIMEDOUT";
+          try {
+            if (!closed) child.kill("SIGTERM");
+          } catch {}
+          killId = setTimeout(() => {
+            try {
+              if (!closed) child.kill("SIGKILL");
+            } catch {}
+          }, 750);
+          if (typeof killId.unref === "function") killId.unref();
+          reject(error);
+        }, timeoutMs);
+        if (typeof timeoutId.unref === "function") timeoutId.unref();
+      }
     });
   }
 
@@ -55,7 +118,7 @@ function createAgentCliHelpers(ctx) {
 
   async function probeCliVersion(probeCmd, probeArgs, env) {
     try {
-      const result = await runCommand(probeCmd, probeArgs, { env });
+      const result = await runCommand(probeCmd, probeArgs, { env, timeoutMs: 5000 });
       return {
         launched: true,
         exitCode: result.exitCode,
@@ -72,36 +135,20 @@ function createAgentCliHelpers(ctx) {
     }
   }
 
-  function isCodexAcpFallbackPath(command, usesAcpFallback, resolvedPath) {
-    return (
-      command === "codex" &&
-      usesAcpFallback &&
-      path.basename(resolvedPath || "").toLowerCase().startsWith("codex-acp")
-    );
-  }
-
-  function isCodexAcpFallbackProbeUsable(command, usesAcpFallback, resolvedPath, probe) {
-    if (!isCodexAcpFallbackPath(command, usesAcpFallback, resolvedPath) || !probe?.launched) {
-      return false;
-    }
-    const output = String(probe.output || "").toLowerCase();
-    const hasCodexAcpUsage = /\busage:\s*codex-acp(?:\.exe)?\s+\[options\]/.test(output);
-    const rejectedVersionFlag =
-      /(unexpected|unrecognized|unknown)\s+(argument|option|flag)\s+['"]?--version['"]?/.test(output) ||
-      /['"]?--version['"]?\s+(found|is\s+)?(unexpected|unrecognized|unknown)/.test(output);
-    return hasCodexAcpUsage && rejectedVersionFlag;
-  }
-
-  function isAcpFallbackProbeUsable(command, usesAcpFallback, resolvedPath, probe) {
-    return isCodexAcpFallbackProbeUsable(command, usesAcpFallback, resolvedPath, probe);
-  }
-
   async function runCodexCli(args, options) {
     const shellEnv = await getShellEnv();
-    const codexCliPath = resolveCliFromPath("codex", shellEnv) || "codex";
+    const requestedPath = String(options?.codexPath || "").trim();
+    const configuredPath = requestedPath ? normalizeCliPathForPlatform?.(requestedPath) : null;
+    if (requestedPath && !configuredPath) {
+      throw new Error(`Codex CLI path not found: ${requestedPath}`);
+    }
+    const codexCliPath = configuredPath || await resolveCliFromPathAsync("codex", shellEnv) || "codex";
     return await runCommand(codexCliPath, args, {
       cwd: options?.cwd?.trim() || undefined,
       env: shellEnv,
+      timeoutMs: Number.isFinite(options?.timeoutMs)
+        ? Number(options.timeoutMs)
+        : DEFAULT_CODEX_CLI_TIMEOUT_MS,
     });
   }
 
@@ -121,53 +168,102 @@ function createAgentCliHelpers(ctx) {
   async function validateCodexChatGptAuth(options) {
     const maxAgeMs = options?.maxAgeMs ?? 30000;
     const now = Date.now();
-    const cached = getCodexValidationCache();
-    if (cached && now - cached.checkedAt < maxAgeMs) {
-      return cached;
-    }
-
-    const { createACPProvider } = require("@mcpc-tech/acp-ai-provider");
-    const shellEnv = await getShellEnv();
-    const resolvedCommand = resolveCodexAcpBinaryPath(shellEnv, electronModule);
-    if (!resolvedCommand) {
-      const result = { ok: false, checkedAt: now, error: "codex-acp binary not found", code: "ENOENT" };
-      setCodexValidationCache(result);
-      return result;
-    }
-    const provider = createACPProvider({
-      command: resolvedCommand,
-      env: shellEnv,
-      session: {
-        cwd: process.cwd(),
-        mcpServers: [],
-      },
-      authMethodId: "chatgpt",
-    });
-
-    try {
-      await provider.initSession();
-      const result = { ok: true, checkedAt: now, error: null };
-      setCodexValidationCache(result);
-      return result;
-    } catch (error) {
-      const normalized = extractCodexError(error);
+    const rawRequestedCodexPath = String(options?.codexPath || "").trim();
+    const requestedCodexPath = rawRequestedCodexPath ? normalizeCliPathForPlatform?.(rawRequestedCodexPath) : null;
+    if (rawRequestedCodexPath && !requestedCodexPath) {
       const result = {
         ok: false,
         checkedAt: now,
-        error: normalized.message,
-        code: normalized.code,
+        codexPath: null,
+        error: `Codex CLI path not found: ${rawRequestedCodexPath}`,
+        code: "ENOENT",
       };
       setCodexValidationCache(result);
       return result;
-    } finally {
+    }
+    const cached = getCodexValidationCache();
+    if (cached && now - cached.checkedAt < maxAgeMs && (cached.codexPath || null) === requestedCodexPath) return cached;
+    const inFlightKey = requestedCodexPath || "__auto__";
+    const existingValidation = codexAuthValidationInFlight.get(inFlightKey);
+    if (existingValidation) return existingValidation;
+
+    const validationPromise = (async () => {
+      const shellEnv = await getShellEnv();
+      const rawCodexPath = requestedCodexPath || await resolveSdkBinPathAsync("codex", shellEnv);
+      const codexPath = rawCodexPath && typeof resolveCodexExecutableForSdk === "function"
+        ? resolveCodexExecutableForSdk(rawCodexPath) || null
+        : rawCodexPath;
+      if (!codexPath) {
+        const result = { ok: false, checkedAt: now, codexPath: requestedCodexPath, error: "codex binary not found", code: "ENOENT" };
+        setCodexValidationCache(result);
+        return result;
+      }
+
+      const abortController = new AbortController();
+      let timeoutId = null;
+      let iterator = null;
       try {
-        if (typeof provider.forceCleanup === "function") {
-          provider.forceCleanup();
-        } else if (typeof provider.cleanup === "function") {
-          provider.cleanup();
-        }
-      } catch {
-        // Ignore validation cleanup failures.
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            const error = new Error(
+              `Codex ChatGPT auth validation timed out after ${CODEX_AUTH_VALIDATION_TIMEOUT_MS}ms`,
+            );
+            error.code = "ETIMEDOUT";
+            try { abortController.abort(error); } catch {}
+            reject(error);
+          }, CODEX_AUTH_VALIDATION_TIMEOUT_MS);
+          if (typeof timeoutId?.unref === "function") timeoutId.unref();
+        });
+
+        const probePromise = (async () => {
+          // Minimal read-only probe turn through the SDK to confirm auth works.
+          const { Codex } = await (typeof loadCodexSdk === "function"
+            ? loadCodexSdk()
+            : import("@openai/codex-sdk"));
+          const codexOptions = { env: addCodexExecutableEnvForSdk(shellEnv, codexPath) };
+          if (codexPath) codexOptions.codexPathOverride = codexPath;
+          const codex = new Codex(codexOptions);
+          const thread = codex.startThread({ skipGitRepoCheck: true });
+          const { events } = await thread.runStreamed("ping", {
+            sandbox: "read-only",
+            signal: abortController.signal,
+          });
+          iterator = events?.[Symbol.asyncIterator]?.();
+          if (!iterator) throw new Error("Codex auth validation returned no event stream");
+          let failed = null;
+          while (true) {
+            const next = await iterator.next();
+            if (next.done) break;
+            const event = next.value;
+            if (event?.type === "turn.failed") { failed = event.error; break; }
+            if (event?.type === "turn.completed") break;
+            if (event?.type === "item.completed") break;
+          }
+          if (failed) throw failed;
+        })();
+
+        await Promise.race([probePromise, timeoutPromise]);
+        const result = { ok: true, checkedAt: now, codexPath, error: null };
+        setCodexValidationCache(result);
+        return result;
+      } catch (error) {
+        const normalized = extractCodexError(error);
+        const result = { ok: false, checkedAt: now, codexPath, error: normalized.message, code: normalized.code };
+        setCodexValidationCache(result);
+        return result;
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        try { abortController.abort(); } catch {}
+        try { void Promise.resolve(iterator?.return?.()).catch(() => {}); } catch {}
+      }
+    })();
+
+    codexAuthValidationInFlight.set(inFlightKey, validationPromise);
+    try {
+      return await validationPromise;
+    } finally {
+      if (codexAuthValidationInFlight.get(inFlightKey) === validationPromise) {
+        codexAuthValidationInFlight.delete(inFlightKey);
       }
     }
   }
@@ -301,9 +397,6 @@ function createAgentCliHelpers(ctx) {
       getCommandOutput,
       getFirstCommandOutputLine,
       probeCliVersion,
-      isCodexAcpFallbackPath,
-      isCodexAcpFallbackProbeUsable,
-      isAcpFallbackProbeUsable,
       runCodexCli,
       runCodexCliChecked,
       validateCodexChatGptAuth,
@@ -315,4 +408,9 @@ function createAgentCliHelpers(ctx) {
   }
 }
 
-module.exports = { createAgentCliHelpers };
+module.exports = {
+  createAgentCliHelpers,
+  CODEX_AUTH_VALIDATION_TIMEOUT_MS,
+  DEFAULT_CODEX_CLI_TIMEOUT_MS,
+  MAX_AGENT_CLI_BUFFER_CHARS,
+};

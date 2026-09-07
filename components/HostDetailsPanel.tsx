@@ -9,15 +9,20 @@ import {
   Tag,
   X,
 } from "lucide-react";
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
-import { useApplicationBackend } from "../application/state/useApplicationBackend";
-import { resolveGroupDefaults, resolveGroupTerminalThemeId } from "../domain/groupConfig";
+import { useApplicationBackend, type SshAgentStatus } from "../application/state/useApplicationBackend";
+import { applyGroupDefaults, resolveGroupDefaults, resolveGroupTerminalThemeId } from "../domain/groupConfig";
 import {
   getEffectiveHostDistro,
   normalizePrimaryTelnetState,
 } from "../domain/host";
-import { isCompleteProxyConfig, normalizeManualProxyConfig } from "../domain/proxyProfiles";
+import {
+  formatProxyConfigEndpoint,
+  formatProxyConfigType,
+  updateProxyConfigField,
+} from "../domain/proxyProfiles";
+import { hasRequiredHostAuthCredential, resolveHostAuth, resolveHostAuthMethodForPersistence } from "../domain/sshAuth";
 import { customThemeStore } from "../application/state/customThemeStore";
 import {
   hasHostFontSizeOverride,
@@ -25,7 +30,7 @@ import {
   resolveHostTerminalFontSize,
   resolveHostTerminalThemeId,
 } from "../domain/terminalAppearance";
-import { EnvVar, GroupConfig, Host, Identity, ManagedSource, ProxyConfig, ProxyProfile, SSHKey } from "../types";
+import { EnvVar, GroupConfig, Host, Identity, ManagedSource, ProxyConfig, ProxyProfile, Snippet, SSHKey } from "../types";
 import { DISTRO_COLORS, DISTRO_LOGOS } from "./DistroAvatar";
 import ThemeSelectPanel from "./ThemeSelectPanel";
 import {
@@ -33,11 +38,23 @@ import {
   AsidePanelContent,
   AsidePanelFooter,
   type AsidePanelLayout,
+  type AsidePanelResizeProps,
 } from "./ui/aside-panel";
 import { HostDetailsAdvancedSections } from "./HostDetailsAdvancedSections";
-import { HostDetailsConnectionSections } from "./HostDetailsConnectionSections";
-import { LINUX_DISTRO_OPTION_IDS, parseOptionalPortInput, resolveDetailsTelnetPassword, resolveDetailsTelnetPort, resolveDetailsTelnetUsername } from "./HostDetailsPanel.helpers";
+import { detachEffectiveHostIdentity, HostDetailsConnectionSections } from "./HostDetailsConnectionSections";
+import {
+  LINUX_DISTRO_OPTION_IDS,
+  parseOptionalPortInput,
+  resolveDetailsTelnetPassword,
+  resolveDetailsTelnetPort,
+  resolveDetailsTelnetUsername,
+  resolvePrimaryProtocolSavePort,
+  resolvePrimaryProtocolSwitchPort,
+  prepareTelnetCredentialsForSave,
+  prepareProxyConfigForSave,
+} from "./HostDetailsPanel.helpers";
 export { parseOptionalPortInput } from "./HostDetailsPanel.helpers";
+import { TerminalEncodingSelect } from "./TerminalEncodingSelect";
 import { Button } from "./ui/button";
 import { Combobox, ComboboxOption, MultiCombobox } from "./ui/combobox";
 import { Input } from "./ui/input";
@@ -52,6 +69,14 @@ import {
   ProxyPanel,
 } from "./host-details";
 import { HostNotesEditor } from "./host/HostNotesEditor";
+import { HostDetailsScriptsSection } from "./host/HostDetailsScriptsSection";
+import { ensureHostConnectScriptIds, getEditableHostConnectScriptIds, syncSnippetsForHostConnectQueueSave } from "@/domain/hostConnectScripts.ts";
+import {
+  isPluginHostProtocol,
+  sanitizePluginConnection,
+  stripBuiltInConnectionFieldsForPluginHost,
+} from "../domain/pluginConnection";
+import { PluginConnectionSection } from "./PluginConnectionSection";
 
 type CredentialType = "sshid" | "key" | "certificate" | "localKeyFile" | null;
 type SubPanel =
@@ -83,9 +108,15 @@ interface HostDetailsPanelProps {
   groupConfigs?: GroupConfig[];
   layout?: AsidePanelLayout;
   onImportKey?: (draft: Partial<SSHKey>) => SSHKey;
+  snippets?: Snippet[];
+  onSnippetsChange?: (snippets: Snippet[]) => void;
+  onHostsChange?: (hosts: Host[] | ((prev: Host[]) => Host[])) => void;
+  className?: string;
 }
 
-const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
+type HostDetailsPanelPropsWithResize = HostDetailsPanelProps & AsidePanelResizeProps;
+
+const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   initialData,
   availableKeys,
   identities,
@@ -105,9 +136,24 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   groupConfigs = [],
   layout = "overlay",
   onImportKey,
+  snippets = [],
+  onSnippetsChange,
+  onHostsChange,
+  className,
+  resizable,
+  persistWidthStorageKey,
+  resizeAriaLabel,
 }) => {
   const { t } = useI18n();
+  const asideResizeProps = {
+    resizable,
+    persistWidthStorageKey,
+    resizeAriaLabel,
+  };
   const { checkSshAgent } = useApplicationBackend();
+  const baselineSnippetsRef = useRef(snippets);
+  const baselineHydratedRef = useRef(snippets.length > 0);
+  const openingQueueIdsRef = useRef<string[]>([]);
   const [form, setForm] = useState<Host>(
     () =>
       (initialData ? normalizePrimaryTelnetState(initialData) : null) ||
@@ -120,7 +166,8 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         protocol: "ssh",
         tags: [],
         os: "linux",
-        authMethod: "password",
+        authMethod: undefined,
+        authPolicyVersion: 1,
         charset: groupDefaults?.charset ? undefined : "UTF-8",
         distroMode: "auto",
         createdAt: Date.now(),
@@ -139,6 +186,8 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   const [showPassword, setShowPassword] = useState(false);
   const [showTelnetPassword, setShowTelnetPassword] = useState(false);
   const [showAlgorithmOverrides, setShowAlgorithmOverrides] = useState(false);
+  const [showNotesEditor, setShowNotesEditor] = useState(() => Boolean(initialData?.notes?.trim()));
+  const [pluginConnectionValid, setPluginConnectionValid] = useState(true);
 
   const [newKeyFilePath, setNewKeyFilePath] = useState("");
   const [pendingReferenceKeyPath, setPendingReferenceKeyPath] = useState<string | null>(null);
@@ -146,31 +195,113 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupParent, setNewGroupParent] = useState("");
 
-  const [sshAgentStatus, setSshAgentStatus] = useState<{
-    running: boolean;
-    startupType: string | null;
-    error: string | null;
-  } | null>(null);
+  const [sshAgentStatus, setSshAgentStatus] = useState<SshAgentStatus | null>(null);
+  const [sshForwardingAgentStatus, setSshForwardingAgentStatus] = useState<SshAgentStatus | null>(null);
 
   useEffect(() => {
-    if (form.agentForwarding) {
-      checkSshAgent().then(setSshAgentStatus);
+    let cancelled = false;
+    if (form.agentForwarding || form.useSshAgent === true) {
+      void checkSshAgent({
+        identityAgent: form.useSshAgent === true ? form.identityAgent : undefined,
+        hostname: form.hostname,
+        port: form.port,
+        username: form.username,
+      }).then((status) => {
+        if (!cancelled) setSshAgentStatus(status);
+      });
     } else {
       setSshAgentStatus(null);
     }
-  }, [form.agentForwarding, checkSshAgent]);
+    return () => {
+      cancelled = true;
+    };
+  }, [form.agentForwarding, form.useSshAgent, form.identityAgent, form.hostname, form.port, form.username, checkSshAgent]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (form.agentForwarding) {
+      void checkSshAgent({
+        identityAgent: form.identityAgent,
+        agentForwarding: true,
+        hostname: form.hostname,
+        port: form.port,
+        username: form.username,
+      }).then((status) => {
+        if (!cancelled) setSshForwardingAgentStatus(status);
+      });
+    } else {
+      setSshForwardingAgentStatus(null);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [form.agentForwarding, form.identityAgent, form.hostname, form.port, form.username, checkSshAgent]);
 
   const [groupInputValue, setGroupInputValue] = useState(form.group || "");
 
+  const initialHostId = initialData?.id;
+
   useEffect(() => {
-    if (initialData) {
-      setForm(normalizePrimaryTelnetState(initialData));
-      setGroupInputValue(initialData.group || "");
-      setPendingReferenceKeyPath(null);
-      setShowPassword(false);
-      setShowTelnetPassword(false);
+    baselineSnippetsRef.current = snippets;
+    baselineHydratedRef.current = snippets.length > 0;
+    if (!initialData) {
+      openingQueueIdsRef.current = [];
+    } else {
+      const normalized = normalizePrimaryTelnetState(initialData);
+      const ensured = snippets.length > 0
+        ? ensureHostConnectScriptIds(normalized, snippets)
+        : normalized;
+      openingQueueIdsRef.current = getEditableHostConnectScriptIds(ensured, snippets);
     }
-  }, [initialData]);
+    // Snapshot only when opening/reopening a host editor, not on live snippet edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialHostId]);
+
+  useEffect(() => {
+    // If the editor opened before snippets hydrated, capture the first non-empty
+    // catalog as baseline so concurrent-edit guards still have a reference.
+    if (baselineHydratedRef.current) return;
+    if (snippets.length === 0) return;
+    baselineSnippetsRef.current = snippets;
+    baselineHydratedRef.current = true;
+    if (initialData) {
+      const normalized = normalizePrimaryTelnetState(initialData);
+      const ensured = ensureHostConnectScriptIds(normalized, snippets);
+      openingQueueIdsRef.current = getEditableHostConnectScriptIds(ensured, snippets);
+    }
+  }, [initialData, snippets]);
+
+  useEffect(() => {
+    if (!initialData) return;
+    const normalized = normalizePrimaryTelnetState(initialData);
+    setForm(
+      snippets.length > 0
+        ? ensureHostConnectScriptIds(normalized, snippets)
+        : normalized,
+    );
+    setGroupInputValue(initialData.group || "");
+    setPendingReferenceKeyPath(null);
+    setShowPassword(false);
+    setShowTelnetPassword(false);
+    setShowNotesEditor(Boolean(normalized.notes?.trim()));
+    // Reset only when opening a different host — not when snippets list updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialHostId]);
+
+  useEffect(() => {
+    if (!initialData || snippets.length === 0) return;
+    setForm((prev) => {
+      if (prev.id !== initialData.id) return prev;
+      const synced = ensureHostConnectScriptIds(prev, snippets);
+      if (
+        synced.connectScriptIds === prev.connectScriptIds
+        && synced.loginScriptId === prev.loginScriptId
+      ) {
+        return prev;
+      }
+      return synced;
+    });
+  }, [initialData, snippets]);
 
   const update = <K extends keyof Host>(key: K, value: Host[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -197,6 +328,23 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     }
     return groupDefaults;
   }, [defaultGroup, form.group, groupConfigs, groupDefaults]);
+
+  const effectiveAuthHost = useMemo(
+    () => effectiveGroupDefaults ? applyGroupDefaults(form, effectiveGroupDefaults) : form,
+    [effectiveGroupDefaults, form],
+  );
+
+  const selectedIdentity = useMemo(() => {
+    if (!effectiveAuthHost.identityId) return undefined;
+    return identities.find((i) => i.id === effectiveAuthHost.identityId);
+  }, [effectiveAuthHost.identityId, identities]);
+
+  const effectiveAuth = useMemo(() => resolveHostAuth({
+    host: effectiveAuthHost,
+    keys: availableKeys,
+    identities,
+  }), [availableKeys, effectiveAuthHost, identities]);
+  const effectiveAuthMethod = effectiveAuth.authMethod;
 
   const effectiveThemeId = useMemo(
     () => resolveHostTerminalThemeId(form, resolveGroupTerminalThemeId(effectiveGroupDefaults, terminalThemeId)),
@@ -246,17 +394,17 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   const hasMissingProxyProfile = Boolean(form.proxyProfileId && !selectedProxyProfile);
   const proxySummaryType = hasMissingProxyProfile
     ? t("hostDetails.proxyPanel.missing")
-    : (selectedProxyProfile?.config.type || form.proxyConfig?.type || "http").toUpperCase();
+    : formatProxyConfigType(selectedProxyProfile?.config || form.proxyConfig) || "HTTP";
   const proxySummaryLabel = hasMissingProxyProfile
     ? t("hostDetails.proxyPanel.missingSaved")
     : selectedProxyProfile
       ? selectedProxyProfile.label
-      : `${form.proxyConfig?.host}:${form.proxyConfig?.port}`;
+      : formatProxyConfigEndpoint(form.proxyConfig);
   const proxySummaryTooltip = hasMissingProxyProfile
     ? t("hostDetails.proxyPanel.missingSaved")
     : selectedProxyProfile
-      ? `${selectedProxyProfile.label} - ${selectedProxyProfile.config.host}:${selectedProxyProfile.config.port}`
-      : `${form.proxyConfig?.type?.toUpperCase()} ${form.proxyConfig?.host}:${form.proxyConfig?.port}`;
+      ? `${selectedProxyProfile.label} - ${formatProxyConfigEndpoint(selectedProxyProfile.config)}`
+      : `${formatProxyConfigType(form.proxyConfig)} ${formatProxyConfigEndpoint(form.proxyConfig)}`;
 
   const handleDistroModeChange = useCallback((mode: "auto" | "manual") => {
     setForm((prev) => ({
@@ -270,18 +418,12 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   }, []);
 
   const updateProxyConfig = useCallback(
-    (field: keyof ProxyConfig, value: string | number) => {
+    (field: keyof ProxyConfig, value: ProxyConfig[keyof ProxyConfig]) => {
       setForm((prev) => {
         const { proxyProfileId: _proxyProfileId, ...rest } = prev;
         return {
           ...rest,
-          proxyConfig: {
-            type: prev.proxyConfig?.type || "http",
-            host: prev.proxyConfig?.host || "",
-            port: prev.proxyConfig?.port || 8080,
-            ...prev.proxyConfig,
-            [field]: value,
-          },
+          proxyConfig: updateProxyConfigField(prev.proxyConfig, field, value),
         } as Host;
       });
     },
@@ -346,23 +488,46 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       return { ...prev, environmentVariables: filtered.length > 0 ? filtered : undefined };
     });
   };
+  const pluginProtocolActive = isPluginHostProtocol(form.protocol);
+  const hasHostname = form.hostname.trim().length > 0;
+  const canSaveHost = pluginProtocolActive
+    ? pluginConnectionValid && Boolean(sanitizePluginConnection(form.pluginConnection, form.protocol))
+    : hasHostname;
 
   const handleSubmit = () => {
-    if (!form.hostname) return;
-    const normalizedProxyConfig = normalizeManualProxyConfig(form.proxyConfig);
-    if (normalizedProxyConfig && !isCompleteProxyConfig(normalizedProxyConfig)) {
-      toast.error(
-        normalizedProxyConfig.host ? t("proxyProfiles.error.port") : t("hostDetails.proxyPanel.error.required"),
-      );
+    const hostname = form.hostname.trim()
+      || (pluginProtocolActive ? form.label.trim() || form.pluginConnection?.providerId || "plugin" : "");
+    if (!hostname || !canSaveHost) return;
+    if (!pluginProtocolActive && !hasRequiredHostAuthCredential({ host: effectiveAuthHost, keys: availableKeys, identities })) {
+      toast.error(t("hostDetails.auth.credentialRequired"));
+      return;
+    }
+    const proxySave = pluginProtocolActive
+      ? { normalizedProxyConfig: undefined, error: undefined }
+      : prepareProxyConfigForSave({
+      proxyConfig: form.proxyConfig,
+      proxyProfileId: form.proxyProfileId,
+      proxyProfiles,
+      identities,
+    });
+    if (proxySave.error) {
+      const messageKey = proxySave.error === "port"
+        ? "proxyProfiles.error.port"
+        : proxySave.error === "required"
+          ? "hostDetails.proxyPanel.error.required"
+          : proxySave.error === "missingSaved"
+            ? "hostDetails.proxyPanel.missingSaved"
+            : proxySave.error === "missingIdentity"
+              ? "hostDetails.proxyPanel.missingIdentity"
+              : proxySave.error === "incompleteIdentity"
+                ? "hostDetails.proxyPanel.incompleteIdentity"
+                : "hostDetails.proxyPanel.unreadableIdentity";
+      toast.error(t(messageKey));
       setActiveSubPanel("proxy");
       return;
     }
-    if (hasMissingProxyProfile) {
-      toast.error(t("hostDetails.proxyPanel.missingSaved"));
-      setActiveSubPanel("proxy");
-      return;
-    }
-    let finalLabel = form.label?.trim() || form.hostname;
+    const normalizedProxyConfig = proxySave.normalizedProxyConfig;
+    let finalLabel = form.label?.trim() || hostname;
     const finalGroup = groupInputValue.trim() || form.group || "";
 
     const targetManagedSource = managedSources
@@ -385,22 +550,37 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     }
 
     const { proxyConfig: _draftProxyConfig, ...formWithoutProxyDraft } = form;
-    const finalPort =
-      form.protocol === "telnet"
-        ? form.port
-        : form.port ?? (groupDefaults?.port ? undefined : 22);
+    const finalPort = resolvePrimaryProtocolSavePort(
+      form.protocol,
+      form.port,
+      Boolean(groupDefaults?.port),
+      Boolean(groupDefaults?.telnetPort),
+    );
     let cleaned: Host = {
       ...formWithoutProxyDraft,
       ...(normalizedProxyConfig && { proxyConfig: normalizedProxyConfig }),
+      hostname,
       label: finalLabel,
       group: finalGroup,
       tags: form.tags || [],
       notes: form.notes?.trim() || undefined,
       port: finalPort,
       password: form.savePassword === false ? undefined : form.password,
+      authMethod: resolveHostAuthMethodForPersistence({
+        host: form,
+        keys: availableKeys,
+        identities,
+        groupDefaults: effectiveGroupDefaults,
+      }),
+      authPolicyVersion: 1,
       managedSourceId: finalManagedSourceId,
     };
-    cleaned = normalizePrimaryTelnetState(cleaned);
+    if (pluginProtocolActive) {
+      const pluginConnection = sanitizePluginConnection(cleaned.pluginConnection, cleaned.protocol);
+      if (!pluginConnection) return;
+      cleaned = stripBuiltInConnectionFieldsForPluginHost({ ...cleaned, pluginConnection });
+    }
+    cleaned = prepareTelnetCredentialsForSave(normalizePrimaryTelnetState(cleaned));
     if (
       onImportKey &&
       pendingReferenceKeyPath &&
@@ -443,10 +623,85 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       cleaned.fontSize = initialData?.fontSize;
     }
 
-    if ((cleaned.protocol && cleaned.protocol !== "ssh") || cleaned.moshEnabled) {
+    if ((cleaned.protocol && cleaned.protocol !== "ssh") || cleaned.moshEnabled || cleaned.etEnabled) {
       delete cleaned.x11Forwarding;
     }
-    onSave(cleaned);
+    if (onSnippetsChange || onHostsChange) {
+      const hostId = cleaned.id;
+      if (snippets.length === 0 && !baselineHydratedRef.current) {
+        // Vault may publish hosts before snippets hydrate. Do not wipe unresolved
+        // connectScriptIds while the script catalog is still incomplete.
+      } else {
+        const savedQueueIds = openingQueueIdsRef.current;
+        const finalQueueIds = getEditableHostConnectScriptIds(cleaned, snippets);
+        const synced = syncSnippetsForHostConnectQueueSave(
+          snippets,
+          hostId,
+          savedQueueIds,
+          finalQueueIds,
+          {
+            baselineSnippets: baselineSnippetsRef.current,
+            hosts: allHosts,
+          },
+        );
+        cleaned = {
+          ...cleaned,
+          connectScriptIds: synced.connectScriptIds.length > 0
+            ? synced.connectScriptIds
+            : undefined,
+          // sanitizeHost reconstitutes connectScriptIds from loginScriptId when
+          // the explicit queue is absent; clear the legacy field when emptied.
+          ...(synced.connectScriptIds.length === 0
+            ? { loginScriptId: undefined }
+            : {}),
+        };
+        if (synced.changed && onSnippetsChange) {
+          onSnippetsChange(synced.snippets);
+        }
+        if (onHostsChange && synced.hosts.length > 0) {
+          const peerChanged = synced.hosts.some((host) => {
+            if (host.id === cleaned.id) return false;
+            const original = allHosts.find((entry) => entry.id === host.id);
+            return original !== undefined && original !== host;
+          });
+          if (peerChanged) {
+            // Append only the script IDs this save newly queued onto each peer.
+            // Leave the edited host alone so onSave can three-way merge it.
+            onHostsChange((prevHosts) => {
+              const peerAdds = new Map<string, string[]>();
+              for (const syncedHost of synced.hosts) {
+                if (syncedHost.id === cleaned.id) continue;
+                const snapshot = allHosts.find((entry) => entry.id === syncedHost.id);
+                if (!snapshot || snapshot === syncedHost) continue;
+                const snapshotIds = snapshot.connectScriptIds ?? [];
+                const addedIds = (syncedHost.connectScriptIds ?? []).filter(
+                  (id) => !snapshotIds.includes(id),
+                );
+                if (addedIds.length > 0) peerAdds.set(syncedHost.id, addedIds);
+              }
+              return prevHosts.map((host) => {
+                if (host.id === cleaned.id) return host;
+                const addedIds = peerAdds.get(host.id);
+                if (!addedIds || addedIds.length === 0) return host;
+                const currentIds = host.connectScriptIds ?? [];
+                const mergedIds = [...currentIds];
+                for (const id of addedIds) {
+                  if (!mergedIds.includes(id)) mergedIds.push(id);
+                }
+                if (
+                  mergedIds.length === currentIds.length
+                  && mergedIds.every((id, index) => id === currentIds[index])
+                ) {
+                  return host;
+                }
+                return { ...host, connectScriptIds: mergedIds };
+              });
+            });
+          }
+        }
+      }
+    }
+    onSave(stripBuiltInConnectionFieldsForPluginHost(cleaned));
   };
 
   const handleCreateGroup = () => {
@@ -495,10 +750,20 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     };
   }, [availableKeys]);
 
-  const selectedIdentity = useMemo(() => {
-    if (!form.identityId) return undefined;
-    return identities.find((i) => i.id === form.identityId);
-  }, [form.identityId, identities]);
+  const selectedTelnetIdentity = useMemo(() => {
+    if (!form.telnetIdentityId) return undefined;
+    return identities.find((i) => i.id === form.telnetIdentityId);
+  }, [form.telnetIdentityId, identities]);
+
+  const telnetIdentityOptions: ComboboxOption[] = useMemo(
+    () =>
+      identities.map((identity) => ({
+        value: identity.id,
+        label: identity.label,
+        sublabel: identity.username,
+      })),
+    [identities],
+  );
 
   const filteredIdentitySuggestions = useMemo(() => {
     if (selectedIdentity) return [];
@@ -541,8 +806,21 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   );
 
   const clearIdentity = useCallback(() => {
-    setForm((prev) => ({ ...prev, identityId: undefined }));
+    setForm((prev) => detachEffectiveHostIdentity(prev, effectiveAuth.username));
     setIdentitySuggestionsOpen(false);
+  }, [effectiveAuth.username]);
+
+  const updateTelnetIdentity = useCallback((identityId: string) => {
+    setForm((prev) => ({
+      ...prev,
+      telnetIdentityId: identityId || undefined,
+      ...(identityId
+        ? {
+          telnetUsername: undefined,
+          telnetPassword: undefined,
+        }
+        : {}),
+    }));
   }, []);
 
   if (activeSubPanel === "create-group") {
@@ -557,6 +835,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -566,6 +845,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       <ProxyPanel
         proxyConfig={form.proxyConfig}
         proxyProfiles={proxyProfiles}
+        identities={identities}
         selectedProxyProfileId={form.proxyProfileId}
         onUpdateProxy={updateProxyConfig}
         onSelectProxyProfile={selectProxyProfile}
@@ -573,6 +853,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -591,6 +872,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -619,6 +901,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -640,6 +923,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         showBackButton={true}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -676,6 +960,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         showBackButton={true}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -686,7 +971,9 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       onClose={onCancel}
       width="w-[420px]"
       layout={layout}
+      className={className}
       dataSection="host-details-panel"
+      {...asideResizeProps}
       title={
         initialData ? t("hostDetails.title.details") : t("hostDetails.title.new")
       }
@@ -696,7 +983,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           size="icon"
           className="h-8 w-8"
           onClick={handleSubmit}
-          disabled={!form.hostname}
+          disabled={!canSaveHost}
           aria-label={t("hostDetails.saveAria")}
         >
           <Check size={16} />
@@ -766,24 +1053,24 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           </div>
         </HostDetailsSection>
 
-        <HostDetailsSection
-          icon={<FileText size={14} className="text-muted-foreground shrink-0" />}
-          title={t("hostDetails.notes.label")}
-          hint={t("hostDetails.notes.help")}
-        >
-          <HostNotesEditor
-            panelKey={form.id}
-            value={form.notes ?? ""}
-            onChange={(notes) => update("notes", notes)}
-            showHeader={false}
-          />
-        </HostDetailsSection>
+        <PluginConnectionSection
+          form={form}
+          setForm={setForm}
+          t={t}
+          onValidityChange={setPluginConnectionValid}
+          identities={identities}
+          keys={availableKeys}
+        />
 
-        <HostDetailsConnectionSections
+        {!pluginProtocolActive ? <HostDetailsConnectionSections
           t={t}
           form={form}
+          setForm={setForm}
           update={update}
-          groupDefaults={groupDefaults}
+          groupDefaults={effectiveGroupDefaults}
+          effectiveAuthMethod={effectiveAuthMethod}
+          effectiveUsername={effectiveAuth.username}
+          effectiveIdentityId={effectiveAuthHost.identityId}
           selectedIdentity={selectedIdentity}
           clearIdentity={clearIdentity}
           identities={identities}
@@ -808,7 +1095,43 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           distroOptions={distroOptions}
           effectiveFormDistro={effectiveFormDistro}
           getDistroOptionLabel={getDistroOptionLabel}
-        />
+        /> : null}
+
+        {onSnippetsChange ? (
+          <HostDetailsScriptsSection
+            host={form}
+            onHostChange={setForm}
+            snippets={snippets}
+            t={t}
+          />
+        ) : null}
+
+        <HostDetailsSection
+          icon={<FileText size={14} className="text-muted-foreground shrink-0" />}
+          title={t("hostDetails.notes.label")}
+          hint={t("hostDetails.notes.help")}
+          action={
+            <Switch
+              checked={showNotesEditor}
+              onCheckedChange={setShowNotesEditor}
+              aria-label={
+                showNotesEditor
+                  ? t("hostDetails.notes.toggle.hide")
+                  : t("hostDetails.notes.toggle.show")
+              }
+            />
+          }
+        >
+          {showNotesEditor ? (
+            <HostNotesEditor
+              panelKey={form.id}
+              value={form.notes ?? ""}
+              onChange={(notes) => update("notes", notes)}
+              showHeader={false}
+              defaultTab="edit"
+            />
+          ) : null}
+        </HostDetailsSection>
 
         <HostDetailsAdvancedSections
           t={t}
@@ -820,7 +1143,9 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           effectiveFontSize={effectiveFontSize}
           hasEffectiveFontSizeOverride={hasEffectiveFontSizeOverride}
           sshAgentStatus={sshAgentStatus}
+          sshForwardingAgentStatus={sshForwardingAgentStatus}
           effectiveGroupDefaults={effectiveGroupDefaults}
+          effectiveAuthMethod={effectiveAuthMethod}
           showAlgorithmOverrides={showAlgorithmOverrides}
           setShowAlgorithmOverrides={setShowAlgorithmOverrides}
           chainedHosts={chainedHosts}
@@ -830,7 +1155,6 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           proxySummaryLabel={proxySummaryLabel}
           proxySummaryTooltip={proxySummaryTooltip}
           clearProxyConfig={clearProxyConfig}
-          groupDefaults={groupDefaults}
         />
 
         <div className="flex items-center gap-3 py-2">
@@ -873,43 +1197,74 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
               <span className="text-xs text-muted-foreground">{t("hostDetails.telnet.setDefault")}</span>
               <Switch
                 checked={form.protocol === "telnet"}
-                onCheckedChange={(checked) => update("protocol", checked ? "telnet" : "ssh")}
+                onCheckedChange={(checked) => {
+                  const nextProtocol = checked ? "telnet" : "ssh";
+                  setForm((prev) => ({
+                    ...prev,
+                    protocol: nextProtocol,
+                    port: resolvePrimaryProtocolSwitchPort(
+                      prev.port,
+                      nextProtocol,
+                      Boolean(groupDefaults?.telnetPort),
+                      Boolean(groupDefaults?.port),
+                    ),
+                  }));
+                }}
               />
             </div>
 
             <p className="text-xs font-semibold">{t("hostDetails.telnet.credentials")}</p>
-	            <Input
-	              placeholder={t("hostDetails.telnet.username")}
-	              value={effectiveTelnetUsername}
-	              onChange={(e) =>
-	                update("telnetUsername" as keyof Host, e.target.value)
-	              }
-              className="h-10"
-            />
-            <div className="relative">
-              <Input
-                placeholder={t("hostDetails.telnet.password")}
-                type={showTelnetPassword ? "text" : "password"}
-                value={effectiveTelnetPassword}
-                onChange={(e) =>
-                  update("telnetPassword" as keyof Host, e.target.value)
-                }
-                className="h-10 pr-10"
+            {identities.length > 0 && (
+              <Combobox
+                options={telnetIdentityOptions}
+                value={form.telnetIdentityId || ""}
+                onValueChange={updateTelnetIdentity}
+                placeholder={t("hostDetails.telnet.identity.placeholder")}
+                emptyText={t("common.noResultsFound")}
+                className="w-full"
               />
-              <button
-                type="button"
-                onClick={() => setShowTelnetPassword(!showTelnetPassword)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {showTelnetPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
+            )}
+            {form.telnetIdentityId ? (
+              <div className="text-xs text-muted-foreground">
+                {selectedTelnetIdentity
+                  ? `${selectedTelnetIdentity.username} - ${selectedTelnetIdentity.label}`
+                  : t("hostDetails.identity.missing")}
+              </div>
+            ) : (
+              <>
+                <Input
+                  placeholder={t("hostDetails.telnet.username")}
+                  value={effectiveTelnetUsername}
+                  onChange={(e) =>
+                    update("telnetUsername" as keyof Host, e.target.value)
+                  }
+                  className="h-10"
+                />
+                <div className="relative">
+                  <Input
+                    placeholder={t("hostDetails.telnet.password")}
+                    type={showTelnetPassword ? "text" : "password"}
+                    value={effectiveTelnetPassword}
+                    onChange={(e) =>
+                      update("telnetPassword" as keyof Host, e.target.value)
+                    }
+                    className="h-10 pr-10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowTelnetPassword(!showTelnetPassword)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {showTelnetPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </>
+            )}
 
-            <Input
-              placeholder={groupDefaults?.charset || t("hostDetails.charset.placeholder")}
-              value={form.charset || "UTF-8"}
-              onChange={(e) => update("charset", e.target.value)}
-              className="h-10"
+            <TerminalEncodingSelect
+              value={form.charset}
+              inheritedValue={effectiveGroupDefaults?.charset}
+              onValueChange={(value) => update("charset", value)}
             />
 
             <button
@@ -958,7 +1313,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         <Button
           className="w-full h-10"
           onClick={handleSubmit}
-          disabled={!form.hostname}
+          disabled={!canSaveHost}
         >
           {t("common.save")}
         </Button>

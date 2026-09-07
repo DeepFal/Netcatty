@@ -1,24 +1,19 @@
 import type { DiscoveredAgent, ExternalAgentConfig } from './types';
+import { getCommandBasename, isPathLikeCommand } from './shared/pathLikeCommand';
 
-export type ManagedAgentKey = 'codex' | 'claude' | 'copilot';
+export { isPathLikeCommand, getCommandBasename };
 
-const MANAGED_AGENT_META: Record<ManagedAgentKey, { commandNames: string[]; acpCommand: string }> = {
-  codex: { commandNames: ['codex', 'codex-acp'], acpCommand: 'codex-acp' },
-  claude: { commandNames: ['claude'], acpCommand: 'claude-agent-acp' },
-  copilot: { commandNames: ['copilot'], acpCommand: 'copilot' },
+export type ManagedAgentKey = 'codex' | 'claude' | 'copilot' | 'cursor' | 'codebuddy' | 'opencode' | 'grok';
+
+const MANAGED_AGENT_META: Record<ManagedAgentKey, { commandNames: string[]; sdkBackend: string }> = {
+  codex: { commandNames: ['codex'], sdkBackend: 'codex' },
+  claude: { commandNames: ['claude'], sdkBackend: 'claude' },
+  copilot: { commandNames: ['copilot'], sdkBackend: 'copilot' },
+  cursor: { commandNames: ['cursor'], sdkBackend: 'cursor' },
+  codebuddy: { commandNames: ['codebuddy'], sdkBackend: 'codebuddy' },
+  opencode: { commandNames: ['opencode'], sdkBackend: 'opencode' },
+  grok: { commandNames: ['grok'], sdkBackend: 'grok' },
 };
-
-function getCommandBasename(command: string | undefined): string {
-  const normalized = String(command || '').trim();
-  if (!normalized) return '';
-  const parts = normalized.split(/[\\/]/);
-  return (parts.pop() || '').toLowerCase();
-}
-
-function isPathLikeCommand(command: string | undefined): boolean {
-  const normalized = String(command || '').trim();
-  return normalized.includes('/') || normalized.includes('\\');
-}
 
 function matchesPrimaryCliBasename(command: string | undefined, agentKey: ManagedAgentKey): boolean {
   const basename = getCommandBasename(command);
@@ -28,11 +23,17 @@ function matchesPrimaryCliBasename(command: string | undefined, agentKey: Manage
 export function isSettingsManagedDiscoveredAgent(
   agent: Pick<DiscoveredAgent, 'command'>,
 ): agent is Pick<DiscoveredAgent, 'command'> & { command: ManagedAgentKey } {
-  return agent.command === 'codex' || agent.command === 'claude' || agent.command === 'copilot';
+  return agent.command === 'codex'
+    || agent.command === 'claude'
+    || agent.command === 'copilot'
+    || agent.command === 'cursor'
+    || agent.command === 'codebuddy'
+    || agent.command === 'opencode'
+    || agent.command === 'grok';
 }
 
 export function matchesManagedAgentConfig(
-  agent: Pick<ExternalAgentConfig, 'id' | 'command' | 'acpCommand'>,
+  agent: Pick<ExternalAgentConfig, 'id' | 'command' | 'sdkBackend' | 'acpCommand'>,
   agentKey: ManagedAgentKey,
 ): boolean {
   const meta = MANAGED_AGENT_META[agentKey];
@@ -46,9 +47,15 @@ export function matchesManagedAgentConfig(
   }
   return (
     agent.id === `discovered_${agentKey}` ||
-    agent.acpCommand === meta.acpCommand ||
+    getExternalAgentSdkBackend(agent) === meta.sdkBackend ||
     meta.commandNames.some((commandName) => basename === commandName || basename.startsWith(`${commandName}.`))
   );
+}
+
+export function getExternalAgentSdkBackend(
+  agent: Pick<ExternalAgentConfig, 'sdkBackend' | 'acpCommand'> | undefined,
+): string | undefined {
+  return agent?.sdkBackend || agent?.acpCommand || undefined;
 }
 
 export function getManagedAgentStoredPath(
@@ -73,4 +80,11 @@ export function getManagedAgentStoredPath(
       matchesPrimaryCliBasename(agent.command, agentKey),
   );
   return fallbackAgent?.command ?? null;
+}
+
+export function getManualAgentCommand(
+  config: Pick<ExternalAgentConfig, 'command' | 'commandSource'> | null | undefined,
+): string | undefined {
+  const command = String(config?.command || '').trim();
+  return config?.commandSource === 'manual' && command ? command : undefined;
 }

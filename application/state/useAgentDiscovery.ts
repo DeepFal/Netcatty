@@ -1,45 +1,155 @@
-import { useCallback, useEffect, useState } from 'react';
+import { startTransition, useCallback, useEffect, useRef, useState } from 'react';
 import type { DiscoveredAgent, ExternalAgentConfig } from '../../infrastructure/ai/types';
+import { getExternalAgentSdkBackend } from '../../infrastructure/ai/managedAgents';
 
 interface NetcattyBridge {
-  aiDiscoverAgents(): Promise<DiscoveredAgent[]>;
+  aiDiscoverAgents(options?: { refreshShellEnv?: boolean; apiKeyPresent?: boolean }): Promise<DiscoveredAgent[]>;
 }
 
 function getBridge(): NetcattyBridge | undefined {
   return (window as unknown as { netcatty?: NetcattyBridge }).netcatty;
 }
 
+const AGENT_DISCOVERY_CACHE_TTL_MS = 60_000;
+let agentDiscoveryCache: {
+  agents: DiscoveredAgent[];
+  apiKeyPresent: boolean;
+  updatedAt: number;
+} | null = null;
+const agentDiscoveryPromises = new Map<string, Promise<DiscoveredAgent[]>>();
+let agentDiscoveryWriteGeneration = 0;
+
 export function useAgentDiscovery(
   externalAgents: ExternalAgentConfig[],
   setExternalAgents?: (value: ExternalAgentConfig[] | ((prev: ExternalAgentConfig[]) => ExternalAgentConfig[])) => void,
+  options?: {
+    enabled?: boolean;
+    schedule?: (task: () => void) => () => void;
+  },
 ) {
-  const [discoveredAgents, setDiscoveredAgents] = useState<DiscoveredAgent[]>([]);
+  const enabled = options?.enabled ?? true;
+  const schedule = options?.schedule;
+  const [discoveredAgents, setDiscoveredAgents] = useState<DiscoveredAgent[]>(
+    () => agentDiscoveryCache?.agents ?? [],
+  );
   const [isDiscovering, setIsDiscovering] = useState(false);
+  const discoverSeqRef = useRef(0);
+  const mountedRef = useRef(true);
+  const enabledRef = useRef(enabled);
 
-  const discover = useCallback(async () => {
+  enabledRef.current = enabled;
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    discoverSeqRef.current += 1;
+  }, []);
+
+  const cursorApiKeyPresent = externalAgents.some(
+    (agent) => agent.id === "discovered_cursor" && Boolean(agent.apiKey),
+  );
+
+  const discover = useCallback(async (discoverOptions?: { refreshShellEnv?: boolean }) => {
+    if (!enabledRef.current) return;
     const bridge = getBridge();
     if (!bridge) return;
 
+    const forceRefresh = discoverOptions?.refreshShellEnv === true;
+    const cacheFresh =
+      agentDiscoveryCache
+      && agentDiscoveryCache.apiKeyPresent === cursorApiKeyPresent
+      && Date.now() - agentDiscoveryCache.updatedAt < AGENT_DISCOVERY_CACHE_TTL_MS;
+
+    if (!forceRefresh && cacheFresh) {
+      startTransition(() => setDiscoveredAgents(agentDiscoveryCache?.agents ?? []));
+      return;
+    }
+
     setIsDiscovering(true);
+    const discoverSeq = ++discoverSeqRef.current;
+    const writeGeneration = ++agentDiscoveryWriteGeneration;
+    const promiseKey = JSON.stringify({
+      apiKeyPresent: cursorApiKeyPresent,
+      refreshShellEnv: forceRefresh,
+    });
     try {
-      const agents = await bridge.aiDiscoverAgents();
-      setDiscoveredAgents(agents);
+      let discoveryPromise = agentDiscoveryPromises.get(promiseKey) ?? null;
+      if (!discoveryPromise) {
+        const sharedPromise = bridge.aiDiscoverAgents({
+          ...discoverOptions,
+          apiKeyPresent: cursorApiKeyPresent,
+        }).finally(() => {
+          if (agentDiscoveryPromises.get(promiseKey) === sharedPromise) {
+            agentDiscoveryPromises.delete(promiseKey);
+          }
+        });
+        agentDiscoveryPromises.set(promiseKey, sharedPromise);
+        discoveryPromise = sharedPromise;
+      }
+      const agents = await discoveryPromise;
+      if (
+        !mountedRef.current
+        || !enabledRef.current
+        || discoverSeq !== discoverSeqRef.current
+        || writeGeneration !== agentDiscoveryWriteGeneration
+      ) return;
+      agentDiscoveryCache = {
+        agents,
+        apiKeyPresent: cursorApiKeyPresent,
+        updatedAt: Date.now(),
+      };
+      startTransition(() => setDiscoveredAgents(agents));
     } catch (err) {
       console.error('Agent discovery failed:', err);
     } finally {
+      if (mountedRef.current && discoverSeq === discoverSeqRef.current) {
+        setIsDiscovering(false);
+      }
+    }
+  }, [cursorApiKeyPresent]);
+
+  useEffect(() => {
+    discoverSeqRef.current += 1;
+    if (!enabled) {
       setIsDiscovering(false);
     }
-  }, []);
+  }, [cursorApiKeyPresent, enabled]);
 
-  // Discover on mount
   useEffect(() => {
-    discover();
-  }, [discover]);
+    if (!enabled) return;
+
+    let cancelled = false;
+    const runDiscover = () => {
+      if (!cancelled) void discover();
+    };
+
+    if (schedule) {
+      const cancel = schedule(runDiscover);
+      return () => {
+        cancelled = true;
+        cancel();
+      };
+    }
+
+    if (typeof requestIdleCallback === 'function') {
+      const idleId = requestIdleCallback(runDiscover);
+      return () => {
+        cancelled = true;
+        cancelIdleCallback(idleId);
+      };
+    }
+
+    const timeoutId = setTimeout(runDiscover, 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [discover, enabled, schedule]);
 
   // Auto-update args for already-configured discovered agents when
   // the canonical args from discovery change (e.g. after an app update).
   useEffect(() => {
     if (!setExternalAgents || discoveredAgents.length === 0) return;
+    if (!enabled) return;
 
     setExternalAgents((prev) => {
       let changed = false;
@@ -52,25 +162,39 @@ export function useAgentDiscovery(
         );
         if (!match) return ea;
 
-        // Check if args, ACP config, or Claude's resolved system path differ
+        // Check if args, SDK backend, or managed SDK path env differ.
         const currentArgs = JSON.stringify(ea.args || []);
         const newArgs = JSON.stringify(match.args);
-        const acpChanged = ea.acpCommand !== match.acpCommand
-          || JSON.stringify(ea.acpArgs || []) !== JSON.stringify(match.acpArgs || []);
+        const backend = match.sdkBackend ?? match.command;
+        const backendChanged = getExternalAgentSdkBackend(ea) !== backend
+          || Boolean(ea.acpCommand)
+          || JSON.stringify(ea.acpArgs || []) !== JSON.stringify([]);
+        const matchPath = match.binPath || match.path;
         const env = match.command === 'claude'
-          ? { ...(ea.env ?? {}), CLAUDE_CODE_EXECUTABLE: match.path }
-          : ea.env;
-        const envChanged = match.command === 'claude'
-          && ea.env?.CLAUDE_CODE_EXECUTABLE !== match.path;
-        if (currentArgs !== newArgs || acpChanged || envChanged) {
+          ? { ...(ea.env ?? {}), CLAUDE_CODE_EXECUTABLE: matchPath }
+          : match.command === 'opencode'
+            ? { ...(ea.env ?? {}), OPENCODE_BIN: matchPath }
+            : ea.env;
+        const envChanged =
+          (match.command === 'claude' && ea.env?.CLAUDE_CODE_EXECUTABLE !== matchPath)
+          || (match.command === 'opencode' && ea.env?.OPENCODE_BIN !== matchPath);
+        const versionChanged = Boolean(match.version) && ea.cliVersion !== match.version;
+        if (currentArgs !== newArgs || backendChanged || envChanged || versionChanged) {
           changed = true;
-          return { ...ea, args: match.args, acpCommand: match.acpCommand, acpArgs: match.acpArgs, ...(env ? { env } : {}) };
+          const { acpCommand: _legacyCommand, acpArgs: _legacyArgs, ...rest } = ea;
+          return {
+            ...rest,
+            args: match.args,
+            sdkBackend: backend,
+            ...(match.version ? { cliVersion: match.version } : {}),
+            ...(env ? { env } : {}),
+          };
         }
         return ea;
       });
       return changed ? next : prev;
     });
-  }, [discoveredAgents, setExternalAgents]);
+  }, [discoveredAgents, enabled, setExternalAgents]);
 
   // Filter out agents that are already configured as external agents
   const unconfiguredAgents = discoveredAgents.filter(
@@ -82,16 +206,21 @@ export function useAgentDiscovery(
   // Build ExternalAgentConfig from a discovered agent
   const enableAgent = useCallback(
     (agent: DiscoveredAgent): ExternalAgentConfig => {
+      const backend = agent.sdkBackend ?? agent.command;
       return {
         id: `discovered_${agent.command}`,
         name: agent.name,
-        command: agent.path || agent.command,
+        command: agent.binPath || agent.path || agent.command,
         args: agent.args,
         icon: agent.icon,
         enabled: true,
-        acpCommand: agent.acpCommand,
-        acpArgs: agent.acpArgs,
-        ...(agent.command === 'claude' ? { env: { CLAUDE_CODE_EXECUTABLE: agent.path } } : {}),
+        sdkBackend: backend,
+        ...(agent.version ? { cliVersion: agent.version } : {}),
+        ...(agent.command === 'claude'
+          ? { env: { CLAUDE_CODE_EXECUTABLE: agent.binPath || agent.path || '' } }
+          : agent.command === 'opencode'
+            ? { env: { OPENCODE_BIN: agent.binPath || agent.path || '' } }
+          : {}),
       };
     },
     [],
@@ -101,7 +230,7 @@ export function useAgentDiscovery(
     discoveredAgents,
     unconfiguredAgents,
     isDiscovering,
-    rediscover: discover,
+    rediscover: () => discover({ refreshShellEnv: true }),
     enableAgent,
   };
 }

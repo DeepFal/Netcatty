@@ -1,19 +1,34 @@
 import { useCallback } from "react";
-import type { Host, Identity, SSHKey, TerminalSettings } from "../../../domain/models";
+import type { Host, Identity, KnownHost, SSHKey, TerminalSettings } from "../../../domain/models";
 import { isEncryptedCredentialPlaceholder, sanitizeCredentialValue } from "../../../domain/credentials";
-import { resolveBridgeKeyAuth, resolveHostAuth } from "../../../domain/sshAuth";
+import { resolveBridgeKeyAuth, resolveBridgeSshAgentAuth, resolveHostAuth } from "../../../domain/sshAuth";
 import { resolveHostKeepalive } from "../../../domain/host";
+import { resolveHostSshConnectionTimeouts } from "../../../domain/sshConnectionTimeouts";
+import {
+  findIncompleteProxyIdentityId,
+  findMissingProxyIdentityId,
+  formatIncompleteProxyIdentityMessage,
+  formatMissingProxyIdentityMessage,
+  hasUnreadableProxyCredential,
+  hasUsableProxyConfig,
+  resolveProxyConfigAuth,
+} from "../../../domain/proxyProfiles";
 
 // Fallback used when no global TerminalSettings are wired through (older
 // call sites or tests). Matches DEFAULT_TERMINAL_SETTINGS so behavior is
 // identical whether or not the caller passes settings.
-const FALLBACK_KEEPALIVE = { keepaliveInterval: 30, keepaliveCountMax: 10 };
+const FALLBACK_TERMINAL_SETTINGS = {
+  verifyHostKeys: true,
+  keepaliveInterval: 30,
+  keepaliveCountMax: 10,
+};
 
 interface UseSftpHostCredentialsParams {
   hosts: Host[];
   keys: SSHKey[];
   identities: Identity[];
-  terminalSettings?: Pick<TerminalSettings, 'keepaliveInterval' | 'keepaliveCountMax'>;
+  knownHosts?: KnownHost[];
+  terminalSettings?: Pick<TerminalSettings, 'verifyHostKeys' | 'keepaliveInterval' | 'keepaliveCountMax'>;
 }
 
 export const buildSftpHostCredentials = ({
@@ -21,24 +36,25 @@ export const buildSftpHostCredentials = ({
   hosts,
   keys,
   identities,
+  knownHosts,
   terminalSettings,
 }: UseSftpHostCredentialsParams & { host: Host }): NetcattySSHOptions => {
-  const globalKeepalive = terminalSettings ?? FALLBACK_KEEPALIVE;
+  const globalTerminalSettings = { ...FALLBACK_TERMINAL_SETTINGS, ...(terminalSettings ?? {}) };
   if (host.proxyProfileId && !host.proxyConfig) {
     throw new Error(`Saved proxy for host "${host.label || host.hostname}" is missing. Open host settings and select a valid proxy.`);
+  }
+  if (findMissingProxyIdentityId(host.proxyConfig, identities)) {
+    throw new Error(formatMissingProxyIdentityMessage(host.label || host.hostname));
+  }
+  if (findIncompleteProxyIdentityId(host.proxyConfig, identities)) {
+    throw new Error(formatIncompleteProxyIdentityMessage(host.label || host.hostname));
   }
 
   const resolved = resolveHostAuth({ host, keys, identities });
   const key = resolved.key || null;
 
   const proxyConfig = host.proxyConfig
-    ? {
-      type: host.proxyConfig.type,
-      host: host.proxyConfig.host,
-      port: host.proxyConfig.port,
-      username: host.proxyConfig.username,
-      password: sanitizeCredentialValue(host.proxyConfig.password),
-    }
+    ? resolveProxyConfigAuth(host.proxyConfig, identities)
     : undefined;
   let jumpHosts: NetcattyJumpHost[] | undefined;
   if (host.hostChain?.hostIds && host.hostChain.hostIds.length > 0) {
@@ -49,6 +65,12 @@ export const buildSftpHostCredentials = ({
       }
       if (jumpHost.proxyProfileId && !jumpHost.proxyConfig) {
         throw new Error(`Saved proxy for jump host "${jumpHost.label || jumpHost.hostname}" is missing. Open host settings and select a valid proxy.`);
+      }
+      if (findMissingProxyIdentityId(jumpHost.proxyConfig, identities)) {
+        throw new Error(formatMissingProxyIdentityMessage(jumpHost.label || jumpHost.hostname));
+      }
+      if (findIncompleteProxyIdentityId(jumpHost.proxyConfig, identities)) {
+        throw new Error(formatIncompleteProxyIdentityMessage(jumpHost.label || jumpHost.hostname));
       }
       return jumpHost;
     }).map((jumpHost, index) => {
@@ -66,15 +88,16 @@ export const buildSftpHostCredentials = ({
           : jumpHost.identityFilePaths,
         passphrase: jumpAuth.passphrase,
       });
-      const hasJumpKeyMaterial = Boolean(jumpKeyAuth.privateKey || jumpKeyAuth.identityFilePaths?.length);
+      const jumpAgentAuth = resolveBridgeSshAgentAuth(jumpHost, jumpKey, jumpAuth.authMethod);
+      const hasJumpKeyMaterial = Boolean(
+        jumpAgentAuth.useSshAgent || jumpKeyAuth.privateKey || jumpKeyAuth.identityFilePaths?.length,
+      );
       const hasConfiguredJumpProxyEndpoint =
         index === 0 &&
-        !!(jumpHost.proxyConfig?.host && jumpHost.proxyConfig?.port);
+        hasUsableProxyConfig(jumpHost.proxyConfig);
       if (
         hasConfiguredJumpProxyEndpoint &&
-        jumpHost.proxyConfig?.username &&
-        isEncryptedCredentialPlaceholder(jumpHost.proxyConfig.password) &&
-        !sanitizeCredentialValue(jumpHost.proxyConfig.password)
+        hasUnreadableProxyCredential(jumpHost.proxyConfig, identities)
       ) {
         throw new Error(`Proxy credentials for jump host "${jumpHost.label || jumpHost.hostname}" cannot be decrypted on this device. Open host settings and re-enter the proxy password.`);
       }
@@ -84,15 +107,19 @@ export const buildSftpHostCredentials = ({
         isEncryptedCredentialPlaceholder(jumpAuth.passphrase);
       if (
         (jumpAuth.authMethod === "password" && isEncryptedCredentialPlaceholder(jumpAuth.password) && !jumpPassword) ||
-        (jumpAuth.authMethod !== "password" && hasUnreadableJumpCredential && !jumpPassword && !hasJumpKeyMaterial)
+        (jumpAuth.authMethod !== "password" && jumpAuth.authMethod !== "auto" && hasUnreadableJumpCredential && !jumpPassword && !hasJumpKeyMaterial)
       ) {
         throw new Error(`Saved credentials for jump host "${jumpHost.label || jumpHost.hostname}" cannot be decrypted on this device. Open host settings and re-enter them.`);
       }
-      const hopKeepalive = resolveHostKeepalive(jumpHost, globalKeepalive);
+      const hopKeepalive = resolveHostKeepalive(jumpHost, globalTerminalSettings);
+      const hopConnectionTimeouts = resolveHostSshConnectionTimeouts(jumpHost);
       return {
         hostname: jumpHost.hostname,
+        hostId: jumpHost.id,
         port: jumpHost.port || 22,
         username: jumpAuth.username || "root",
+        authMethod: jumpAuth.authMethod,
+        requiresMfa: !!jumpHost.requiresMfa,
         password: jumpPassword,
         privateKey: jumpKeyAuth.privateKey,
         certificate: jumpKey?.certificate,
@@ -101,18 +128,16 @@ export const buildSftpHostCredentials = ({
         keyId: jumpAuth.keyId,
         keySource: jumpKey?.source,
         label: jumpHost.label,
-        proxy: jumpHost.proxyConfig?.host && jumpHost.proxyConfig?.port
-          ? {
-            type: jumpHost.proxyConfig.type,
-            host: jumpHost.proxyConfig.host,
-            port: jumpHost.proxyConfig.port,
-            username: jumpHost.proxyConfig.username,
-            password: sanitizeCredentialValue(jumpHost.proxyConfig.password),
-          }
+        proxy: hasUsableProxyConfig(jumpHost.proxyConfig)
+          ? resolveProxyConfigAuth(jumpHost.proxyConfig, identities)
           : undefined,
         identityFilePaths: jumpKeyAuth.identityFilePaths,
+        ...jumpAgentAuth,
         keepaliveInterval: hopKeepalive.interval,
         keepaliveCountMax: hopKeepalive.countMax,
+        sshTcpConnectTimeoutMs: hopConnectionTimeouts.tcpConnectTimeoutSeconds * 1000,
+        sshAuthReadyTimeoutMs: hopConnectionTimeouts.authReadyTimeoutSeconds * 1000,
+        verifyHostKeys: globalTerminalSettings.verifyHostKeys,
         legacyAlgorithms: jumpHost.legacyAlgorithms,
         skipEcdsaHostKey: jumpHost.skipEcdsaHostKey,
         algorithmOverrides: jumpHost.algorithms,
@@ -120,7 +145,7 @@ export const buildSftpHostCredentials = ({
     });
   }
   const usesTargetProxyForFirstHop = !!proxyConfig && !jumpHosts?.[0]?.proxy;
-  if (usesTargetProxyForFirstHop && host.proxyConfig?.username && isEncryptedCredentialPlaceholder(host.proxyConfig.password) && !proxyConfig?.password) {
+  if (usesTargetProxyForFirstHop && hasUnreadableProxyCredential(host.proxyConfig, identities)) {
     throw new Error("Proxy credentials cannot be decrypted on this device. Open host settings and re-enter the proxy password.");
   }
 
@@ -131,23 +156,30 @@ export const buildSftpHostCredentials = ({
       : host.identityFilePaths,
     passphrase: resolved.passphrase,
   });
+  const targetAgentAuth = resolveBridgeSshAgentAuth(host, key, resolved.authMethod);
   const password = sanitizeCredentialValue(resolved.password);
-  const hasKeyMaterial = Boolean(keyAuth.privateKey || keyAuth.identityFilePaths?.length);
+  const hasKeyMaterial = Boolean(
+    targetAgentAuth.useSshAgent || keyAuth.privateKey || keyAuth.identityFilePaths?.length,
+  );
   const hasUnreadableCredential =
     isEncryptedCredentialPlaceholder(resolved.password) ||
     isEncryptedCredentialPlaceholder(key?.privateKey) ||
     isEncryptedCredentialPlaceholder(resolved.passphrase);
   if (
     (resolved.authMethod === "password" && isEncryptedCredentialPlaceholder(resolved.password) && !password) ||
-    (resolved.authMethod !== "password" && hasUnreadableCredential && !password && !hasKeyMaterial)
+    (resolved.authMethod !== "password" && resolved.authMethod !== "auto" && hasUnreadableCredential && !password && !hasKeyMaterial)
   ) {
     throw new Error("Saved credentials cannot be decrypted on this device. Open host settings and re-enter them.");
   }
 
-  const targetKeepalive = resolveHostKeepalive(host, globalKeepalive);
+  const targetKeepalive = resolveHostKeepalive(host, globalTerminalSettings);
+  const targetConnectionTimeouts = resolveHostSshConnectionTimeouts(host);
   return {
     hostname: host.hostname,
+    hostId: host.id,
     username: resolved.username,
+    authMethod: resolved.authMethod,
+    requiresMfa: !!host.requiresMfa,
     port: host.port || 22,
     password,
     privateKey: keyAuth.privateKey,
@@ -159,9 +191,15 @@ export const buildSftpHostCredentials = ({
     proxy: proxyConfig,
     jumpHosts: jumpHosts && jumpHosts.length > 0 ? jumpHosts : undefined,
     sudo: host.sftpSudo,
+    fileProtocol: host.sftpFileProtocol || "auto",
     identityFilePaths: keyAuth.identityFilePaths,
+    ...targetAgentAuth,
     keepaliveInterval: targetKeepalive.interval,
     keepaliveCountMax: targetKeepalive.countMax,
+    sshTcpConnectTimeoutMs: targetConnectionTimeouts.tcpConnectTimeoutSeconds * 1000,
+    sshAuthReadyTimeoutMs: targetConnectionTimeouts.authReadyTimeoutSeconds * 1000,
+    knownHosts,
+    verifyHostKeys: globalTerminalSettings.verifyHostKeys,
     // Algorithm settings — must reach the SFTP bridge or hosts that need
     // legacy mode / the ECDSA skip / advanced overrides would still hit
     // the original negotiation failure when opening their SFTP pane,
@@ -176,9 +214,10 @@ export const useSftpHostCredentials = ({
   hosts,
   keys,
   identities,
+  knownHosts,
   terminalSettings,
 }: UseSftpHostCredentialsParams) =>
   useCallback(
-    (host: Host): NetcattySSHOptions => buildSftpHostCredentials({ host, hosts, keys, identities, terminalSettings }),
-    [hosts, identities, keys, terminalSettings],
+    (host: Host): NetcattySSHOptions => buildSftpHostCredentials({ host, hosts, keys, identities, knownHosts, terminalSettings }),
+    [hosts, identities, keys, knownHosts, terminalSettings],
   );

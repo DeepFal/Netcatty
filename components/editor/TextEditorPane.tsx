@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import Editor, { type OnMount, loader, useMonaco } from '@monaco-editor/react';
 import type * as Monaco from 'monaco-editor';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 
 // Configure Monaco to use local files instead of CDN
 const viteEnv = import.meta.env ?? { BASE_URL: "/" };
@@ -21,10 +21,14 @@ const monacoBasePath = viteEnv.DEV
   ? './node_modules/monaco-editor/min/vs'
   : `${viteEnv.BASE_URL}monaco/vs`;
 loader.config({ paths: { vs: monacoBasePath } });
+const isMacPlatform = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { useClipboardBackend } from '../../application/state/useClipboardBackend';
+import { isPrimaryModifierWBinding } from '../../application/state/windowCommandClose';
 import { HotkeyScheme, KeyBinding, matchesKeyBinding } from '../../domain/models';
+import { pasteForMonacoEditorCommand } from '../../infrastructure/monaco/monacoClipboardPaste';
+import { useNetcattyMonacoTheme } from '../../infrastructure/monaco/useNetcattyMonacoTheme';
 import { getLanguageName, getSupportedLanguages } from '../../lib/sftpFileUtils';
 import { Button } from '../ui/button';
 import { Combobox } from '../ui/combobox';
@@ -80,82 +84,6 @@ const languageIdToMonaco = (langId: string): string => {
   return mapping[langId] || 'plaintext';
 };
 
-// Convert HSL string "h s% l%" to hex color
-const hslToHex = (hslString: string): string => {
-  const parts = hslString.trim().split(/\s+/);
-  if (parts.length < 3) return '#1e1e1e';
-  const h = parseFloat(parts[0]) / 360;
-  const s = parseFloat(parts[1].replace('%', '')) / 100;
-  const l = parseFloat(parts[2].replace('%', '')) / 100;
-
-  const hue2rgb = (p: number, q: number, t: number) => {
-    if (t < 0) t += 1;
-    if (t > 1) t -= 1;
-    if (t < 1 / 6) return p + (q - p) * 6 * t;
-    if (t < 1 / 2) return q;
-    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-    return p;
-  };
-
-  let r: number, g: number, b: number;
-  if (s === 0) {
-    r = g = b = l;
-  } else {
-    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-    const p = 2 * l - q;
-    r = hue2rgb(p, q, h + 1 / 3);
-    g = hue2rgb(p, q, h);
-    b = hue2rgb(p, q, h - 1 / 3);
-  }
-
-  const toHex = (x: number) => {
-    const hex = Math.round(x * 255).toString(16);
-    return hex.length === 1 ? '0' + hex : hex;
-  };
-
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-};
-
-// Read a CSS custom-property and convert from HSL to hex
-const getCssColor = (varName: string, fallback: string): string => {
-  if (typeof document === 'undefined' || typeof getComputedStyle === 'undefined') {
-    return fallback;
-  }
-  const value = getComputedStyle(document.documentElement)
-    .getPropertyValue(varName)
-    .trim();
-  return value ? hslToHex(value) : fallback;
-};
-
-interface EditorColors {
-  bg: string;
-  fg: string;
-  primary: string;
-  card: string;
-  mutedFg: string;
-  border: string;
-}
-
-/** Read all UI CSS variables that matter for the Monaco theme. */
-const getEditorColors = (isDark: boolean): EditorColors => ({
-  bg: getCssColor('--background', isDark ? '#1e1e1e' : '#ffffff'),
-  fg: getCssColor('--foreground', isDark ? '#d4d4d4' : '#1e1e1e'),
-  primary: getCssColor('--primary', isDark ? '#569cd6' : '#0078d4'),
-  card: getCssColor('--card', isDark ? '#252526' : '#f3f3f3'),
-  mutedFg: getCssColor('--muted-foreground', isDark ? '#858585' : '#858585'),
-  border: getCssColor('--border', isDark ? '#3c3c3c' : '#d4d4d4'),
-});
-
-/** Build a fingerprint string so we can detect immersive-mode color changes cheaply. */
-const getThemeSignal = (): string => {
-  if (typeof document === 'undefined' || typeof getComputedStyle === 'undefined') {
-    return '';
-  }
-  const root = document.documentElement;
-  return root.dataset.immersiveTheme
-    ?? getComputedStyle(root).getPropertyValue('--background').trim();
-};
-
 export interface TextEditorPaneProps {
   fileName: string;
   content: string;
@@ -182,28 +110,54 @@ export const isTextEditorReadOnly = ({ saving }: { saving: boolean }): boolean =
 
 export const canPromoteTextEditor = ({ saving }: { saving: boolean }): boolean => !saving;
 
+export function getTextEditorContentStats(content: string): { lineCount: number; charCount: number } {
+  let lineCount = 1;
+  for (let i = 0; i < content.length; i += 1) {
+    if (content.charCodeAt(i) === 10) lineCount += 1;
+  }
+  return { lineCount, charCount: content.length };
+}
+
+export function isTextEditorCommandWEnabled({
+  hotkeyScheme,
+  closeTabBinding,
+  isMac,
+}: {
+  hotkeyScheme: HotkeyScheme;
+  closeTabBinding?: KeyBinding;
+  isMac: boolean;
+}): boolean {
+  if (hotkeyScheme === 'disabled' || !closeTabBinding) return false;
+  return isPrimaryModifierWBinding(
+    hotkeyScheme === 'mac' ? closeTabBinding.mac : closeTabBinding.pc,
+    matchesKeyBinding,
+    isMac,
+  );
+}
+
 export const TextEditorPromoteButton: React.FC<{
   saving: boolean;
   onPromoteToTab: () => void;
   title: string;
-}> = ({ saving, onPromoteToTab, title }) => (
+}> = React.memo(({ saving, onPromoteToTab, title }) => (
   <Tooltip>
     <TooltipTrigger asChild>
       <Button
         variant="ghost"
         size="icon"
-        className="h-7 w-7"
+        className="h-6 w-6"
         onClick={onPromoteToTab}
         disabled={!canPromoteTextEditor({ saving })}
       >
-        <Maximize2 size={14} />
+        <Maximize2 size={13} />
       </Button>
     </TooltipTrigger>
     <TooltipContent>{title}</TooltipContent>
   </Tooltip>
-);
+));
+TextEditorPromoteButton.displayName = 'TextEditorPromoteButton';
 
-export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
+const TextEditorPaneInner: React.FC<TextEditorPaneProps> = ({
   fileName,
   content,
   languageId,
@@ -225,85 +179,25 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
   const { t } = useI18n();
   const { readClipboardText: readClipboardTextFromBridge } = useClipboardBackend();
   const monaco = useMonaco();
+  const customThemeName = useNetcattyMonacoTheme(monaco);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
 
   // Ref to store the latest save function to avoid stale closure in keyboard shortcut
   const handleSaveRef = useRef<() => void>(() => {});
   const handleCloseRef = useRef<(() => void) | null>(null);
+  const closeTabCommandWEnabledRef = useRef(false);
   const handlePasteRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const readClipboardTextRef = useRef<() => Promise<string | null>>(() => Promise.resolve(null));
-
-  // Track theme from document.documentElement class (syncs with app theme)
-  const [isDarkTheme, setIsDarkTheme] = useState(() =>
-    typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
-  );
-
-  // Track a signal that changes whenever immersive-mode or base theme colors change
-  const [themeSignal, setThemeSignal] = useState(() => getThemeSignal());
-
-  // Custom theme name
-  const customThemeName = isDarkTheme ? 'netcatty-dark' : 'netcatty-light';
-
-  // Define and update custom Monaco themes — syncs with immersive-mode / base UI colors
-  useEffect(() => {
-    if (!monaco) return;
-
-    const colors = getEditorColors(isDarkTheme);
-
-    const themeColors: Record<string, string> = {
-      'editor.background': colors.bg,
-      'editor.foreground': colors.fg,
-      'editorCursor.foreground': colors.primary,
-      'editor.selectionBackground': colors.primary + '40',
-      'editor.inactiveSelectionBackground': colors.primary + '25',
-      'editorLineNumber.foreground': colors.mutedFg,
-      'editorLineNumber.activeForeground': colors.fg,
-      'editor.lineHighlightBackground': colors.fg + '08',
-      'editorWidget.background': colors.card,
-      'editorWidget.foreground': colors.fg,
-      'editorWidget.border': colors.border,
-      'input.background': colors.card,
-      'input.foreground': colors.fg,
-      'input.border': colors.border,
-    };
-
-    monaco.editor.defineTheme('netcatty-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      rules: [],
-      colors: themeColors,
-    });
-
-    monaco.editor.defineTheme('netcatty-light', {
-      base: 'vs',
-      inherit: true,
-      rules: [],
-      colors: themeColors,
-    });
-
-    monaco.editor.setTheme(customThemeName);
-  }, [monaco, isDarkTheme, themeSignal, customThemeName]);
-
-  // Listen for theme changes via MutationObserver on <html> class, style, and immersive data attr
-  useEffect(() => {
-    if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
-    const root = document.documentElement;
-    const updateTheme = () => {
-      setIsDarkTheme(root.classList.contains('dark'));
-      setThemeSignal(getThemeSignal());
-    };
-    const observer = new MutationObserver(updateTheme);
-    observer.observe(root, {
-      attributes: true,
-      attributeFilter: ['class', 'style', 'data-immersive-theme'],
-    });
-    return () => observer.disconnect();
-  }, []);
 
   const closeTabBinding = useMemo(
     () => keyBindings.find((binding) => binding.action === 'closeTab'),
     [keyBindings],
   );
+  closeTabCommandWEnabledRef.current = isTextEditorCommandWEnabled({
+    hotkeyScheme,
+    closeTabBinding,
+    isMac: isMacPlatform,
+  });
 
   const handleSave = useCallback(() => {
     if (saving) return;
@@ -399,6 +293,7 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
     // key-event dispatcher fires first for focused editor keystrokes, so
     // registering the command here is the reliable path.
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => {
+      if (!closeTabCommandWEnabledRef.current) return;
       handleCloseRef.current?.();
     });
 
@@ -409,31 +304,13 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
     });
 
     // Fallback paste path for Electron environments where Monaco paste can fail.
-    // Skip custom paste when focus is inside the find/replace widget so that
-    // its input fields receive the pasted text via default browser behavior.
+    // When focus is in the find/replace widget, paste into that input instead of the body.
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
-      const active = document.activeElement;
-      if (active?.closest('.find-widget')) {
-        // Read clipboard and insert into the find/replace input field.
-        void (async () => {
-          try {
-            const text = await readClipboardTextRef.current();
-            if (!text) return;
-            // Monaco find widget inputs are <textarea> elements inside .monaco-inputbox
-            if (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement) {
-              const start = active.selectionStart ?? active.value.length;
-              const end = active.selectionEnd ?? active.value.length;
-              active.focus();
-              active.setSelectionRange(start, end);
-              document.execCommand('insertText', false, text);
-            }
-          } catch {
-            // Ignore – paste simply won't work
-          }
-        })();
-        return;
-      }
-      void handlePasteRef.current();
+      void pasteForMonacoEditorCommand({
+        activeElement: document.activeElement,
+        readClipboardText: () => readClipboardTextRef.current(),
+        pasteIntoEditor: () => handlePasteRef.current(),
+      });
     });
 
     editor.focus();
@@ -465,6 +342,8 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
 
   const supportedLanguages = useMemo(() => getSupportedLanguages(), []);
   const monacoLanguage = useMemo(() => languageIdToMonaco(languageId), [languageId]);
+  const languageName = useMemo(() => getLanguageName(languageId), [languageId]);
+  const contentStats = useMemo(() => getTextEditorContentStats(content), [content]);
   const languageOptions = useMemo(
     () => supportedLanguages.map((lang) => ({ value: lang.id, label: lang.name })),
     [supportedLanguages],
@@ -477,35 +356,35 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
       data-hotkey-close-tab={chrome === 'modal' ? 'true' : undefined}
     >
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border/60 flex-shrink-0">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-baseline gap-2 flex-1 min-w-0">
-            <span className="text-sm font-semibold truncate flex-shrink-0">
+      <div className="h-9 px-3 py-1.5 border-b border-border/60 flex-shrink-0">
+        <div className="flex h-full items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <span className="flex-shrink-0 truncate text-sm font-semibold leading-5">
               {fileName}
             </span>
             {subtitle && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="text-xs text-muted-foreground truncate cursor-default">
+                  <span className="cursor-default truncate text-xs leading-4 text-muted-foreground">
                     {subtitle}
                   </span>
                 </TooltipTrigger>
                 <TooltipContent>{subtitle}</TooltipContent>
               </Tooltip>
             )}
-            {saveError && <span className="text-xs text-destructive truncate">{saveError}</span>}
+            {saveError && <span className="truncate text-xs leading-4 text-destructive">{saveError}</span>}
           </div>
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex h-6 items-center gap-2 min-w-0">
             {/* Search button */}
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-7 w-7"
+                  className="h-6 w-6"
                   onClick={handleSearch}
                 >
-                  <Search size={14} />
+                  <Search size={13} />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{t('common.search')}</TooltipContent>
@@ -517,10 +396,10 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
                 <Button
                   variant={wordWrap ? 'secondary' : 'ghost'}
                   size="icon"
-                  className="h-7 w-7"
+                  className="h-6 w-6"
                   onClick={onToggleWordWrap}
                 >
-                  <WrapText size={14} />
+                  <WrapText size={13} />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{t('sftp.editor.wordWrap')}</TooltipContent>
@@ -532,21 +411,21 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
               value={languageId}
               onValueChange={(v) => onLanguageChange(v || 'plaintext')}
               placeholder={t('sftp.editor.syntaxHighlight')}
-              triggerClassName="h-7 max-w-[180px] min-w-[120px] text-xs"
+              triggerClassName="h-6 max-w-[170px] min-w-[112px] text-xs"
             />
 
             {/* Save button */}
             <Button
               variant="default"
               size="sm"
-              className="h-7"
+              className="h-6 px-2.5 text-xs"
               onClick={handleSave}
               disabled={saving}
             >
               {saving ? (
-                <Loader2 size={14} className="mr-1.5 animate-spin" />
+                <Loader2 size={13} className="mr-1 animate-spin" />
               ) : (
-                <CloudUpload size={14} className="mr-1.5" />
+                <CloudUpload size={13} className="mr-1" />
               )}
               {saving ? t('sftp.editor.saving') : t('sftp.editor.save')}
             </Button>
@@ -565,10 +444,10 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7"
+                className="h-6 w-6"
                 onClick={onRequestClose}
               >
-                <X size={14} />
+                <X size={13} />
               </Button>
             )}
           </div>
@@ -618,14 +497,17 @@ export const TextEditorPane: React.FC<TextEditorPaneProps> = ({
       {/* Footer */}
       <div className="px-4 py-2 border-t border-border/60 flex items-center justify-between text-xs text-muted-foreground bg-muted/30 flex-shrink-0">
         <span>
-          {getLanguageName(languageId)}
+          {languageName}
         </span>
         <span>
-          {content.split('\n').length} lines • {content.length} characters
+          {contentStats.lineCount} lines • {contentStats.charCount} characters
         </span>
       </div>
     </div>
   );
 };
+
+export const TextEditorPane = React.memo(TextEditorPaneInner);
+TextEditorPane.displayName = 'TextEditorPane';
 
 export default TextEditorPane;

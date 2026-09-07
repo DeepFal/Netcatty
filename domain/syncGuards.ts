@@ -9,16 +9,7 @@ export type ShrinkFinding =
   | {
       suspicious: true;
       reason: 'bulk-shrink' | 'large-shrink';
-      entityType:
-        | 'hosts'
-        | 'keys'
-        | 'identities'
-        | 'proxyProfiles'
-        | 'snippets'
-        | 'customGroups'
-        | 'snippetPackages'
-        | 'portForwardingRules'
-        | 'groupConfigs';
+      entityType: CloudSyncPayloadEntityKey;
       baseCount: number;
       outgoingCount: number;
       lost: number;
@@ -60,6 +51,28 @@ export function detectSuspiciousShrink(
     const outgoingCount = countOf(outgoing, entityType);
     const lost = baseCount - outgoingCount;
     if (lost <= 0) continue;
+
+    // groupConfigs often hold startup commands / host appearance for only one
+    // or two folders. A hydration race that uploads hosts + groupConfigs:[]
+    // falls below the bulk/ratio gates (#2757). Only flag this entity — wiping
+    // the last snippet/note/etc. while hosts remain stays a normal delete.
+    // Fully empty outgoing snapshots remain allowed as real deletions.
+    if (
+      entityType === 'groupConfigs'
+      && outgoingCount === 0
+      && baseCount > 0
+      && CHECKED_ENTITIES.some((other) => other !== entityType && countOf(outgoing, other) > 0)
+    ) {
+      return {
+        suspicious: true,
+        reason: lost >= LARGE_SHRINK_ABSOLUTE ? 'large-shrink' : 'bulk-shrink',
+        entityType,
+        baseCount,
+        outgoingCount,
+        lost,
+        ...(viaRemote ? { viaRemote: true } : {}),
+      };
+    }
 
     if (lost >= LARGE_SHRINK_ABSOLUTE) {
       return {

@@ -1,8 +1,47 @@
 import { ArrowLeft, MoreVertical, X } from 'lucide-react';
 import React, { createContext, ReactNode, useCallback, useContext, useMemo, useState } from 'react';
 import { cn } from '../../lib/utils';
+import { localStorageAdapter } from '@/infrastructure/persistence/localStorageAdapter';
 import { Popover, PopoverContent, PopoverTrigger } from './popover';
 import { ScrollArea } from './scroll-area';
+
+export const DEFAULT_ASIDE_INLINE_WIDTH_PX = 380;
+const MIN_ASIDE_INLINE_WIDTH_PX = 320;
+const MAX_ASIDE_INLINE_WIDTH_PX = 720;
+
+export function clampAsideInlineWidth(width: number): number {
+    return Math.max(MIN_ASIDE_INLINE_WIDTH_PX, Math.min(MAX_ASIDE_INLINE_WIDTH_PX, width));
+}
+
+export interface AsidePanelResizeProps {
+    resizable?: boolean;
+    persistWidthStorageKey?: string;
+    resizeAriaLabel?: string;
+}
+
+function parseInlineWidthPx(width: string): number {
+    const arbitraryWidthMatch = width.match(/w-\[(.+)\]/);
+    if (arbitraryWidthMatch) {
+        const raw = arbitraryWidthMatch[1].trim();
+        const parsed = parseInt(raw, 10);
+        if (!Number.isNaN(parsed)) return clampAsideInlineWidth(parsed);
+    }
+
+    switch (width) {
+        case 'w-full':
+        case 'w-screen':
+            return DEFAULT_ASIDE_INLINE_WIDTH_PX;
+        default:
+            return DEFAULT_ASIDE_INLINE_WIDTH_PX;
+    }
+}
+
+function readPersistedAsideWidth(storageKey: string | undefined, fallback: number): number {
+    if (!storageKey) return fallback;
+    const stored = localStorageAdapter.readNumber(storageKey);
+    if (stored === null) return fallback;
+    return clampAsideInlineWidth(stored);
+}
 
 // Types
 interface AsideContentItem {
@@ -23,6 +62,7 @@ interface AsidePanelContextType {
 }
 
 const AsidePanelContext = createContext<AsidePanelContextType | null>(null);
+const AsideActionMenuContext = createContext<(() => void) | null>(null);
 
 export const useAsidePanel = () => {
     const context = useContext(AsidePanelContext);
@@ -33,7 +73,7 @@ export const useAsidePanel = () => {
 };
 
 // Props
-interface AsidePanelProps {
+interface AsidePanelProps extends AsidePanelResizeProps {
     open: boolean;
     onClose: () => void;
     title?: string;
@@ -133,18 +173,31 @@ interface AsideActionMenuProps {
 }
 
 export const AsideActionMenu: React.FC<AsideActionMenuProps> = ({ children }) => {
+    const [open, setOpen] = useState(false);
+    const close = useCallback(() => setOpen(false), []);
+
     return (
-        <Popover>
+        <Popover open={open} onOpenChange={setOpen}>
             <PopoverTrigger asChild>
                 <button className="p-1.5 hover:bg-muted rounded-md transition-colors cursor-pointer">
                     <MoreVertical size={18} />
                 </button>
             </PopoverTrigger>
             <PopoverContent className="w-40 p-1" align="end">
-                {children}
+                <AsideActionMenuContext.Provider value={close}>
+                    {children}
+                </AsideActionMenuContext.Provider>
             </PopoverContent>
         </Popover>
     );
+};
+
+export const invokeAsideActionMenuItemClick = (
+    closeMenu: (() => void) | null,
+    onClick?: () => void,
+) => {
+    closeMenu?.();
+    onClick?.();
 };
 
 // Action Menu Item
@@ -154,9 +207,11 @@ export const AsideActionMenuItem: React.FC<{
     onClick?: () => void;
     variant?: 'default' | 'destructive';
 }> = ({ icon, children, onClick, variant = 'default' }) => {
+    const closeMenu = useContext(AsideActionMenuContext);
+
     return (
         <button
-            onClick={onClick}
+            onClick={() => invokeAsideActionMenuItemClick(closeMenu, onClick)}
             className={cn(
                 "w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors cursor-pointer",
                 variant === 'destructive'
@@ -258,7 +313,7 @@ export const AsidePanelStack: React.FC<AsidePanelStackProps> = ({
         <AsidePanelContext.Provider value={{ push, pop, replace, clear, canGoBack, currentItem }}>
             <div className={cn(
                 layout === 'inline'
-                    ? "relative split-panel-enter shrink-0 h-full min-h-0 max-w-full border-l border-border/60 bg-background z-30 flex flex-col app-no-drag overflow-hidden shadow-[-16px_0_32px_hsl(var(--foreground)/0.08)]"
+                    ? "relative split-panel-enter shrink-0 h-full min-h-0 max-w-full border-l border-border/60 bg-background flex flex-col app-no-drag overflow-hidden shadow-[-16px_0_32px_hsl(var(--foreground)/0.08)]"
                     : "absolute right-0 top-0 bottom-0 max-w-full border-l border-border/60 bg-background z-30 flex flex-col app-no-drag overflow-hidden",
                 layout === 'overlay' && width,
                 className
@@ -292,28 +347,91 @@ export const AsidePanel: React.FC<AsidePanelProps> = ({
     className,
     width = 'w-[380px]',
     layout = 'overlay',
+    resizable = false,
+    persistWidthStorageKey,
+    resizeAriaLabel,
     dataSection,
 }) => {
-    if (!open) return null;
+    const fallbackWidthPx = parseInlineWidthPx(width);
+    const [panelWidthPx, setPanelWidthPx] = useState(() =>
+        resizable ? readPersistedAsideWidth(persistWidthStorageKey, fallbackWidthPx) : fallbackWidthPx,
+    );
+    const [isResizing, setIsResizing] = useState(false);
+    const effectivePanelWidthPx = resizable ? panelWidthPx : fallbackWidthPx;
+    // Resizable panels always use pixel width so overlay and inline share the same drag path.
+    const usesPixelWidth = resizable || layout === 'inline';
 
-    const inlineWidth = resolveInlineWidth(width);
-    const inlineStyle = layout === 'inline'
+    const panelStyle = usesPixelWidth
         ? ({
-            width: inlineWidth,
-            ['--aside-inline-width' as string]: inlineWidth,
+            width: `${effectivePanelWidthPx}px`,
+            ['--aside-inline-width' as string]: `${effectivePanelWidthPx}px`,
         } as React.CSSProperties)
         : undefined;
+
+    const handleResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        if (!resizable) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        const startX = event.clientX;
+        const startWidth = panelWidthPx;
+        const previousCursor = document.body.style.cursor;
+        const previousUserSelect = document.body.style.userSelect;
+
+        setIsResizing(true);
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+
+        const handlePointerMove = (moveEvent: PointerEvent) => {
+            setPanelWidthPx(clampAsideInlineWidth(startWidth + startX - moveEvent.clientX));
+        };
+        const handlePointerUp = (upEvent: PointerEvent) => {
+            const nextWidth = clampAsideInlineWidth(startWidth + startX - upEvent.clientX);
+            setPanelWidthPx(nextWidth);
+            if (persistWidthStorageKey) {
+                localStorageAdapter.writeNumber(persistWidthStorageKey, nextWidth);
+            }
+            setIsResizing(false);
+            document.body.style.cursor = previousCursor;
+            document.body.style.userSelect = previousUserSelect;
+            window.removeEventListener('pointermove', handlePointerMove);
+            window.removeEventListener('pointerup', handlePointerUp);
+            window.removeEventListener('pointercancel', handlePointerUp);
+        };
+
+        window.addEventListener('pointermove', handlePointerMove);
+        window.addEventListener('pointerup', handlePointerUp);
+        window.addEventListener('pointercancel', handlePointerUp);
+    }, [panelWidthPx, persistWidthStorageKey, resizable]);
+
+    if (!open) return null;
 
     return (
         <div className={cn(
             layout === 'inline'
-                ? "relative split-panel-enter shrink-0 h-full min-h-0 max-w-full border-l border-border/60 bg-background z-30 flex flex-col app-no-drag overflow-hidden shadow-[-16px_0_32px_hsl(var(--foreground)/0.08)]"
+                ? "relative split-panel-enter shrink-0 h-full min-h-0 max-w-full border-l border-border/60 bg-background flex flex-col app-no-drag overflow-hidden shadow-[-16px_0_32px_hsl(var(--foreground)/0.08)]"
                 : "absolute right-0 top-0 bottom-0 max-w-full border-l border-border/60 bg-background z-30 flex flex-col app-no-drag overflow-hidden",
-            layout === 'overlay' && width,
+            layout === 'overlay' && !usesPixelWidth && width,
+            isResizing && 'transition-none',
             className
         )}
-        style={inlineStyle}
+        style={panelStyle}
         data-section={dataSection}>
+            {resizable ? (
+                <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label={resizeAriaLabel}
+                    className={cn(
+                        'absolute left-0 top-0 z-40 h-full w-2 -translate-x-1/2 cursor-col-resize',
+                        'after:absolute after:left-1/2 after:top-2 after:h-[calc(100%-16px)] after:w-px after:-translate-x-1/2 after:bg-border/0 after:transition-colors',
+                        'hover:after:bg-border/70',
+                        isResizing && 'after:bg-primary/70',
+                    )}
+                    onPointerDown={handleResizeStart}
+                />
+            ) : null}
             {title && (
                 <AsidePanelHeader
                     title={title}

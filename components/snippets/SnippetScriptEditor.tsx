@@ -3,9 +3,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { STORAGE_KEY_SNIPPET_SCRIPT_EDITOR_HEIGHT } from '@/infrastructure/config/storageKeys.ts';
 import { localStorageAdapter } from '@/infrastructure/persistence/localStorageAdapter.ts';
-import { cn } from '@/lib/utils.ts';
 import { Button } from '../ui/button';
-import { CodeTextarea } from '../ui/code-textarea';
+import {
+  ScriptCodeEditor,
+  type ScriptCodeEditorHandle,
+} from '../scripts/ScriptCodeEditor';
 import {
   Dialog,
   DialogContent,
@@ -19,18 +21,26 @@ const DEFAULT_HEIGHT = 120;
 const MIN_HEIGHT = 80;
 const MAX_HEIGHT = 520;
 
-function clampHeight(height: number): number {
-  return Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, height));
+function clampHeight(height: number, minHeight = MIN_HEIGHT, maxHeight = MAX_HEIGHT): number {
+  return Math.max(minHeight, Math.min(maxHeight, height));
 }
 
-function readStoredHeight(): number {
+function readStoredHeight({
+  defaultHeight,
+  minHeight,
+  maxHeight,
+  persistHeight,
+}: {
+  defaultHeight: number;
+  minHeight: number;
+  maxHeight: number;
+  persistHeight: boolean;
+}): number {
+  if (!persistHeight) return clampHeight(defaultHeight, minHeight, maxHeight);
   const stored = localStorageAdapter.readNumber(STORAGE_KEY_SNIPPET_SCRIPT_EDITOR_HEIGHT);
-  if (stored === null) return DEFAULT_HEIGHT;
-  return clampHeight(stored);
+  if (stored === null) return clampHeight(defaultHeight, minHeight, maxHeight);
+  return clampHeight(stored, minHeight, maxHeight);
 }
-
-const editorFillClass =
-  '[&>div]:h-full [&_textarea]:h-full [&_textarea]:min-h-0 [&_textarea]:overflow-auto';
 
 export interface SnippetScriptEditorProps {
   value: string;
@@ -39,6 +49,12 @@ export interface SnippetScriptEditorProps {
   id?: string;
   /** Shown on the same row as the expand button (e.g. "Script *"). */
   label?: string;
+  defaultHeight?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  persistHeight?: boolean;
+  /** Save or submit the surrounding form with Cmd/Ctrl+Enter. */
+  onSubmitShortcut?: () => void;
 }
 
 export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
@@ -47,11 +63,22 @@ export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
   placeholder,
   id,
   label,
+  defaultHeight = DEFAULT_HEIGHT,
+  minHeight = MIN_HEIGHT,
+  maxHeight = MAX_HEIGHT,
+  persistHeight = true,
+  onSubmitShortcut,
 }) => {
   const { t } = useI18n();
-  const [height, setHeight] = useState(readStoredHeight);
+  const [height, setHeight] = useState(() => readStoredHeight({
+    defaultHeight,
+    minHeight,
+    maxHeight,
+    persistHeight,
+  }));
   const [modalOpen, setModalOpen] = useState(false);
   const dragRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const inlineEditorRef = useRef<ScriptCodeEditorHandle>(null);
   const heightRef = useRef(height);
   heightRef.current = height;
 
@@ -66,10 +93,10 @@ export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
     const onMove = (e: MouseEvent) => {
       if (!dragRef.current) return;
       const delta = e.clientY - dragRef.current.startY;
-      setHeight(clampHeight(dragRef.current.startHeight + delta));
+      setHeight(clampHeight(dragRef.current.startHeight + delta, minHeight, maxHeight));
     };
     const onUp = () => {
-      if (dragRef.current) {
+      if (dragRef.current && persistHeight) {
         localStorageAdapter.writeNumber(
           STORAGE_KEY_SNIPPET_SCRIPT_EDITOR_HEIGHT,
           heightRef.current,
@@ -87,7 +114,7 @@ export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
-  }, []);
+  }, [maxHeight, minHeight, persistHeight]);
 
   return (
     <>
@@ -96,8 +123,9 @@ export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
           {label ? (
             id ? (
               <label
-                htmlFor={id}
+                id={`${id}-label`}
                 className="text-xs font-semibold text-muted-foreground shrink-0 cursor-text"
+                onClick={() => inlineEditorRef.current?.focus()}
               >
                 {label}
               </label>
@@ -124,17 +152,22 @@ export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
             <TooltipContent>{t('snippets.scriptEditor.expand')}</TooltipContent>
           </Tooltip>
         </div>
-        <div className="relative rounded-md" style={{ height }}>
-          <div className={cn('h-full min-h-0 overflow-hidden', editorFillClass)}>
-            <CodeTextarea
-              id={id}
-              placeholder={placeholder}
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              className="min-h-0"
-              wrapperClassName="h-full"
-            />
-          </div>
+        <div
+          className="relative overflow-hidden rounded-md border border-border/60 bg-background"
+          style={{ height }}
+        >
+          <ScriptCodeEditor
+            ref={inlineEditorRef}
+            value={value}
+            onChange={onChange}
+            language="shell"
+            fill
+            height={height}
+            ariaLabel={label || placeholder}
+            placeholder={placeholder}
+            tabFocusMode
+            onSubmitShortcut={onSubmitShortcut}
+          />
           <div
             role="separator"
             aria-orientation="horizontal"
@@ -152,14 +185,17 @@ export const SnippetScriptEditor: React.FC<SnippetScriptEditorProps> = ({
           <DialogHeader className="px-6 pt-6 pb-3 shrink-0">
             <DialogTitle>{t('snippets.scriptEditor.modalTitle')}</DialogTitle>
           </DialogHeader>
-          <div className={cn('flex-1 min-h-0 px-6 pb-3 overflow-hidden', editorFillClass)}>
-            <CodeTextarea
-              placeholder={placeholder}
+          <div className="flex-1 min-h-0 mx-6 mb-3 overflow-hidden rounded-md border border-border/60 bg-background">
+            <ScriptCodeEditor
               value={value}
-              onChange={(e) => onChange(e.target.value)}
-              className="min-h-0"
-              wrapperClassName="h-full"
+              onChange={onChange}
+              language="shell"
+              fill
               autoFocus
+              active={modalOpen}
+              ariaLabel={label || placeholder}
+              placeholder={placeholder}
+              onSubmitShortcut={onSubmitShortcut}
             />
           </div>
           <DialogFooter className="px-6 pb-6 pt-2 shrink-0">

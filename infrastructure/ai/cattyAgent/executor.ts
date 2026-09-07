@@ -1,4 +1,7 @@
 import type { ToolCall, ToolResult, AIPermissionMode, WebSearchConfig } from '../types';
+import type {
+  TerminalContextReader,
+} from '../../../domain/terminalContextRead';
 import {
   executeTerminalExecute,
   executeWorkspaceGetInfo,
@@ -8,6 +11,7 @@ import {
   type ToolDeps,
   type ToolExecResult,
 } from '../shared/toolExecutors';
+import { fitTerminalExecuteResultForModel } from '../harness/terminalCompression';
 
 /**
  * Bridge interface for Catty Agent to interact with the Electron main process.
@@ -33,6 +37,12 @@ export interface NetcattyBridge {
    * `aiExec` but before the main process has registered it.
    */
   aiCattyCancelExec?(chatSessionId: string): Promise<unknown>;
+  aiSetChatSessionCancelled?(chatSessionId: string, cancelled?: boolean): Promise<{ ok: boolean; error?: string }>;
+  aiCapability?(
+    rpcMethod: string,
+    params: Record<string, unknown>,
+    chatSessionId?: string,
+  ): Promise<unknown>;
 }
 
 // Workspace context provided to the executor
@@ -53,11 +63,31 @@ export interface ExecutorContext {
   // Workspace info
   workspaceId?: string;
   workspaceName?: string;
+  readTerminalContext?: TerminalContextReader;
 }
 
 /** Convert a shared ToolExecResult into the executor's ToolResult format. */
 function toToolResult(toolCallId: string, r: ToolExecResult): ToolResult {
   if (r.ok === false) {
+    if (
+      typeof r.data === 'object'
+      && r.data !== null
+      && 'stdout' in r.data
+      && 'stderr' in r.data
+      && 'exitCode' in r.data
+    ) {
+      const fitted = fitTerminalExecuteResultForModel(r.data as {
+        stdout: string;
+        stderr: string;
+        exitCode: number | null;
+      });
+      const output = [
+        r.error,
+        fitted.stdout ? `Partial output:\n${fitted.stdout}` : '',
+        fitted.stderr ? `Stderr:\n${fitted.stderr}` : '',
+      ].filter(Boolean).join('\n\n');
+      return { toolCallId, content: output, isError: true };
+    }
     return { toolCallId, content: r.error, isError: true };
   }
   // For terminal_execute, format as the legacy STDOUT/STDERR/exitCode text block

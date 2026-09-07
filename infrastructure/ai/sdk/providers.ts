@@ -1,8 +1,12 @@
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
+import { createGoogle } from '@ai-sdk/google';
 import type { ProviderConfig, ProviderStyle } from '../types';
-import { resolveProviderStyle } from '../types';
+import { resolveOpenAIApi, resolveProviderStyle } from '../types';
+import { normalizeAnthropicSdkBaseURL } from '../anthropicCompatBaseUrl';
+import { normalizeOllamaSdkBaseURL } from '../ollamaCompatBaseUrl';
+
+export { normalizeOllamaSdkBaseURL };
 import {
   applyOpenAIChatContinuationToBody,
   extractProviderContinuationFromRawChunk,
@@ -14,6 +18,7 @@ import {
 
 export interface ProviderRequestContext {
   getOpenAIChatAssistantFields?: () => Array<OpenAIChatAssistantFields | undefined>;
+  streamIdleTimeoutMs?: number;
 }
 
 /**
@@ -38,7 +43,8 @@ interface BridgeAPI {
     headers: Record<string, string>,
     body: string,
     providerId?: string,
-  ): Promise<{ ok: boolean; statusCode?: number; statusText?: string; error?: string }>;
+    idleTimeoutMs?: number,
+  ): Promise<{ ok: boolean; statusCode?: number; statusText?: string; error?: string; aborted?: boolean }>;
   onAiStreamData(requestId: string, cb: (data: string) => void): () => void;
   onAiStreamEnd(requestId: string, cb: () => void): () => void;
   onAiStreamError(requestId: string, cb: (error: string) => void): () => void;
@@ -119,7 +125,14 @@ function createOpenAIChatStreamFieldCapture(
 
 function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) => string {
   const toolCallIdsByChoiceAndIndex = new Map<string, string>();
+  const toolCallNamesByChoiceAndIndex = new Map<string, string>();
   const pendingToolCallsByChoiceAndIndex = new Map<string, Record<string, unknown>>();
+  // Full concatenation of every arguments fragment seen for a tool call key,
+  // so a tool call the SDK has not seen yet can be forwarded self-describing.
+  const argumentsSeenByKey = new Map<string, string>();
+  // Keys forwarded inside choices array position 0 — the only element the
+  // AI SDK reads. Tool calls living at position > 0 are invisible to it.
+  const sdkVisibleKeys = new Set<string>();
   const requestIdToken = requestId.replace(/[^a-zA-Z0-9_-]/g, '_');
 
   return (data: string): string => {
@@ -157,6 +170,13 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
         const toolCallRecord = toolCall as Record<string, unknown>;
         const toolCallIndex = typeof toolCallRecord.index === 'number' ? toolCallRecord.index : toolCallPosition;
         const key = `${choiceIndex}:${toolCallIndex}`;
+        const recordFn = toolCallRecord.function;
+        const recordArguments = recordFn && typeof recordFn === 'object'
+          ? (recordFn as Record<string, unknown>).arguments
+          : undefined;
+        if (typeof recordArguments === 'string') {
+          argumentsSeenByKey.set(key, (argumentsSeenByKey.get(key) ?? '') + recordArguments);
+        }
         const existingId = toolCallIdsByChoiceAndIndex.get(key);
         const pendingToolCall = pendingToolCallsByChoiceAndIndex.get(key);
         const candidateToolCall = pendingToolCall
@@ -164,7 +184,34 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
           : toolCallRecord;
 
         if (existingId) {
-          normalizedToolCalls.push(toolCall);
+          const rememberedName = toolCallNamesByChoiceAndIndex.get(key);
+          const needsFullArguments = choicePosition === 0 && !sdkVisibleKeys.has(key);
+          let normalizedToolCall = normalizeOpenAIChatToolCall(
+            toolCallRecord,
+            existingId,
+            rememberedName,
+          );
+          if (needsFullArguments) {
+            normalizedToolCall = injectFullOpenAIChatToolCallArguments(
+              normalizedToolCall,
+              argumentsSeenByKey.get(key),
+            );
+          }
+          if (choicePosition === 0) {
+            sdkVisibleKeys.add(key);
+          }
+          if (
+            normalizedToolCall.id === toolCallRecord.id &&
+            normalizedToolCall.type === toolCallRecord.type &&
+            normalizedToolCall.function === toolCallRecord.function &&
+            (!rememberedName || hasFunctionName(toolCallRecord))
+          ) {
+            normalizedToolCalls.push(toolCall);
+          } else {
+            changed = true;
+            deltaChanged = true;
+            normalizedToolCalls.push(normalizedToolCall);
+          }
           continue;
         }
 
@@ -179,16 +226,38 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
           ? candidateToolCall.id
           : `call_netcatty_${requestIdToken}_${choiceIndex}_${toolCallIndex}`;
         toolCallIdsByChoiceAndIndex.set(key, toolCallId);
+        const candidateFunction = candidateToolCall.function;
+        if (candidateFunction && typeof candidateFunction === 'object') {
+          toolCallNamesByChoiceAndIndex.set(
+            key,
+            (candidateFunction as Record<string, unknown>).name as string,
+          );
+        }
         pendingToolCallsByChoiceAndIndex.delete(key);
+        let normalizedToolCall = normalizeOpenAIChatToolCall(candidateToolCall, toolCallId);
+        if (choicePosition === 0 && !sdkVisibleKeys.has(key)) {
+          normalizedToolCall = injectFullOpenAIChatToolCallArguments(
+            normalizedToolCall,
+            argumentsSeenByKey.get(key),
+          );
+        }
+        if (choicePosition === 0) {
+          sdkVisibleKeys.add(key);
+        }
 
-        if (candidateToolCall === toolCallRecord && toolCallId === toolCallRecord.id) {
+        if (
+          candidateToolCall === toolCallRecord &&
+          toolCallId === toolCallRecord.id &&
+          normalizedToolCall.type === toolCallRecord.type &&
+          normalizedToolCall.function === toolCallRecord.function
+        ) {
           normalizedToolCalls.push(toolCall);
           continue;
         }
 
         changed = true;
         deltaChanged = true;
-        normalizedToolCalls.push({ ...candidateToolCall, id: toolCallId });
+        normalizedToolCalls.push(normalizedToolCall);
       }
 
       if (!deltaChanged) return choice;
@@ -221,10 +290,17 @@ function mergeOpenAIChatToolCallDeltas(
   const incomingFunction = incomingFn && typeof incomingFn === 'object'
     ? incomingFn as Record<string, unknown>
     : undefined;
-  const mergedFunction = {
+  const mergedFunction: Record<string, unknown> = {
     ...(currentFunction ?? {}),
     ...(incomingFunction ?? {}),
   };
+  if (
+    typeof currentFunction?.name === 'string' &&
+    currentFunction.name &&
+    incomingFunction?.name === ''
+  ) {
+    mergedFunction.name = currentFunction.name;
+  }
   const currentArgs = currentFunction?.arguments;
   const incomingArgs = incomingFunction?.arguments;
   if (typeof currentArgs === 'string' && typeof incomingArgs === 'string') {
@@ -235,6 +311,51 @@ function mergeOpenAIChatToolCallDeltas(
     ...current,
     ...incoming,
     function: mergedFunction,
+  };
+}
+
+function normalizeOpenAIChatToolCall(
+  toolCall: Record<string, unknown>,
+  toolCallId: string,
+  rememberedName?: string,
+): Record<string, unknown> {
+  const normalized = { ...toolCall, id: toolCallId };
+  if (
+    normalized.type === '' ||
+    normalized.type == null ||
+    (typeof normalized.type === 'string' && normalized.type !== 'function')
+  ) {
+    normalized.type = 'function';
+  }
+  const fn = normalized.function;
+  if (fn && typeof fn === 'object') {
+    const fnRecord = fn as Record<string, unknown>;
+    if (!hasFunctionName({ function: fnRecord })) {
+      const normalizedFunction = { ...fnRecord };
+      if (rememberedName) {
+        normalizedFunction.name = rememberedName;
+      } else if (fnRecord.name === '' || fnRecord.name === null) {
+        delete normalizedFunction.name;
+      }
+      normalized.function = normalizedFunction;
+    }
+  } else if (rememberedName) {
+    normalized.function = { name: rememberedName };
+  }
+  return normalized;
+}
+
+function injectFullOpenAIChatToolCallArguments(
+  toolCall: Record<string, unknown>,
+  fullArguments: string | undefined,
+): Record<string, unknown> {
+  if (fullArguments === undefined) return toolCall;
+  const fn = toolCall.function;
+  const fnRecord = fn && typeof fn === 'object' ? fn as Record<string, unknown> : undefined;
+  if (fnRecord?.arguments === fullArguments) return toolCall;
+  return {
+    ...toolCall,
+    function: { ...(fnRecord ?? {}), arguments: fullArguments },
   };
 }
 
@@ -346,23 +467,60 @@ export function createBridgeFetchForSDK(
       // Set up IPC event listeners BEFORE starting the stream to avoid
       // missing early events.
       const encoder = new TextEncoder();
-      let streamController: ReadableStreamDefaultController<Uint8Array>;
+      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const pendingChunks: Uint8Array[] = [];
+      let pendingClose = false;
+      let pendingError: Error | null = null;
       let cleanedUp = false;
+
+      const enqueueChunk = (chunk: Uint8Array) => {
+        if (streamController) {
+          streamController.enqueue(chunk);
+          return;
+        }
+        pendingChunks.push(chunk);
+      };
+      const closeStream = () => {
+        if (streamController) {
+          try { streamController.close(); } catch { /* already closed */ }
+          return;
+        }
+        pendingClose = true;
+      };
+      const errorStream = (error: Error) => {
+        if (streamController) {
+          try { streamController.error(error); } catch { /* already errored */ }
+          return;
+        }
+        pendingError = error;
+      };
+      const flushPendingStreamEvents = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+        for (const chunk of pendingChunks.splice(0)) {
+          controller.enqueue(chunk);
+        }
+        if (pendingError) {
+          controller.error(pendingError);
+          return;
+        }
+        if (pendingClose) {
+          controller.close();
+        }
+      };
 
       const unsubData = bridge.onAiStreamData(requestId, (data: string) => {
         const normalizedData = normalizeOpenAIChatToolCalls(data);
         captureOpenAIChatFields(normalizedData);
         // Re-wrap as SSE so the SDK can parse it
-        streamController?.enqueue(encoder.encode(`data: ${normalizedData}\n\n`));
+        enqueueChunk(encoder.encode(`data: ${normalizedData}\n\n`));
       });
       const unsubEnd = bridge.onAiStreamEnd(requestId, () => {
-        try { streamController?.close(); } catch { /* already closed */ }
+        closeStream();
         cleanup();
       });
       const unsubError = bridge.onAiStreamError(
         requestId,
         (error: string) => {
-          try { streamController?.error(new Error(error)); } catch { /* already errored */ }
+          errorStream(new Error(error));
           cleanup();
         },
       );
@@ -381,7 +539,7 @@ export function createBridgeFetchForSDK(
           'abort',
           () => {
             bridge.aiChatCancel(requestId).catch(() => {});
-            try { streamController?.error(new DOMException('Aborted', 'AbortError')); } catch { /* already errored */ }
+            errorStream(new DOMException('Aborted', 'AbortError'));
             cleanup();
           },
           { once: true },
@@ -396,10 +554,16 @@ export function createBridgeFetchForSDK(
         headers,
         requestBody || '',
         providerId,
+        requestContext?.streamIdleTimeoutMs,
       );
 
       if (!result.ok) {
         cleanup();
+        // Cancel during proxy lookup / request start must stay an AbortError,
+        // not a synthetic 502 that the AI SDK treats as a provider failure.
+        if (result.aborted || resolvedInit?.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
         const errorMessage = result.error || 'Stream request failed';
         const jsonBody = JSON.stringify({ error: { message: errorMessage } });
         return new Response(jsonBody, {
@@ -428,6 +592,7 @@ export function createBridgeFetchForSDK(
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
           streamController = controller;
+          flushPendingStreamEvents(controller);
         },
       });
 
@@ -464,9 +629,10 @@ export function createBridgeFetchForSDK(
  *
  * The URL fallback fires regardless of style — the user picked this
  * providerId for a reason, even if they overrode the wire format. The
- * ollama `'ollama'` throwaway apiKey is style-specific: it's only meaningful
- * to the OpenAI-compat client, since Anthropic/Google clients need a real
- * key on their own URL.
+ * ollama `'ollama'` throwaway apiKey is only for unauthenticated local
+ * OpenAI-compat servers: Anthropic/Google need a real key, and Ollama
+ * Cloud must keep the IPC placeholder so the main process can inject
+ * the decrypted cloud key.
  */
 export function resolveProviderEndpoint(
   config: ProviderConfig,
@@ -476,12 +642,19 @@ export function resolveProviderEndpoint(
   let baseURL = config.baseURL;
   let apiKey = safeApiKey;
   if (config.providerId === 'ollama') {
-    baseURL = baseURL || 'http://localhost:11434/v1';
-    if (style === 'openai') {
+    baseURL = normalizeOllamaSdkBaseURL(baseURL || 'http://localhost:11434/v1');
+    if (style === 'openai' && !apiKey) {
       apiKey = 'ollama';
     }
   } else if (config.providerId === 'openrouter') {
     baseURL = baseURL || 'https://openrouter.ai/api/v1';
+  }
+  // @ai-sdk/anthropic expects baseURL to include /v1 (then appends /messages).
+  // Bare Claude Code style hosts get /v1 so chat matches probe/discovery.
+  // Custom path prefixes (e.g. …/anthropic) are left alone — they already
+  // complete the SDK base and must not become …/anthropic/v1.
+  if (style === 'anthropic' && baseURL) {
+    baseURL = normalizeAnthropicSdkBaseURL(baseURL);
   }
   return { baseURL, apiKey };
 }
@@ -498,13 +671,18 @@ export function createModelFromConfig(
   const { baseURL, apiKey } = resolveProviderEndpoint(config, style, safeApiKey);
 
   switch (style) {
-    case 'openai':
-      // Use .chat() to force Chat Completions API (not Responses API)
-      return createOpenAI({
+    case 'openai': {
+      const openai = createOpenAI({
         apiKey,
         baseURL,
         fetch: customFetch,
-      }).chat(modelId);
+      });
+      // Chat Completions stays the default so OpenAI-compatible proxies keep
+      // working. Responses is opt-in for relays that cache better on /v1/responses.
+      return resolveOpenAIApi(config) === 'responses'
+        ? openai.responses(modelId)
+        : openai.chat(modelId);
+    }
 
     case 'anthropic':
       return createAnthropic({
@@ -514,7 +692,7 @@ export function createModelFromConfig(
       })(modelId);
 
     case 'google':
-      return createGoogleGenerativeAI({
+      return createGoogle({
         apiKey,
         baseURL,
         fetch: customFetch,

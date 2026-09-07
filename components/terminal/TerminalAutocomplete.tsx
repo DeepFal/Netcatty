@@ -1,5 +1,5 @@
 import ReactDOM from "react-dom";
-import type { ComponentProps, RefObject } from "react";
+import { useCallback, type ComponentProps, type RefObject } from "react";
 import type { Terminal as XTerm } from "@xterm/xterm";
 import {
   useTerminalAutocomplete,
@@ -7,6 +7,10 @@ import {
   type AutocompleteSettings,
 } from "./autocomplete";
 import type { Snippet } from "../../domain/models";
+import { usePaneVisible } from "./paneVisibilityStore";
+import { getWindowPluginTerminalProviderRegistry } from "../../application/state/pluginTerminalProviderRegistry";
+import { provideTerminalCompletions } from "./autocomplete/terminalCompletionProviders";
+import { shouldUsePluginTerminalCompletionProvider } from "../../domain/terminalPromptSecurity";
 
 type PopupProps = ComponentProps<typeof AutocompletePopup>;
 
@@ -17,15 +21,18 @@ interface TerminalAutocompleteProps {
   termRef: RefObject<XTerm | null>;
   sessionId: string;
   hostId: string;
+  hostGroup?: string;
   hostOs: "linux" | "windows" | "macos";
   settings?: Partial<AutocompleteSettings>;
   protocol?: string;
+  workspaceId?: string;
+  status?: "connecting" | "connected" | "disconnected";
+  /** Pane visibility fallback when paneVisibilityStore has no entry (popup terminals). */
+  isVisible?: boolean;
   getCwd?: () => string | undefined;
   onAcceptText: (text: string) => void;
   snippets?: Snippet[];
   onAcceptSnippet?: (snippet: Snippet) => void;
-  /** Whether this terminal tab is the visible one. */
-  visible: boolean;
   themeColors: PopupProps["themeColors"];
   containerRef: PopupProps["containerRef"];
   searchBarOffset: number;
@@ -34,6 +41,13 @@ interface TerminalAutocompleteProps {
   inputRef: HandlerRef<(data: string) => void>;
   repositionRef: HandlerRef<() => void>;
   closeRef: HandlerRef<() => void>;
+  sudoHintRef: HandlerRef<(active: boolean) => boolean>;
+  sudoHintText: string;
+  isPluginCompletionProviderAvailable?: () => boolean;
+  sensitiveInputActiveRef: RefObject<boolean>;
+  allowHostStyleGreaterThanPrompt?: boolean;
+  /** Vendor CLI / network-device session: skip live-preview PTY rewrites (#1193). */
+  isNetworkDevice?: boolean;
 }
 
 /**
@@ -52,14 +66,17 @@ export function TerminalAutocomplete({
   termRef,
   sessionId,
   hostId,
+  hostGroup,
   hostOs,
   settings,
   protocol,
+  workspaceId,
+  status = "connected",
+  isVisible = true,
   getCwd,
   onAcceptText,
   snippets,
   onAcceptSnippet,
-  visible,
   themeColors,
   containerRef,
   searchBarOffset,
@@ -67,11 +84,61 @@ export function TerminalAutocomplete({
   inputRef,
   repositionRef,
   closeRef,
+  sudoHintRef,
+  sudoHintText,
+  isPluginCompletionProviderAvailable,
+  sensitiveInputActiveRef,
+  allowHostStyleGreaterThanPrompt = false,
+  isNetworkDevice = false,
 }: TerminalAutocompleteProps) {
+  // Self-subscribe to this pane's visibility so toggling it doesn't have to
+  // flow through (and re-render) the TerminalView ctx. Popup / standalone
+  // Terminal mounts never publish the store — fall back to the isVisible prop
+  // (same contract as hibernate).
+  const visible = usePaneVisible(sessionId, isVisible);
+  const provideCompletions = useCallback(async (
+    input: string,
+    options: Parameters<typeof import("./autocomplete/completionEngine").getCompletions>[1] & {
+      promptText: string;
+      signal?: AbortSignal;
+    },
+  ) => {
+    const normalizedProtocol: NetcattyTerminalSessionSnapshot['protocol'] = protocol ?? "ssh";
+    const pluginRegistry = isPluginCompletionProviderAvailable?.() === false
+      || options.allowExternalProviders === false
+      || !shouldUsePluginTerminalCompletionProvider({
+        sensitiveInputActive: sensitiveInputActiveRef.current === true,
+        promptText: options.promptText,
+        allowHostStyleGreaterThan: allowHostStyleGreaterThanPrompt,
+      })
+      ? null
+      : getWindowPluginTerminalProviderRegistry();
+    return provideTerminalCompletions(pluginRegistry, {
+      input,
+      session: {
+        sessionId,
+        ...(hostId ? { hostId } : {}),
+        ...(workspaceId ? { workspaceId } : {}),
+        protocol: normalizedProtocol,
+        status,
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+      },
+      hostOs,
+      hostGroup,
+      cwdSource: options.cwdSource,
+      snippets: options.snippets,
+      maximum: options.maxResults ?? 15,
+      historyScope: options.historyScope ?? settings?.historyScope,
+      signal: options.signal,
+      onLatePathSuggestions: options.onLatePathSuggestions,
+    });
+  }, [allowHostStyleGreaterThanPrompt, hostGroup, hostId, hostOs, isPluginCompletionProviderAvailable, protocol, sensitiveInputActiveRef, sessionId, settings?.historyScope, status, workspaceId]);
   const autocomplete = useTerminalAutocomplete({
     termRef,
+    containerRef,
     sessionId,
     hostId,
+    hostGroup,
     hostOs,
     settings,
     onAcceptText,
@@ -79,6 +146,9 @@ export function TerminalAutocomplete({
     onAcceptSnippet,
     protocol,
     getCwd,
+    sensitiveInputActiveRef,
+    provideCompletions,
+    isNetworkDevice,
   });
 
   // Surface the handlers for runtime wiring. They have stable identities
@@ -88,6 +158,13 @@ export function TerminalAutocomplete({
   inputRef.current = autocomplete.handleInput;
   repositionRef.current = autocomplete.repositionPopup;
   closeRef.current = autocomplete.closePopup;
+  sudoHintRef.current = (active: boolean): boolean => {
+    if (!active) {
+      autocomplete.hideSudoHint();
+      return false;
+    }
+    return autocomplete.showSudoHint(sudoHintText);
+  };
 
   const { state } = autocomplete;
   if (!visible || !state.popupVisible || state.suggestions.length === 0) {
@@ -99,9 +176,7 @@ export function TerminalAutocomplete({
     <AutocompletePopup
       suggestions={state.suggestions}
       selectedIndex={state.selectedIndex}
-      position={state.popupPosition}
-      cursorLineTop={state.popupCursorLineTop}
-      cursorLineBottom={state.popupCursorLineBottom}
+      anchorViewport={state.popupAnchorViewport}
       visible={state.popupVisible}
       expandUpward={state.expandUpward}
       themeColors={themeColors}

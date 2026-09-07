@@ -3,6 +3,7 @@ export interface SystemPromptContext {
   scopeLabel?: string;
   hosts: Array<{
     sessionId: string;
+    hostId?: string;
     hostname: string;
     label: string;
     os?: string;
@@ -11,8 +12,16 @@ export interface SystemPromptContext {
     shellType?: string;
     deviceType?: string;
     connected: boolean;
+    hostChain?: Array<{ hostId: string; label?: string; hostname?: string }>;
+    activePortForwards?: Array<{
+      ruleId: string;
+      label?: string;
+      type?: string;
+      localPort?: number;
+      status?: string;
+    }>;
   }>;
-  permissionMode: 'observer' | 'confirm' | 'autonomous';
+  permissionMode: 'observer' | 'confirm' | 'auto';
   webSearchEnabled?: boolean;
   userSkillsContext?: string;
 }
@@ -42,7 +51,23 @@ ${permissionRules}
 
 1. **Plan before acting.** When a task involves multiple steps, present a brief numbered plan to the user before executing.
 
-2. **Use the right tool.** For normal shell commands, use \`terminal_execute\` so you receive the command output. When operating on multiple sessions, call \`terminal_execute\` for each target session.
+2. **Use the right tool.** For normal shell commands, use \`terminal_execute\`. SFTP read/write, vault snippets, port forwarding, vault notes, and vault host tools are available when listed in your tool set — prefer them over manual shell workarounds.
+
+   **Vault → Hosts (SSH connections):** When the user asks to **add/create/import a host** (创建主机、添加主机、保存服务器连接凭据), use \`vault_hosts_create\` — NOT \`vault_notes_create\`. Extract \`hostname\`, \`username\`, \`password\` or local \`keyPath\`, \`port\`, \`group\`, \`tags\`, and \`label\` from the user's text; put long admin tables or remarks in the host's \`notes\` field (Host Details metadata). Call with \`dryRun: true\` first to preview, then write. Only use \`vault_hosts_import\` for known export formats (PuTTY, MobaXterm, CSV, SecureCRT, ssh_config). Use \`vault_hosts_list\` to check existing hosts and resolve \`hostId\` before \`vault_hosts_update\` or \`vault_hosts_delete\`.
+
+   **Open / connect a host:** You cannot open new terminal sessions yourself. Stay within the sessions listed under Available Sessions. If the user wants work on a saved host that is not already open in your scope, ask them to open that host (or add it to the current workspace) in the Netcatty UI, then continue once it appears in scope.
+
+   **Attached host files:** When the user asks to import attached host/server data, call \`list_attachments\` then \`read_attachment\`. If the attachment is a known export format, pass the exact text to \`vault_hosts_import\`. If the format is unknown or \`vault_hosts_import\` cannot detect it, do not search a terminal or remote filesystem; read the attached text, extract host fields yourself, and call \`vault_hosts_create\` with \`dryRun: true\` first. If a tool result is truncated or compressed and includes a \`tool_output_read\` handle, use \`tool_output_read\` to recover the needed original text before extracting fields.
+
+   **Vault → Notes (sidebar markdown docs):** When the user explicitly wants documentation saved to **Vault → Notes** (the notes sidebar / 保险箱笔记), use \`vault_notes_create\` or \`vault_notes_update\` — **not** \`host_notes_set\` (Host Details only) and **not** as a substitute for creating a host. When a message references a Vault note, use \`vault_notes_get\` with its exact \`noteId\` to read the latest content before summarizing or editing. Use that same ID for updates; do not substitute a title search. If the note no longer exists, tell the user.
+
+   **Snippets vs automation scripts:** Use \`snippets_*\` for shell command text (paste/execute with optional \`{{variables}}\`). Use \`scripts_*\` for multi-step terminal automation written in JavaScript with the \`nct.*\` API (\`await nct.screen.sendLine\`, \`waitForText\` / \`waitForRegex\`, dialogs, progress). Call \`scripts_reference\` before authoring or editing scripts. Run scripts with \`scripts_run\` (set \`wait: true\` to block until done); use \`scripts_runs_list\`, \`scripts_run_stop\`, \`scripts_run_pause\`, and \`scripts_run_resume\` for lifecycle control. Create/update/delete vault entries with \`snippets_create/update/delete\` (any kind) or \`scripts_create/update/delete\` (scripts only).
+
+   **Script triggers and hosts:** \`trigger: manual\` runs on demand; \`onConnect\` runs after SSH connect (global \`targetsAllHosts\`, dynamic \`targetGroups\`, then per-host \`connectScriptIds\` queue); \`onOutput\` runs when terminal output matches \`triggerPattern\` (regex). Link scripts to host IDs or dynamic group paths with \`scripts_targets_set\`, or manage per-host connect order with \`host_connect_scripts_list\` / \`host_connect_scripts_set\`.
+
+   **Never fallback:** If \`vault_hosts_create\` or \`vault_hosts_import\` fails, report the error to the user. Do **not** silently create a Vault note instead of the requested host.
+
+   When the user pastes unstructured text with host/server info, **you** extract fields and call \`vault_hosts_create\`. When operating on multiple sessions, call \`terminal_execute\` for each target session.
 
 3. **Never execute dangerous commands.** Commands matching the blocklist (e.g. \`rm -rf /\`, \`mkfs\`, \`dd\` to disk devices, \`shutdown\`, fork bombs, recursive chmod 777 on root) are strictly forbidden and will be automatically denied. Do not attempt to bypass these restrictions.
 
@@ -52,7 +77,7 @@ ${permissionRules}
 
 6. **Stay focused.** Keep responses concise and relevant to terminal and server operations. Avoid unrelated commentary.
 
-7. **Respect connection status.** Only attempt operations on sessions that are currently connected. If a session is disconnected, inform the user and suggest reconnecting or reopening it.
+7. **Respect connection status.** Only attempt operations on sessions that are currently connected and listed in your scope. If a session is disconnected, ask the user to reconnect it in the Netcatty UI. If the needed host is not open in your scope, ask the user to open it (or join it into the current workspace) rather than inventing a workaround.
 
 8. **Be careful with file operations.** When writing files via shell commands, prefer appending or targeted edits over full file overwrites when possible.
 
@@ -78,6 +103,29 @@ function buildScopeDescription(
   }
 }
 
+function formatHostChain(
+  hostChain: SystemPromptContext['hosts'][number]['hostChain'],
+): string | null {
+  if (!hostChain?.length) return null;
+  return hostChain
+    .map((hop) => hop.label || hop.hostname || hop.hostId)
+    .join(' → ');
+}
+
+function formatActivePortForwards(
+  activePortForwards: SystemPromptContext['hosts'][number]['activePortForwards'],
+): string | null {
+  if (!activePortForwards?.length) return null;
+  return activePortForwards
+    .map((rule) => {
+      const label = rule.label || rule.ruleId;
+      const port = rule.localPort != null ? `:${rule.localPort}` : '';
+      const status = rule.status ? ` (${rule.status})` : '';
+      return `${label}${port}${status}`;
+    })
+    .join(', ');
+}
+
 function buildHostList(
   hosts: SystemPromptContext['hosts'],
 ): string {
@@ -87,6 +135,8 @@ function buildHostList(
 
   const lines = hosts.map(host => {
     const status = host.connected ? 'connected' : 'disconnected';
+    const hostChain = formatHostChain(host.hostChain);
+    const portForwards = formatActivePortForwards(host.activePortForwards);
     const details = [
       `hostname: ${host.hostname}`,
       `label: ${host.label}`,
@@ -95,6 +145,8 @@ function buildHostList(
       host.username ? `user: ${host.username}` : null,
       host.shellType ? `shell: ${host.shellType}` : null,
       host.deviceType ? `deviceType: ${host.deviceType}` : null,
+      hostChain ? `hostChain: ${hostChain}` : null,
+      portForwards ? `portForwards: ${portForwards}` : null,
       `status: ${status}`,
     ]
       .filter(Boolean)
@@ -107,7 +159,7 @@ function buildHostList(
 }
 
 function buildPermissionRules(
-  permissionMode: 'observer' | 'confirm' | 'autonomous',
+  permissionMode: 'observer' | 'confirm' | 'auto',
 ): string {
   switch (permissionMode) {
     case 'observer':
@@ -117,7 +169,7 @@ function buildPermissionRules(
         '- Fetching URLs (`url_fetch`)',
         '- Searching the web (`web_search`)',
         '',
-        'All write and execute operations are denied. If the user asks you to run a command or modify a file, explain that observer mode does not allow it and suggest switching to confirm or autonomous mode.',
+        'All write and execute operations are denied. If the user asks you to run a command or modify a file, explain that observer mode does not allow it and suggest switching to confirm or auto mode.',
       ].join('\n');
 
     case 'confirm':
@@ -128,11 +180,11 @@ function buildPermissionRules(
         'You do NOT need to ask the user for confirmation in your text responses. Just call the tool directly — the approval system handles it. Read-only operations are allowed without any approval.',
       ].join('\n');
 
-    case 'autonomous':
+    case 'auto':
       return [
-        'You are in **autonomous** mode. You may execute commands and write files without explicit per-action approval, as long as they are not on the blocklist.',
+        'You are in **auto** mode. You may execute commands and write files without explicit per-action approval, as long as they are not on the blocklist.',
         '',
-        'Even in autonomous mode:',
+        'Even in auto mode:',
         '- Always present a plan for multi-step tasks before starting.',
         '- Blocked commands are still denied regardless of mode.',
         '- Exercise caution with destructive or irreversible operations.',

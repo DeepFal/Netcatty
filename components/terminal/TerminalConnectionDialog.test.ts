@@ -91,6 +91,46 @@ test("renders host key confirmation inside the connection dialog", () => {
   assert.equal(markup.includes("Timeout in"), false);
 });
 
+test("does not show a countdown while waiting for user input", () => {
+  const markup = renderDialog({
+    progressProps: {
+      timeLeft: 20,
+      isAwaitingUserInput: true,
+      isCancelling: false,
+      progressLogs: ["Waiting for passphrase."],
+      onCancelConnect: () => {},
+      onCloseSession: () => {},
+      onRetry: () => {},
+    },
+  });
+
+  assert.match(markup, /Waiting for user input/);
+  assert.equal(markup.includes("Timeout in"), false);
+});
+
+test("shows enter reconnect hint when disconnected reconnect is available", () => {
+  const markup = renderDialog({
+    status: "disconnected",
+    error: null,
+    showEnterReconnectHint: true,
+  });
+
+  assert.match(markup, /Press Enter to reconnect/);
+  // Focus sink so Enter still reaches the overlay after body/document blur (#2544).
+  assert.match(markup, /data-terminal-disconnected-dialog="true"/);
+  assert.match(markup, /tabindex="-1"/);
+});
+
+test("does not show enter reconnect hint until the caller marks enter reconnect available", () => {
+  const markup = renderDialog({
+    status: "disconnected",
+    error: null,
+  });
+
+  assert.equal(markup.includes("Press Enter to reconnect"), false);
+  assert.equal(markup.includes("data-terminal-disconnected-dialog"), false);
+});
+
 test("renders changed host key warning in the same connection dialog", () => {
   const markup = renderDialog({
     hostKeyVerification: {
@@ -131,4 +171,91 @@ test("fills both progress segments for disconnected states", () => {
 
   const fullSegments = markup.match(/style="width:100%"/g) ?? [];
   assert.equal(fullSegments.length >= 2, true);
+});
+
+test("keeps connection log padding inside the scrollable content", () => {
+  const markup = renderDialog({
+    status: "disconnected",
+    error: "Connection timed out.",
+    showLogs: true,
+    progressProps: {
+      timeLeft: 0,
+      isCancelling: false,
+      progressLogs: Array.from({ length: 12 }, (_, index) => `Log line ${index + 1}`),
+      onCancelConnect: () => {},
+      onCloseSession: () => {},
+      onRetry: () => {},
+    },
+  });
+
+  assert.match(markup, /class="[^"]*max-h-44/);
+  assert.doesNotMatch(markup, /class="[^"]*max-h-44[^"]*p-2\.5/);
+  assert.match(markup, /class="[^"]*p-2\.5[^"]*pb-4[^"]*pr-4/);
+});
+
+test("shows the ET server port (not the SSH port) for an ET host with a custom etPort", () => {
+  const markup = renderDialog({
+    host: { ...host, etEnabled: true, port: 22, etPort: 9022 },
+  });
+
+  // ET connectivity hinges on the etserver port, so the dialog must show it.
+  assert.match(markup, /10\.2\.0\.32:9022/);
+  assert.equal(markup.includes("10.2.0.32:22"), false);
+});
+
+test("defaults the displayed ET port to 2022 when no etPort is set", () => {
+  const markup = renderDialog({
+    host: { ...host, etEnabled: true, port: 22 },
+  });
+
+  assert.match(markup, /10\.2\.0\.32:2022/);
+  assert.equal(markup.includes("10.2.0.32:22"), false);
+});
+
+test("labels plugin transports without presenting them as SSH endpoints", () => {
+  const providerId = "com.example.transport.connection";
+  const markup = renderDialog({
+    host: {
+      ...host,
+      hostname: providerId,
+      port: 22,
+      protocol: `plugin:${providerId}`,
+      pluginConnection: { providerId, configuration: {} },
+    },
+  });
+
+  assert.match(markup, /Plugin connection/);
+  assert.equal(markup.includes(`${providerId}:22`), false);
+});
+
+test("shows restored session copy for disconnected restored placeholders", () => {
+  const markup = renderDialog({
+    status: "disconnected",
+    error: null,
+    restoreState: "restored-disconnected",
+  } as Partial<React.ComponentProps<typeof TerminalConnectionDialog>>);
+
+  assert.match(markup, /Restored session/);
+  assert.match(markup, /This terminal is disconnected/);
+  assert.match(markup, /Reconnect/);
+});
+
+test("disconnected observer surfaces do not advertise a reconnect they cannot perform", () => {
+  const markup = renderDialog({
+    status: "disconnected",
+    error: "Observed session ended.",
+    showEnterReconnectHint: false,
+    progressProps: {
+      timeLeft: 0,
+      isCancelling: false,
+      progressLogs: [],
+      onCancelConnect: () => {},
+      onCloseSession: () => {},
+      onRetry: undefined,
+    },
+  });
+
+  assert.equal(markup.includes("Press Enter to reconnect"), false);
+  assert.equal(markup.includes("Start over"), false);
+  assert.match(markup, /Close session/);
 });

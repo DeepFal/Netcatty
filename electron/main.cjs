@@ -54,7 +54,7 @@ try {
   electronModule = require("electron");
 }
 
-const { app, BrowserWindow, Menu, protocol, shell, clipboard, session } = electronModule || {};
+const { app, BrowserWindow, Menu, protocol, shell, clipboard, session, ipcMain } = electronModule || {};
 if (!app || !BrowserWindow) {
   throw new Error("Failed to load Electron runtime. Ensure the app is launched with the Electron binary.");
 }
@@ -62,7 +62,56 @@ if (!app || !BrowserWindow) {
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
+const { execFile } = require("node:child_process");
 const { getCliDiscoveryFilePath } = require("./cli/discoveryPath.cjs");
+const {
+  SSH_DEEP_LINK_CHANNEL,
+  TELNET_DEEP_LINK_CHANNEL,
+  JMS_DEEP_LINK_CHANNEL,
+  applyInitialJmsDeepLinkPreference,
+  applyInitialSshDeepLinkPreference,
+  applyJmsProtocolClientPreference,
+  applySshProtocolClientPreference,
+  collectJmsDeepLinkUrls,
+  collectSshDeepLinkQueueItems,
+  getSshDeepLinkRendererReadyTimeoutMs,
+  redactPuttyCommandLinePasswords,
+  isJmsDeepLinkUrl,
+  isSshDeepLinkUrl,
+  isTelnetDeepLinkUrl,
+  readJmsDeepLinkEnabledPreference,
+  readSshDeepLinkEnabledPreference,
+  shouldDeliverJmsDeepLink,
+  shouldDeliverSshDeepLink,
+  shouldRequeueFailedSshDeepLinkDelivery,
+  shouldDeliverTelnetDeepLink,
+  updateJmsDeepLinkEnabledPreference,
+  updateSshDeepLinkEnabledPreference,
+  writeJmsDeepLinkEnabledPreference,
+  writeSshDeepLinkEnabledPreference,
+} = require("./deepLink.cjs");
+const { getReusableMainWindow } = require("./mainWindowReuse.cjs");
+const { createAppContentWindowClosedHandler } = require("./appWindowLifecycle.cjs");
+const { PLUGIN_PROTOCOL_SCHEME } = require("./plugins/constants.cjs");
+const { runPluginShutdown } = require("./plugins/shutdownCoordinator.cjs");
+const {
+  OPEN_TERMINAL_PATH_CHANNEL,
+  collectOpenTerminalPathArgs,
+  resolveOpenTerminalPath,
+  resolveOpenTerminalPathsFromArgs,
+} = require("./openTerminalPath.cjs");
+const {
+  applyExplorerContextMenuPreference,
+  applyInitialExplorerContextMenuPreference,
+  resolveExplorerContextMenuEnabled,
+  resolveExplorerContextMenuLaunchSpec,
+  updateExplorerContextMenuEnabledPreference,
+  writeExplorerContextMenuEnabledPreference,
+} = require("./explorerContextMenu.cjs");
+const {
+  registerHandlers: registerAutoLaunchHandlers,
+  wasLaunchedHidden,
+} = require("./autoLaunch.cjs");
 
 try {
   protocol?.registerSchemesAsPrivileged?.([
@@ -76,9 +125,19 @@ try {
         stream: true,
       },
     },
+    {
+      scheme: PLUGIN_PROTOCOL_SCHEME,
+      privileges: {
+        standard: true,
+        secure: true,
+        supportFetchAPI: true,
+        corsEnabled: false,
+        codeCache: true,
+      },
+    },
   ]);
 } catch (err) {
-  console.warn("[Main] Failed to register app:// scheme privileges:", err);
+  console.warn("[Main] Failed to register custom scheme privileges:", err);
 }
 
 // Apply ssh2 protocol patch needed for OpenSSH sk-* signature layouts.
@@ -121,8 +180,31 @@ const getGlobalShortcutBridge = createLazyModule("./bridges/globalShortcutBridge
 const getCredentialBridge = createLazyModule("./bridges/credentialBridge.cjs");
 const getAutoUpdateBridge = createLazyModule("./bridges/autoUpdateBridge.cjs");
 const getAiBridge = createLazyModule("./bridges/aiBridge.cjs");
+const getHttpNetworkProxyBridge = createLazyModule("./bridges/httpNetworkProxyBridge.cjs");
 const getWindowManager = createLazyModule("./bridges/windowManager.cjs");
 const getVaultBackupBridge = createLazyModule("./bridges/vaultBackupBridge.cjs");
+const {
+  DEFAULT_APP_LOCK_SETTINGS,
+  canLockFromSettings,
+  createAppLockSettingsStore,
+} = require("./bridges/appLockSettingsStore.cjs");
+const {
+  createAppLockController,
+  createAppLockRuntimeBridge,
+} = require("./bridges/appLockRuntimeBridge.cjs");
+const {
+  createAppLockSystemAuthBridge,
+  resolveDefaultHelperPath,
+} = require("./bridges/appLockSystemAuthBridge.cjs");
+const {
+  emitAppLockReopen,
+  ensureAppLockForFreshSession,
+  handleAppHide,
+  handleActivateWithMainWindow,
+  handleBeforeQuit,
+  hasNoUsableAppContentWindows,
+  shouldCommitQuitWithoutDirtyCheck,
+} = require("./main/appLockLifecycle.cjs");
 const ptyProcessTree = require("./bridges/ptyProcessTree.cjs");
 const { queryDirtyEditors } = require("./bridges/dirtyEditorGuard.cjs");
 
@@ -132,11 +214,16 @@ const { queryDirtyEditors } = require("./bridges/dirtyEditorGuard.cjs");
 if (process.env.NETCATTY_NO_SANDBOX === "1") {
   app.commandLine.appendSwitch("no-sandbox");
 }
-// Force hardware acceleration even on blocklisted GPUs (macs sometimes fall back to software)
-app.commandLine.appendSwitch("ignore-gpu-blocklist");
-app.commandLine.appendSwitch("ignore-gpu-blacklist"); // Some Chromium builds use this alias; keep both for safety
-app.commandLine.appendSwitch("enable-gpu-rasterization");
-app.commandLine.appendSwitch("enable-zero-copy");
+// Avoid Chromium spare renderers that inflate baseline memory for little gain.
+app.commandLine.appendSwitch("disable-features", "SpareRendererForSitePerProcess");
+// Aggressive GPU enablement can break some environments; opt out with NETCATTY_COMPAT_GPU=1.
+if (process.env.NETCATTY_COMPAT_GPU !== "1") {
+  // Force hardware acceleration even on blocklisted GPUs (macs sometimes fall back to software)
+  app.commandLine.appendSwitch("ignore-gpu-blocklist");
+  app.commandLine.appendSwitch("ignore-gpu-blacklist"); // Some Chromium builds use this alias; keep both for safety
+  app.commandLine.appendSwitch("enable-gpu-rasterization");
+  app.commandLine.appendSwitch("enable-zero-copy");
+}
 
 // Silence noisy DevTools Autofill CDP errors (Electron's backend doesn't expose this domain)
 app.on("web-contents-created", (_event, contents) => {
@@ -172,9 +259,23 @@ const devServerUrl = process.env.VITE_DEV_SERVER_URL;
 // Never treat a packaged app as "dev" even if the user has VITE_DEV_SERVER_URL set globally.
 const isDev = !app.isPackaged && !!devServerUrl;
 const effectiveDevServerUrl = isDev ? devServerUrl : undefined;
+if (isDev) {
+  app.setName("Netcatty Dev");
+  app.setPath("userData", path.join(app.getPath("userData"), "dev"));
+}
+const { applyPortableDataDirectory } = require("./portableData.cjs");
+const portableData = applyPortableDataDirectory({ app });
+if (portableData) {
+  console.info(`[Main] Portable data directory: ${portableData.dataDirectory}`);
+}
 const preload = path.join(__dirname, "preload.cjs");
 const isMac = process.platform === "darwin";
-const appIcon = path.join(__dirname, "../public/icon.png");
+const appIconManager = require("./bridges/appIconManager.cjs");
+const appPath = path.join(__dirname, "..");
+appIconManager.initializeAppIconManager(appPath, {
+  preferPublic: !app.isPackaged,
+  isMac,
+});
 const electronDir = __dirname;
 
 const APP_PROTOCOL_HEADERS = {
@@ -207,9 +308,41 @@ const DIST_MIME_TYPES = {
   ".wasm": "application/wasm",
 };
 
+const APP_PROTOCOL_LONG_CACHE_EXTENSIONS = new Set([
+  ".js",
+  ".mjs",
+  ".css",
+  ".json",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".svg",
+  ".ico",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".eot",
+  ".wav",
+  ".mp3",
+  ".mp4",
+  ".webm",
+  ".wasm",
+]);
+
 function resolveContentType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   return DIST_MIME_TYPES[ext] || "application/octet-stream";
+}
+
+function resolveAppProtocolCacheControl(filePath, distPath) {
+  const relativePath = path.relative(distPath, filePath).replace(/\\/g, "/");
+  if (relativePath === "index.html") return "no-store";
+  const ext = path.extname(filePath).toLowerCase();
+  if (relativePath.startsWith("assets/") && APP_PROTOCOL_LONG_CACHE_EXTENSIONS.has(ext)) {
+    return "public, max-age=31536000, immutable";
+  }
+  return "no-cache";
 }
 
 function isPathInside(parentPath, childPath) {
@@ -266,6 +399,7 @@ function registerAppProtocol() {
           status: 200,
           headers: {
             ...APP_PROTOCOL_HEADERS,
+            "Cache-Control": resolveAppProtocolCacheControl(fullPath, distPath),
             "Content-Type": resolveContentType(fullPath),
           },
         });
@@ -280,18 +414,8 @@ function registerAppProtocol() {
 
 function focusMainWindow() {
   try {
-    const mainWin = getWindowManager().getMainWindow?.();
-    const win = mainWin && !mainWin.isDestroyed?.() ? mainWin : null;
+    const win = getReusableMainWindow({ getWindowManager });
     if (!win) return false;
-
-    // Check if the webContents has crashed or been destroyed
-    try {
-      if (win.webContents?.isCrashed?.()) {
-        console.warn('[Main] Main window webContents has crashed, destroying window');
-        win.destroy();
-        return false;
-      }
-    } catch {}
 
     // Cancel any in-flight close-to-tray hide so second-instance / dock-click
     // re-entry beats a pending leave-full-screen → hide sequence.
@@ -299,15 +423,13 @@ function focusMainWindow() {
       getGlobalShortcutBridge().clearPendingFullscreenHide?.(win);
     } catch {}
 
-    try {
-      if (win.isMinimized && win.isMinimized()) win.restore();
-    } catch {}
-    try {
-      win.show();
-    } catch {}
-    try {
-      win.focus();
-    } catch {}
+    handleActivateWithMainWindow({
+      app,
+      mainWindow: win,
+      globalShortcutBridge: getGlobalShortcutBridge(),
+      windowManager: getWindowManager(),
+      reopenWindows: getAppLockReopenWindows(),
+    });
     try {
       app.focus({ steal: true });
     } catch {}
@@ -318,12 +440,60 @@ function focusMainWindow() {
   }
 }
 
+function notifyAllAppLockReopenWindows() {
+  emitAppLockReopen(getAppLockReopenWindows());
+}
+
+function getAppLockReopenWindows() {
+  const windowManager = getWindowManager();
+  const seen = new Set();
+  const out = [];
+  const add = (win) => {
+    if (!win || seen.has(win)) return;
+    seen.add(win);
+    out.push(win);
+  };
+  for (const win of windowManager.getMainWindows?.() ?? []) add(win);
+  add(windowManager.getSettingsWindow?.() ?? null);
+  add(getGlobalShortcutBridge().getTrayPanelWindow?.() ?? null);
+  for (const win of windowManager.getTerminalPopupWindows?.() ?? []) add(win);
+  // Detached #/session-window renderers are app-content windows; they must get
+  // reopenSignal for Touch ID/Hello auto-prompt after background re-lock.
+  for (const win of windowManager.getAppContentWindows?.() ?? []) add(win);
+  return out;
+}
+
 // Shared state
 const sessions = new Map();
 const sftpClients = new Map();
 const keyRoot = path.join(os.homedir(), ".netcatty", "keys");
+const APP_LOCK_SETTINGS_FILE = "app-lock-settings.json";
 let cloudSyncSessionPassword = null;
 const CLOUD_SYNC_PASSWORD_FILE = "netcatty_cloud_sync_master_password_v1";
+let appLockSettingsStore = null;
+const appLockRuntimeBridge = createAppLockRuntimeBridge();
+let appLockController = null;
+
+function getLiveAppLockWindows() {
+  const windowManager = getWindowManager();
+  return [
+    BrowserWindow.getFocusedWindow?.(),
+    ...(windowManager.getMainWindows?.() ?? []),
+    windowManager.getSettingsWindow?.() ?? null,
+    getGlobalShortcutBridge().getTrayPanelWindow?.() ?? null,
+    ...(windowManager.getTerminalPopupWindows?.() ?? []),
+  ].filter((win) => (
+    win &&
+    typeof win.isDestroyed === "function" &&
+    !win.isDestroyed() &&
+    typeof win.getNativeWindowHandle === "function"
+  ));
+}
+
+function getAppLockNativeWindowHandle() {
+  const win = getLiveAppLockWindows()[0] || null;
+  return win ? win.getNativeWindowHandle() : null;
+}
 
 // Key management helpers
 const ensureKeyDir = async () => {
@@ -364,9 +534,11 @@ const registerBridges = createBridgeRegistrar({
   preload,
   effectiveDevServerUrl,
   isDev,
-  appIcon,
+  getAppIconPath: () => appIconManager.getAppIconPath(appPath),
   isMac,
   electronDir,
+  appPath,
+  appIconManager,
   sessions,
   sftpClients,
   CLOUD_SYNC_PASSWORD_FILE,
@@ -379,6 +551,7 @@ const registerBridges = createBridgeRegistrar({
   terminalBridge,
   crashLogBridge,
   ptyProcessTree,
+  ensureMainWindow: createAndShowMainWindow,
   getOauthBridge,
   getGithubAuthBridge,
   getGoogleAuthBridge,
@@ -392,24 +565,32 @@ const registerBridges = createBridgeRegistrar({
   getCredentialBridge,
   getAutoUpdateBridge,
   getAiBridge,
+  getHttpNetworkProxyBridge,
   getWindowManager,
   getVaultBackupBridge,
+  getAppLockController: () => appLockController,
   isPathInside,
 });
 /**
  * Create the main application window
  */
-async function createWindow() {
-  const win = await getWindowManager().createWindow(electronModule, {
+async function createWindow({ startHidden = false } = {}) {
+  const windowManager = getWindowManager();
+  windowManager.setAppContentWindowClosedHandler(createAppContentWindowClosedHandler({
+    app,
+    windowManager,
+  }));
+  const win = await windowManager.createWindow(electronModule, {
     preload,
     devServerUrl: effectiveDevServerUrl,
     isDev,
-    appIcon,
+    appIcon: appIconManager.getAppIconPath(appPath),
     isMac,
     electronDir,
     onRegisterBridge: registerBridges,
+    startHidden,
   });
-  
+
   return win;
 }
 
@@ -454,16 +635,47 @@ let mainWindowStartupPromise = null;
 async function createAndShowMainWindow() {
   if (mainWindowStartupPromise) return mainWindowStartupPromise;
 
+  // macOS Dock/tray reopen after every app-content window was closed leaves the
+  // process alive with an already-initialized (and possibly unlocked) app-lock
+  // runtime. Re-lock before the new renderer mounts so unlock does not stick.
+  // Count settings/tray/popup windows too — an open Settings or session popup
+  // means this is not a fresh session (Codex P2 on 100394dc).
+  try {
+    if (hasNoUsableAppContentWindows(getAppLockReopenWindows())) {
+      ensureAppLockForFreshSession(appLockController, "startup");
+    }
+  } catch {
+    // ignore — window creation should still proceed
+  }
+
+  const existingWin = getReusableMainWindow({ getWindowManager });
+  if (existingWin) {
+    focusMainWindow();
+    return existingWin;
+  }
+
+  const startHidden = consumeColdStartHiddenLaunch();
+
   mainWindowStartupPromise = (async () => {
     processErrorController.beginMainWindowStartup();
     try {
-      const win = await createWindow();
-      await waitForWindowToShow(win);
+      const win = await createWindow({ startHidden });
+      // A hidden cold start never fires "show" — waiting for it would hang
+      // startup forever, so only wait when the window is meant to appear.
+      if (!startHidden) await waitForWindowToShow(win);
       void getWindowManager().waitForRendererReady(win, {
         timeoutMs: isDev ? 30000 : 15000,
       }).catch((err) => {
         console.warn("[Main] Renderer ready signal was late or missing after first show:", err?.message || err);
       });
+      // windowShown latches process-error-guard protection on for the rest
+      // of the app's life (see processErrorGuards.cjs), so a hidden cold
+      // start must still report true here: createWindow() above already
+      // succeeded (window created, page loaded) — a deliberately hidden
+      // window is a completed startup, not a failure. Passing false would
+      // leave the guard permanently "strict", classifying any later
+      // non-network error as fatal and killing an otherwise healthy
+      // tray-only session that never happened to show a window.
       processErrorController.completeMainWindowStartup({ windowShown: true });
       return win;
     } catch (err) {
@@ -475,6 +687,487 @@ async function createAndShowMainWindow() {
   })();
 
   return mainWindowStartupPromise;
+}
+
+let sshDeepLinkEnabled = readSshDeepLinkEnabledPreference({ app });
+// PuTTY-style CLI args (-ssh user@host -P 22 -pw pass) are an explicit launch
+// method for bastion/PAM callers (#3044). They must connect even when Netcatty
+// is not the registered ssh:// protocol client (or that registration failed),
+// including when a second launch hands its argv to an already-running
+// instance. Only scheme URLs (ssh:// … / telnet:// …) follow the preference.
+const initialDeepLinkQueueItems = collectSshDeepLinkQueueItems(process.argv, {
+  includeSchemeUrls: sshDeepLinkEnabled,
+});
+const pendingSshDeepLinkUrls = [...initialDeepLinkQueueItems.ssh];
+const pendingTelnetDeepLinkUrls = [...initialDeepLinkQueueItems.telnet];
+// Snapshot the pristine argv before scrubbing it in place below: the
+// single-instance handoff forwards this list to the running instance and a
+// redacted copy would make warm PuTTY-style launches authenticate with the
+// masked password.
+const rawLaunchArgvForHandoff = [...process.argv];
+redactPuttyCommandLinePasswords(process.argv);
+const pendingOpenTerminalPaths = resolveOpenTerminalPathsFromArgs(process.argv);
+let flushingSshDeepLinks = false;
+let flushingTelnetDeepLinks = false;
+let flushingOpenTerminalPaths = false;
+// Only scheme-originated requests are invalidated by the protocol preference.
+let sshSchemeDeliveryGeneration = 0;
+
+let jmsDeepLinkEnabled = readJmsDeepLinkEnabledPreference({ app });
+const pendingJmsDeepLinkUrls = jmsDeepLinkEnabled ? collectJmsDeepLinkUrls(process.argv) : [];
+let flushingJmsDeepLinks = false;
+let jmsDeepLinkDeliveryGeneration = 0;
+
+let explorerContextMenuEnabled = resolveExplorerContextMenuEnabled({ app }).enabled === true;
+
+function queueSshDeepLink(rawUrl, { viaCommandLine = false } = {}) {
+  if (!viaCommandLine && !sshDeepLinkEnabled) return;
+  if (!isSshDeepLinkUrl(rawUrl)) return;
+  pendingSshDeepLinkUrls.push({ rawUrl, viaCommandLine });
+  if (app.isReady?.()) {
+    void flushPendingSshDeepLinks();
+  }
+}
+
+function queueTelnetDeepLink(rawUrl, { viaCommandLine = false } = {}) {
+  if (!viaCommandLine && !sshDeepLinkEnabled) return;
+  if (!isTelnetDeepLinkUrl(rawUrl)) return;
+  pendingTelnetDeepLinkUrls.push({ rawUrl, viaCommandLine });
+  if (app.isReady?.()) {
+    void flushPendingTelnetDeepLinks();
+  }
+}
+
+function queueOpenTerminalPath(rawPath, options = {}) {
+  const resolvedPath = resolveOpenTerminalPath(rawPath, options);
+  if (!resolvedPath) return;
+  pendingOpenTerminalPaths.push(resolvedPath);
+  if (app.isReady?.()) {
+    void flushPendingOpenTerminalPaths();
+  }
+}
+
+function queueResolvedOpenTerminalPaths(paths) {
+  if (!Array.isArray(paths) || paths.length === 0) return;
+  pendingOpenTerminalPaths.push(...paths);
+  if (app.isReady?.()) {
+    void flushPendingOpenTerminalPaths();
+  }
+}
+
+// Drops preference-gated pending links while keeping command-line launches
+// queued — CLI args may still be delivered after the ssh:// preference flips.
+function dropSchemePendingDeepLinks() {
+  // Permanently cancel requests already waiting for a window or renderer,
+  // even if protocol handling is enabled again before that wait completes.
+  sshSchemeDeliveryGeneration += 1;
+  for (let index = pendingSshDeepLinkUrls.length - 1; index >= 0; index -= 1) {
+    if (pendingSshDeepLinkUrls[index]?.viaCommandLine === true) continue;
+    pendingSshDeepLinkUrls.splice(index, 1);
+  }
+  for (let index = pendingTelnetDeepLinkUrls.length - 1; index >= 0; index -= 1) {
+    if (pendingTelnetDeepLinkUrls[index]?.viaCommandLine === true) continue;
+    pendingTelnetDeepLinkUrls.splice(index, 1);
+  }
+}
+
+ipcMain?.handle?.("netcatty:deepLink:ssh:setEnabled", async (_event, payload) => {
+  const enabled = payload?.enabled !== false;
+  const result = updateSshDeepLinkEnabledPreference({
+    currentEnabled: sshDeepLinkEnabled,
+    enabled,
+    applyPreference: (nextEnabled) => applySshProtocolClientPreference({ app, enabled: nextEnabled, isDev }),
+    writePreference: (nextEnabled) => writeSshDeepLinkEnabledPreference({ app, enabled: nextEnabled }),
+    clearPending: dropSchemePendingDeepLinks,
+  });
+  sshDeepLinkEnabled = result.enabled;
+  return result;
+});
+
+ipcMain?.handle?.("netcatty:deepLink:ssh:getEnabled", async () => sshDeepLinkEnabled);
+
+function queueJmsDeepLink(rawUrl) {
+  if (!jmsDeepLinkEnabled) return;
+  if (!isJmsDeepLinkUrl(rawUrl)) return;
+  pendingJmsDeepLinkUrls.push(rawUrl);
+  if (app.isReady?.()) {
+    void flushPendingJmsDeepLinks();
+  }
+}
+
+ipcMain?.handle?.("netcatty:deepLink:jms:setEnabled", async (_event, payload) => {
+  const enabled = payload?.enabled !== false;
+  const result = updateJmsDeepLinkEnabledPreference({
+    currentEnabled: jmsDeepLinkEnabled,
+    enabled,
+    applyPreference: (nextEnabled) => applyJmsProtocolClientPreference({ app, enabled: nextEnabled, isDev }),
+    writePreference: (nextEnabled) => writeJmsDeepLinkEnabledPreference({ app, enabled: nextEnabled }),
+    clearPending: () => {
+      pendingJmsDeepLinkUrls.length = 0;
+      jmsDeepLinkDeliveryGeneration += 1;
+    },
+  });
+  jmsDeepLinkEnabled = result.enabled;
+  return result;
+});
+
+ipcMain?.handle?.("netcatty:deepLink:jms:getEnabled", async () => jmsDeepLinkEnabled);
+
+ipcMain?.handle?.("netcatty:explorerContextMenu:setEnabled", async (_event, payload) => {
+  const enabled = payload?.enabled !== false;
+  const launchSpec = resolveExplorerContextMenuLaunchSpec();
+  const result = updateExplorerContextMenuEnabledPreference({
+    currentEnabled: explorerContextMenuEnabled,
+    enabled,
+    applyPreference: (nextEnabled) => applyExplorerContextMenuPreference({
+      enabled: nextEnabled,
+      executablePath: launchSpec.executablePath,
+      appArgs: launchSpec.appArgs,
+    }),
+    writePreference: (nextEnabled) => writeExplorerContextMenuEnabledPreference({
+      app,
+      enabled: nextEnabled,
+      executablePath: launchSpec.executablePath,
+      appArgs: launchSpec.appArgs,
+    }),
+  });
+  explorerContextMenuEnabled = result.enabled === true;
+  return result;
+});
+
+ipcMain?.handle?.("netcatty:explorerContextMenu:getEnabled", async () => ({
+  enabled: explorerContextMenuEnabled,
+  supported: process.platform === "win32",
+}));
+
+if (ipcMain) registerAutoLaunchHandlers(ipcMain, { app });
+
+// Cold-start only: true when the OS login item launched us hidden (--hidden
+// on Windows, wasOpenedAsHidden on macOS). Consumed exactly once by whichever
+// createAndShowMainWindow() call reaches it first — this is NOT guaranteed to
+// be the default bootstrap call near the bottom of this file: a genuine
+// second instance (or a Dock reopen) can arrive after app.whenReady() but
+// before the bootstrap's own await chain gets there, racing it. Any caller
+// that represents an explicit foreground request (second-instance, activate,
+// deep links, ...) must re-focus after creation regardless of which flag it
+// happened to consume, or a user-triggered relaunch can silently create a
+// hidden window with nothing to show it.
+let consumeColdStartHiddenLaunch = (() => {
+  let pending = wasLaunchedHidden({ argv: process.argv, app });
+  return () => {
+    const value = pending;
+    pending = false;
+    return value;
+  };
+})();
+
+async function deliverJmsDeepLink(rawUrl, expectedGeneration = jmsDeepLinkDeliveryGeneration) {
+  if (!shouldDeliverJmsDeepLink({
+    enabled: jmsDeepLinkEnabled,
+    deliveryGeneration: jmsDeepLinkDeliveryGeneration,
+    expectedGeneration,
+  })) return;
+  const win = await createAndShowMainWindow();
+  if (!shouldDeliverJmsDeepLink({
+    enabled: jmsDeepLinkEnabled,
+    deliveryGeneration: jmsDeepLinkDeliveryGeneration,
+    expectedGeneration,
+  })) return;
+  focusMainWindow();
+  const windowManager = getWindowManager();
+  const result = await windowManager.sendWhenRendererReady?.(
+    win,
+    JMS_DEEP_LINK_CHANNEL,
+    { url: rawUrl },
+    {
+      timeoutMs: 0,
+      shouldSend: () => shouldDeliverJmsDeepLink({
+        enabled: jmsDeepLinkEnabled,
+        deliveryGeneration: jmsDeepLinkDeliveryGeneration,
+        expectedGeneration,
+      }),
+      cancelReason: "jms-deep-link-disabled",
+    },
+  );
+  if (result && result.success === false && result.reason !== "jms-deep-link-disabled") {
+    console.warn("[Main] Failed to deliver jms:// deep link:", result.error || result.reason);
+  }
+  return result || { success: true };
+}
+
+async function flushPendingJmsDeepLinks() {
+  if (flushingJmsDeepLinks) return;
+  flushingJmsDeepLinks = true;
+  let requeueDelayMs = 0;
+  try {
+    while (jmsDeepLinkEnabled && pendingJmsDeepLinkUrls.length > 0) {
+      const rawUrl = pendingJmsDeepLinkUrls.shift();
+      if (!rawUrl) continue;
+      const result = await deliverJmsDeepLink(rawUrl, jmsDeepLinkDeliveryGeneration);
+      if (shouldRequeueFailedSshDeepLinkDelivery({
+        enabled: jmsDeepLinkEnabled,
+        deliveryGeneration: jmsDeepLinkDeliveryGeneration,
+        expectedGeneration: jmsDeepLinkDeliveryGeneration,
+        result,
+        cancelReason: "jms-deep-link-disabled",
+      })) {
+        pendingJmsDeepLinkUrls.unshift(rawUrl);
+        requeueDelayMs = 1000;
+        break;
+      }
+    }
+  } catch (err) {
+    console.warn("[Main] Failed to process jms:// deep link:", err);
+  } finally {
+    flushingJmsDeepLinks = false;
+    if (jmsDeepLinkEnabled && pendingJmsDeepLinkUrls.length > 0) {
+      if (requeueDelayMs > 0) {
+        setTimeout(() => {
+          void flushPendingJmsDeepLinks();
+        }, requeueDelayMs);
+      } else {
+        void flushPendingJmsDeepLinks();
+      }
+    }
+  }
+}
+
+async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false } = {}) {
+  // The ssh:// preference can flip while a delivery is waiting for the
+  // renderer, so re-check it at every gate instead of reusing the queue-time
+  // snapshot. Command-line (PuTTY-style) launches bypass the preference.
+  const shouldDeliver = () => viaCommandLine === true || shouldDeliverSshDeepLink({
+    enabled: sshDeepLinkEnabled,
+    deliveryGeneration: sshSchemeDeliveryGeneration,
+    expectedGeneration,
+  });
+  if (!shouldDeliver()) {
+    return { success: false, reason: "ssh-deep-link-disabled" };
+  }
+  const win = await createAndShowMainWindow();
+  if (!shouldDeliver()) {
+    return { success: false, reason: "ssh-deep-link-disabled" };
+  }
+  focusMainWindow();
+  const windowManager = getWindowManager();
+  // timeoutMs: 0 waits until AppLockGate marks the renderer ready after unlock,
+  // so a slow password entry does not drop startup ssh:// links.
+  const result = await windowManager.sendWhenRendererReady?.(
+    win,
+    SSH_DEEP_LINK_CHANNEL,
+    { url: rawUrl },
+    {
+      timeoutMs: getSshDeepLinkRendererReadyTimeoutMs({ isDev }),
+      shouldSend: shouldDeliver,
+      cancelReason: "ssh-deep-link-disabled",
+    },
+  );
+  if (result && result.success === false && result.reason !== "ssh-deep-link-disabled") {
+    console.warn("[Main] Failed to deliver ssh:// deep link:", result.error || result.reason);
+  }
+  return result || { success: true };
+}
+
+async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false } = {}) {
+  // Mirror deliverSshDeepLink: gate on the live preference so disabling
+  // protocol handling cancels in-flight scheme deliveries, while
+  // command-line launches stay deliverable.
+  const shouldDeliver = () => viaCommandLine === true || shouldDeliverTelnetDeepLink({
+    enabled: sshDeepLinkEnabled,
+    deliveryGeneration: sshSchemeDeliveryGeneration,
+    expectedGeneration,
+  });
+  if (!shouldDeliver()) return;
+  const win = await createAndShowMainWindow();
+  if (!shouldDeliver()) return;
+  focusMainWindow();
+  const windowManager = getWindowManager();
+  const result = await windowManager.sendWhenRendererReady?.(
+    win,
+    TELNET_DEEP_LINK_CHANNEL,
+    { url: rawUrl },
+    {
+      timeoutMs: 0,
+      shouldSend: shouldDeliver,
+      cancelReason: "telnet-deep-link-disabled",
+    },
+  );
+  if (result && result.success === false && result.reason !== "telnet-deep-link-disabled") {
+    console.warn("[Main] Failed to deliver telnet:// deep link:", result.error || result.reason);
+  }
+  return result || { success: true };
+}
+
+async function flushPendingSshDeepLinks() {
+  if (flushingSshDeepLinks) return;
+  flushingSshDeepLinks = true;
+  let requeueDelayMs = 0;
+  try {
+    while (pendingSshDeepLinkUrls.length > 0) {
+      const item = pendingSshDeepLinkUrls.shift();
+      if (!item?.rawUrl) continue;
+      // Command-line launches bypass the ssh:// protocol-client preference;
+      // scheme-originated deliveries gate on it and are cancelled once it is
+      // disabled (deliverSshDeepLink re-checks the live preference).
+      const expectedGeneration = sshSchemeDeliveryGeneration;
+      const result = await deliverSshDeepLink(item.rawUrl, expectedGeneration, {
+        viaCommandLine: item.viaCommandLine === true,
+      });
+      if (shouldRequeueFailedSshDeepLinkDelivery({
+        enabled: item.viaCommandLine === true || sshDeepLinkEnabled,
+        deliveryGeneration: item.viaCommandLine === true ? expectedGeneration : sshSchemeDeliveryGeneration,
+        expectedGeneration,
+        result,
+        cancelReason: "ssh-deep-link-disabled",
+      })) {
+        // Window died or delivery failed while the link is still valid — keep it
+        // queued for the next successful window/renderer ready cycle.
+        pendingSshDeepLinkUrls.unshift(item);
+        requeueDelayMs = 1000;
+        break;
+      }
+    }
+  } catch (err) {
+    console.warn("[Main] Failed to process ssh:// deep link:", err);
+  } finally {
+    flushingSshDeepLinks = false;
+    if (pendingSshDeepLinkUrls.length > 0) {
+      if (requeueDelayMs > 0) {
+        setTimeout(() => {
+          void flushPendingSshDeepLinks();
+        }, requeueDelayMs);
+      } else {
+        void flushPendingSshDeepLinks();
+      }
+    }
+  }
+}
+
+async function flushPendingTelnetDeepLinks() {
+  if (flushingTelnetDeepLinks) return;
+  flushingTelnetDeepLinks = true;
+  let requeueDelayMs = 0;
+  try {
+    while (pendingTelnetDeepLinkUrls.length > 0) {
+      const item = pendingTelnetDeepLinkUrls.shift();
+      if (!item?.rawUrl) continue;
+      // Command-line launches bypass the ssh:// protocol-client preference;
+      // scheme-originated deliveries gate on it and are cancelled once it is
+      // disabled (deliverTelnetDeepLink re-checks the live preference).
+      const expectedGeneration = sshSchemeDeliveryGeneration;
+      const result = await deliverTelnetDeepLink(item.rawUrl, expectedGeneration, {
+        viaCommandLine: item.viaCommandLine === true,
+      });
+      if (shouldRequeueFailedSshDeepLinkDelivery({
+        enabled: item.viaCommandLine === true || sshDeepLinkEnabled,
+        deliveryGeneration: item.viaCommandLine === true ? expectedGeneration : sshSchemeDeliveryGeneration,
+        expectedGeneration,
+        result,
+        cancelReason: "telnet-deep-link-disabled",
+      })) {
+        pendingTelnetDeepLinkUrls.unshift(item);
+        requeueDelayMs = 1000;
+        break;
+      }
+    }
+  } catch (err) {
+    console.warn("[Main] Failed to process telnet:// deep link:", err);
+  } finally {
+    flushingTelnetDeepLinks = false;
+    if (pendingTelnetDeepLinkUrls.length > 0) {
+      if (requeueDelayMs > 0) {
+        setTimeout(() => {
+          void flushPendingTelnetDeepLinks();
+        }, requeueDelayMs);
+      } else {
+        void flushPendingTelnetDeepLinks();
+      }
+    }
+  }
+}
+
+async function deliverOpenTerminalPath(targetPath) {
+  const win = await createAndShowMainWindow();
+  focusMainWindow();
+  const windowManager = getWindowManager();
+  const result = await windowManager.sendWhenRendererReady?.(
+    win,
+    OPEN_TERMINAL_PATH_CHANNEL,
+    { path: targetPath },
+    { timeoutMs: 0 },
+  );
+  if (result && result.success === false) {
+    console.warn("[Main] Failed to deliver open terminal path:", result.error || result.reason);
+  }
+  return result || { success: true };
+}
+
+async function flushPendingOpenTerminalPaths() {
+  if (flushingOpenTerminalPaths) return;
+  flushingOpenTerminalPaths = true;
+  let requeueDelayMs = 0;
+  try {
+    while (pendingOpenTerminalPaths.length > 0) {
+      const targetPath = pendingOpenTerminalPaths.shift();
+      if (!targetPath) continue;
+      const result = await deliverOpenTerminalPath(targetPath);
+      if (result && result.success === false) {
+        pendingOpenTerminalPaths.unshift(targetPath);
+        requeueDelayMs = 1000;
+        break;
+      }
+    }
+  } catch (err) {
+    console.warn("[Main] Failed to process open terminal path:", err);
+  } finally {
+    flushingOpenTerminalPaths = false;
+    if (pendingOpenTerminalPaths.length > 0) {
+      if (requeueDelayMs > 0) {
+        setTimeout(() => {
+          void flushPendingOpenTerminalPaths();
+        }, requeueDelayMs);
+      } else {
+        void flushPendingOpenTerminalPaths();
+      }
+    }
+  }
+}
+
+function hasPendingColdStartLaunchIntents() {
+  return (
+    flushingSshDeepLinks
+    || flushingTelnetDeepLinks
+    || flushingJmsDeepLinks
+    || flushingOpenTerminalPaths
+    || pendingSshDeepLinkUrls.length > 0
+    || pendingTelnetDeepLinkUrls.length > 0
+    || pendingJmsDeepLinkUrls.length > 0
+    || pendingOpenTerminalPaths.length > 0
+  );
+}
+
+async function drainColdStartLaunchIntents() {
+  // Re-entrant void flushes from finally blocks must finish before we notify
+  // the renderer; otherwise landing can race a still-queued startup intent.
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await Promise.all([
+      flushPendingSshDeepLinks(),
+      flushPendingTelnetDeepLinks(),
+      flushPendingJmsDeepLinks(),
+      flushPendingOpenTerminalPaths(),
+    ]);
+    if (!hasPendingColdStartLaunchIntents()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+function notifyColdStartIntentsSettled(win) {
+  try {
+    if (!win || win.isDestroyed?.()) return;
+    win.webContents?.send?.("netcatty:startup:coldStartIntentsSettled");
+  } catch (err) {
+    console.warn("[Main] Failed to notify cold-start intents settled:", err);
+  }
 }
 
 function hasUsableWindow() {
@@ -505,14 +1198,109 @@ function showStartupError(err) {
 // Ensure single-instance behavior — must run before app.whenReady() so
 // the second instance never attempts to register the app:// protocol or
 // create a BrowserWindow (which would fail with ERR_FAILED).
-const gotLock = app.requestSingleInstanceLock();
+// The raw argument list rides along as additionalData: the second-instance
+// event delivers Chromium-regrouped argv (all dash switches before positional
+// args), which separates PuTTY-style flags from their values and breaks the
+// CLI connection parser. The second process's own process.argv preserves the
+// original order.
+const gotLock = app.requestSingleInstanceLock({ rawLaunchArgv: rawLaunchArgvForHandoff.slice(1) });
+// Electron has synchronously copied the handoff data. Release our pristine
+// snapshot so a primary instance does not retain the launch password forever.
+rawLaunchArgvForHandoff.length = 0;
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("open-url", (event, rawUrl) => {
+    event.preventDefault();
+    if (isJmsDeepLinkUrl(rawUrl)) {
+      queueJmsDeepLink(rawUrl);
+      return;
+    }
+    if (isTelnetDeepLinkUrl(rawUrl)) {
+      queueTelnetDeepLink(rawUrl);
+      return;
+    }
+    queueSshDeepLink(rawUrl);
+  });
+
+  app.on("open-file", (event, filePath) => {
+    event.preventDefault();
+    queueOpenTerminalPath(filePath);
+  });
+
+  app.on("second-instance", (_event, argv, workingDirectory, additionalData) => {
+    // Prefer the raw argument list forwarded by the second process (see the
+    // requestSingleInstanceLock comment) — the regrouped event argv separates
+    // PuTTY-style flags from their values, so fall back only when the second
+    // instance predates the raw-argv handoff.
+    const rawLaunchArgv = Array.isArray(additionalData?.rawLaunchArgv)
+      ? additionalData.rawLaunchArgv
+      : null;
+    const secondInstanceArgv = rawLaunchArgv ? [argv[0], ...rawLaunchArgv] : argv;
+    const jmsDeepLinkUrls = collectJmsDeepLinkUrls(secondInstanceArgv);
+    // Scheme URLs follow the ssh:// protocol-client preference; PuTTY-style
+    // CLI args from a bastion/PAM launch always queue (viaCommandLine).
+    const deepLinkQueueItems = collectSshDeepLinkQueueItems(secondInstanceArgv, {
+      includeSchemeUrls: sshDeepLinkEnabled,
+    });
+    redactPuttyCommandLinePasswords(secondInstanceArgv);
+    if (rawLaunchArgv) {
+      // Parsing and subsequent routing use the independent ordered copy.
+      // Release both consumed transport buffers: Chromium may have moved the
+      // password away from -pw, so adjacency-based redaction is unsafe here.
+      rawLaunchArgv.length = 0;
+      argv.length = 0;
+    }
+    if (jmsDeepLinkUrls.length > 0) {
+      if (jmsDeepLinkEnabled) {
+        jmsDeepLinkUrls.forEach(queueJmsDeepLink);
+      }
+      return;
+    }
+    if (deepLinkQueueItems.telnet.length > 0) {
+      deepLinkQueueItems.telnet.forEach((item) => {
+        queueTelnetDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine });
+      });
+      return;
+    }
+    if (deepLinkQueueItems.ssh.length > 0) {
+      deepLinkQueueItems.ssh.forEach((item) => {
+        queueSshDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine });
+      });
+      return;
+    }
+    if (collectOpenTerminalPathArgs(secondInstanceArgv).length > 0) {
+      const baseDirectory = typeof workingDirectory === "string" ? workingDirectory : undefined;
+      const openTerminalPaths = resolveOpenTerminalPathsFromArgs(secondInstanceArgv, { baseDirectory });
+      if (openTerminalPaths.length > 0) {
+        queueResolvedOpenTerminalPaths(openTerminalPaths);
+      } else {
+        // Still bring the app forward when Explorer launched us but the path
+        // failed validation — silent no-op feels like a broken menu item.
+        console.warn("[Main] Open-terminal-path args present but no valid path resolved:", secondInstanceArgv);
+        if (!focusMainWindow()) {
+          // Explicit foreground request (a second instance launch): if a
+          // still-pending hidden auto-launch cold start races ahead of the
+          // normal bootstrap and consumes the --hidden flag here, the window
+          // would otherwise get created hidden with nothing to show it —
+          // focus again to guarantee visibility either way.
+          void createAndShowMainWindow().then(() => {
+            focusMainWindow();
+          }).catch((err) => {
+            console.error("[Main] Failed to recreate window on open-terminal-path:", err);
+          });
+        }
+      }
+      return;
+    }
     if (!focusMainWindow()) {
-      // Window is missing or crashed — try to recreate it
-      void createAndShowMainWindow().catch((err) => {
+      // Window is missing or crashed — try to recreate it. Same
+      // hidden-launch race guard as above: this is an explicit foreground
+      // request, so re-focus after creation regardless of which flag this
+      // particular call happened to consume.
+      void createAndShowMainWindow().then(() => {
+        focusMainWindow();
+      }).catch((err) => {
         console.error("[Main] Failed to recreate window on second-instance:", err);
         showStartupError(err);
         if (!hasUsableWindow()) {
@@ -523,8 +1311,84 @@ if (!gotLock) {
   });
 
   // Application lifecycle
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     registerAppProtocol();
+    const initialSshDeepLinkPreference = applyInitialSshDeepLinkPreference({
+      enabled: sshDeepLinkEnabled,
+      applyPreference: (enabled) => applySshProtocolClientPreference({ app, enabled, isDev }),
+      // Failed protocol registration must not drop command-line launch intents
+      // (they do not depend on being the ssh:// protocol client).
+      clearPending: () => {
+        dropSchemePendingDeepLinks();
+      },
+    });
+    sshDeepLinkEnabled = initialSshDeepLinkPreference.enabled;
+
+    appLockSettingsStore = createAppLockSettingsStore({
+      filePath: path.join(app.getPath("userData"), APP_LOCK_SETTINGS_FILE),
+      readFile: (filePath, encoding) => fs.promises.readFile(filePath, encoding),
+      writeFile: (filePath, content, options) => fs.promises.writeFile(filePath, content, options),
+      rename: (from, to) => fs.promises.rename(from, to),
+    });
+
+    let persistedAppLockSettings = DEFAULT_APP_LOCK_SETTINGS;
+    try {
+      persistedAppLockSettings = await appLockSettingsStore.load();
+    } catch (err) {
+      console.warn("[Main] Failed to load app lock settings, defaulting to disabled:", err);
+      persistedAppLockSettings = appLockSettingsStore.getSnapshot();
+    }
+
+    const lockOnStartup = canLockFromSettings(persistedAppLockSettings);
+    appLockRuntimeBridge.initialize({
+      locked: lockOnStartup,
+      reason: lockOnStartup ? "startup" : null,
+      lastActivityAt: Date.now(),
+    });
+    const appLockSystemAuthBridge = createAppLockSystemAuthBridge({
+      platform: process.platform,
+      systemPreferences: electronModule.systemPreferences,
+      execFile,
+      helperPath: resolveDefaultHelperPath({ isPackaged: app.isPackaged }),
+      getNativeWindowHandle: getAppLockNativeWindowHandle,
+    });
+    appLockController = createAppLockController({
+      settingsStore: appLockSettingsStore,
+      runtimeBridge: appLockRuntimeBridge,
+      systemAuthBridge: appLockSystemAuthBridge,
+      getMainWindows: () => getWindowManager().getMainWindows?.() ?? [],
+      // Includes detached session windows (registerAsMainWindow:false).
+      getAppContentWindows: () => getWindowManager().getAppContentWindows?.() ?? [],
+      getSettingsWindow: () => getWindowManager().getSettingsWindow?.() ?? null,
+      getTrayPanelWindow: () => getGlobalShortcutBridge().getTrayPanelWindow?.() ?? null,
+      getTerminalPopupWindows: () => getWindowManager().getTerminalPopupWindows?.() ?? [],
+    });
+    appLockController.syncIdleTimer?.();
+
+    const initialJmsDeepLinkPreference = applyInitialJmsDeepLinkPreference({
+      enabled: jmsDeepLinkEnabled,
+      applyPreference: (enabled) => applyJmsProtocolClientPreference({ app, enabled, isDev }),
+      clearPending: () => {
+        pendingJmsDeepLinkUrls.length = 0;
+        jmsDeepLinkDeliveryGeneration += 1;
+      },
+    });
+    jmsDeepLinkEnabled = initialJmsDeepLinkPreference.enabled;
+
+    const explorerLaunchSpec = resolveExplorerContextMenuLaunchSpec();
+    const initialExplorerContextMenuPreference = applyInitialExplorerContextMenuPreference({
+      app,
+      executablePath: explorerLaunchSpec.executablePath,
+      appArgs: explorerLaunchSpec.appArgs,
+    });
+    explorerContextMenuEnabled = initialExplorerContextMenuPreference.enabled === true;
+
+    // Spellcheck dictionaries/workers are unused in Netcatty and cost memory.
+    try {
+      session?.defaultSession?.setSpellCheckerEnabled?.(false);
+    } catch {
+      // ignore
+    }
 
     // Grant only the Chromium permissions the app actually uses, and only
     // to the app's own origin. The default session is shared with in-app
@@ -600,7 +1464,10 @@ if (!gotLock) {
     // Build and set application menu. A broken menu should not take down
     // the entire app — fall back to no custom menu and continue startup.
     try {
-      const menu = getWindowManager().buildAppMenu(Menu, app, isMac);
+      const menu = getWindowManager().buildAppMenu(Menu, app, isMac, undefined, {
+        isAppLocked: () => Boolean(appLockRuntimeBridge?.getState?.()?.locked),
+        setAppLockWindowTitle: (win, title) => appLockController?.setWindowTitle?.(win, title),
+      });
       Menu.setApplicationMenu(menu);
     } catch (err) {
       console.error("[Main] Failed to build application menu:", err);
@@ -611,6 +1478,7 @@ if (!gotLock) {
 
     app.on("browser-window-created", (_event, win) => {
       try {
+        appLockController?.protectWindow?.(win);
         const windowManager = getWindowManager();
         const mainWin = windowManager.getMainWindow();
         const settingsWin = windowManager.getSettingsWindow();
@@ -619,7 +1487,8 @@ if (!gotLock) {
           win.setMenuBarVisibility(false);
           win.autoHideMenuBar = true;
           win.setMenu(null);
-          if (appIcon && win.setIcon) win.setIcon(appIcon);
+          const iconPath = appIconManager.getAppIconPath(appPath);
+          if (iconPath && win.setIcon) win.setIcon(iconPath);
         }
       } catch {
         // ignore
@@ -627,23 +1496,41 @@ if (!gotLock) {
     });
 
     // Create the main window
-    void createAndShowMainWindow().then(() => {
+    void createAndShowMainWindow().then(async (win) => {
+      // Empty cold-start queues would otherwise notify immediately (before the
+      // renderer subscribes). Wait for ready, then drain, then settle.
+      try {
+        await getWindowManager().waitForRendererReady(win, {
+          timeoutMs: 0,
+        });
+      } catch (err) {
+        console.warn(
+          "[Main] Renderer ready signal was late or missing before cold-start settle:",
+          err?.message || err,
+        );
+      }
+      await drainColdStartLaunchIntents();
+      notifyColdStartIntentsSettled(win);
+
       // Trigger auto-update check 5 s after window creation.
-      // startAutoCheck() is a no-op on unsupported platforms (Linux deb/rpm/snap).
+      // startAutoCheck() is a no-op on unsupported platforms (for example Linux
+      // Snap or an unmarked development build).
       getAutoUpdateBridge().startAutoCheck(5000);
 
-      // Pre-warm the settings window in the background so it opens instantly.
-      // Delay slightly to avoid competing with main window first-paint resources.
-      setTimeout(() => {
-        getWindowManager().prewarmSettingsWindow(electronModule, {
-          preload,
-          devServerUrl: effectiveDevServerUrl,
-          isDev,
-          appIcon,
-          isMac,
-          electronDir,
-        });
-      }, 3000);
+      // Settings prewarm is opt-in: a hidden BrowserWindow holds a full renderer.
+      // Enable with NETCATTY_PREWARM_SETTINGS=1 (delayed so first paint is undisturbed).
+      if (process.env.NETCATTY_PREWARM_SETTINGS === "1") {
+        setTimeout(() => {
+          getWindowManager().prewarmSettingsWindow(electronModule, {
+            preload,
+            devServerUrl: effectiveDevServerUrl,
+            isDev,
+            appIcon: appIconManager.getAppIconPath(appPath),
+            isMac,
+            electronDir,
+          });
+        }, 15000);
+      }
     }).catch((err) => {
       console.error("[Main] Failed to create main window:", err);
       showStartupError(err);
@@ -658,26 +1545,25 @@ if (!gotLock) {
       // should bring it back. Fallback to creating a new window if none exists.
       try {
         const mainWin = getWindowManager().getMainWindow?.();
-        if (mainWin && !mainWin.isDestroyed?.()) {
-          // If a close-to-tray hide is still pending (fullscreen exit animation
-          // not finished yet), cancel it — user intent to bring the window
-          // back overrides the pending hide.
-          try {
-            getGlobalShortcutBridge().clearPendingFullscreenHide?.(mainWin);
-          } catch {}
-          if (mainWin.isMinimized?.()) mainWin.restore();
-          mainWin.show?.();
-          mainWin.focus?.();
-          try {
-            app.focus({ steal: true });
-          } catch {}
+        if (handleActivateWithMainWindow({
+          app,
+          mainWindow: mainWin,
+          globalShortcutBridge: getGlobalShortcutBridge(),
+          windowManager: getWindowManager(),
+          reopenWindows: getAppLockReopenWindows(),
+        })) {
           return;
         }
       } catch {}
 
       if (focusMainWindow()) return;
-      // Main window doesn't exist — create it even if other windows (e.g. settings) are open
-      void createAndShowMainWindow().catch((err) => {
+      // Main window doesn't exist — create it even if other windows (e.g.
+      // settings) are open. Explicit foreground request (Dock reopen/click):
+      // guard against the same hidden-launch race as the second-instance
+      // handler above by re-focusing after creation.
+      void createAndShowMainWindow().then(() => {
+        focusMainWindow();
+      }).catch((err) => {
         console.error("[Main] Failed to create window on activate:", err);
         showStartupError(err);
         if (!hasUsableWindow()) {
@@ -685,13 +1571,21 @@ if (!gotLock) {
         }
       });
     });
+
+    app.on("hide", () => {
+      handleAppHide(appLockController);
+    });
   });
 
-  // Cleanup on all windows closed
+  // Cleanup on all windows closed. On macOS the process stays alive for Dock
+  // reactivation — re-apply App Lock so a later reopen does not inherit an
+  // unlocked runtime from the previous session in this process.
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {
       app.quit();
+      return;
     }
+    ensureAppLockForFreshSession(appLockController, "startup");
   });
 
   // Quit guard state:
@@ -717,101 +1611,71 @@ if (!gotLock) {
   // later window-close behavior (e.g. close-to-tray hooks that gate on
   // !isQuitting would stop firing).
   const commitQuit = () => {
+    try {
+      appLockController?.setLocked?.("background");
+    } catch {
+      // ignore
+    }
     getWindowManager().setIsQuitting(true);
-    quitConfirmed = true;
-    app.quit();
+    quitGuardChannelBusy = true;
+    void runPluginShutdown()
+      .then(({ timedOut }) => {
+        if (timedOut) console.warn("[Plugins] Shutdown deadline elapsed; continuing app quit");
+      })
+      .catch((error) => {
+        console.warn("[Plugins] Shutdown failed; continuing app quit:", error);
+      })
+      .finally(() => {
+        quitGuardChannelBusy = false;
+        quitConfirmed = true;
+        app.quit();
+      });
   };
 
   app.on("before-quit", (event) => {
-    // Fast path: we've already confirmed the quit once (commitQuit ran) and
-    // app.quit() re-fired before-quit. Let it through.
-    if (quitConfirmed) return;
-
-    // NOTE: an update install (quitAndInstall) intentionally still runs the
-    // dirty-editor check below. setQuittingForUpdate(true) only bypasses
-    // close-to-tray (so the window actually closes and Squirrel.Mac's ShipIt
-    // can swap the bundle); it must NOT skip the unsaved-work guard, or
-    // clicking "Restart Now" with a dirty SFTP editor would silently lose
-    // edits (#1215 review). If the user cancels to save, the quit is aborted
-    // and autoUpdateBridge's watchdog clears the quitting-for-update flags.
-
-    // A check is already in flight — swallow this event; the in-flight handler
-    // will issue commitQuit() when it completes if appropriate.
-    if (quitGuardChannelBusy) {
-      event.preventDefault();
-      return;
-    }
-
     const { ipcMain: _ipcMain } = electronModule;
-    // Target the main window explicitly. Falling back to
-    // BrowserWindow.getAllWindows()[0] could pick the tray panel or settings
-    // window, whose renderers don't listen for app:query-dirty-editors and
-    // would force the 5s timeout fallback to run on every quit.
-    const win = getWindowManager().getMainWindow();
-    // No main window, or it's hidden (tray-panel "Quit" path) — there's no
-    // visible UI to surface a "save first" toast on, so skip the round-trip
-    // and quit directly. The renderer's dirty-editor check exists to warn the
-    // user; if they can't see the warning, it's just dead 5-second wait.
-    //
-    // A minimized window is *not* hidden: the user has a taskbar/Dock entry
-    // and can restore in one click, so we still want to gate the quit on the
-    // dirty-editor check there. Some platforms report isVisible()=false on a
-    // minimized window (see globalShortcutBridge.cjs:478), so check both.
-    const isReachableByUser =
-      win && !win.isDestroyed?.() &&
-      (win.isVisible?.() || win.isMinimized?.());
-    if (!isReachableByUser) {
+    // Target app-content windows explicitly. Falling back to
+    // BrowserWindow.getAllWindows() could pick tray/settings windows whose
+    // renderers don't listen for app:query-dirty-editors and would force the
+    // timeout fallback on every quit.
+    const dirtyEditorWindows = typeof getWindowManager().getDirtyEditorWindows === "function"
+      ? getWindowManager().getDirtyEditorWindows()
+      : null;
+    const mainWindows = Array.isArray(dirtyEditorWindows)
+      ? dirtyEditorWindows
+      : typeof getWindowManager().getMainWindows === "function"
+        ? getWindowManager().getMainWindows()
+        : [getWindowManager().getMainWindow()].filter(Boolean);
+
+    void handleBeforeQuit({
+      event,
+      mainWindows,
+      queryDirtyEditors,
+      appLockController,
+      windowManager: getWindowManager(),
+      app,
+      ipcMain: _ipcMain,
+      quitConfirmed,
+      quitGuardChannelBusy,
+      timeoutMs: QUIT_GUARD_TIMEOUT_MS,
+      setQuitGuardChannelBusy(value) {
+        quitGuardChannelBusy = value;
+      },
+      setQuitConfirmed(value) {
+        quitConfirmed = value;
+      },
+      // Plugin shutdown is asynchronous, so commit paths must cancel the
+      // original quit and re-enter app.quit() through commitQuit.
+      commitQuit,
+      // Cancel a pending update install when the user aborts quit to save
+      // dirty editors (#1215 review) — the install bridge owns its in-flight
+      // state, so clear it alongside the window-manager flag.
+      cancelPendingUpdateInstall: () => getAutoUpdateBridge().cancelPendingInstall?.(),
+    }).catch((err) => {
+      console.warn("[Main] dirty-editor quit guard failed:", err);
+      quitGuardChannelBusy = false;
       commitQuit();
-      return;
-    }
-
-    // The renderer needs to be alive for the IPC roundtrip to make sense.
-    // A crashed renderer would silently drop the message and we'd wait
-    // 5 s for nothing — skip straight to quit (we can't ask the user
-    // anyway, the UI is gone).
-    const wc = win.webContents;
-    if (!wc || wc.isDestroyed?.() || wc.isCrashed?.()) {
-      commitQuit();
-      return;
-    }
-
-    quitGuardChannelBusy = true;
-    event.preventDefault();
-
-    // Ask the renderer whether any editor tab has unsaved changes. The same
-    // round-trip is used by the auto-update install handler (#1215); both go
-    // through queryDirtyEditors so the request/reply/timeout handling stays in
-    // one place. It fails open (resolves false) on timeout / dead renderer, so
-    // a hung renderer can never strand the quit.
-    queryDirtyEditors(wc, QUIT_GUARD_TIMEOUT_MS, { ipcMain: _ipcMain })
-      .then((hasDirty) => {
-        quitGuardChannelBusy = false;
-        if (!hasDirty) {
-          commitQuit();
-          return;
-        }
-        // hasDirty: the renderer showed a toast for dirty editors and the user
-        // is saving instead of quitting.
-        //
-        // A normal quit never sets isQuitting before commitQuit, so there is
-        // nothing to undo. But an update install (quitAndInstall) calls
-        // setQuittingForUpdate(true) — which also flips isQuitting=true to
-        // bypass close-to-tray — BEFORE this dirty check runs. If the user
-        // cancels to save, clear it NOW instead of waiting up to 10s for
-        // autoUpdateBridge's watchdog; otherwise close-to-tray and other
-        // !isQuitting-gated behavior stay bypassed while the app keeps running
-        // (#1215 review).
-        const wm = getWindowManager();
-        if (wm.isQuittingForUpdate?.()) wm.setQuittingForUpdate(false);
-      })
-      .catch((err) => {
-        // queryDirtyEditors is written to never reject, but guard anyway: a
-        // throw here would leave quitGuardChannelBusy=true and wedge the app
-        // un-quittable. Fail open and let the quit through.
-        console.warn("[Main] dirty-editor quit guard failed:", err);
-        quitGuardChannelBusy = false;
-        commitQuit();
-      });
+    });
   });
 
   // Cleanup all PTY sessions and port forwarding tunnels before quitting
@@ -825,6 +1689,13 @@ if (!gotLock) {
       terminalBridge.cleanupAllSessions();
     } catch (err) {
       console.warn("Error during terminal cleanup:", err);
+    }
+    try {
+      // End parked SSH transports that outlived their last tab/tunnel lease.
+      const { discardAllTransports } = require("./bridges/sshConnectionPool.cjs");
+      discardAllTransports("app-quit");
+    } catch (err) {
+      console.warn("Error during SSH transport cleanup:", err);
     }
     try {
       portForwardingBridge.stopAllPortForwards();

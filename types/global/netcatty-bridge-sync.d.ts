@@ -1,9 +1,48 @@
 import type { S3Config, SyncedFile, WebDAVConfig } from "../../domain/sync";
+import type { AppLockSettings } from "../../domain/appLock";
+
+type AppLockRuntimeReason = 'startup' | 'idle' | 'manual' | 'background' | null;
+
+interface AppLockRuntimeState {
+  initialized: boolean;
+  locked: boolean;
+  reason: AppLockRuntimeReason;
+  version: number;
+  lastLockedAt: number | null;
+  lastUnlockedAt: number | null;
+  lastActivityAt: number | null;
+}
+
+type AppLockSettingsMutationError =
+  | { ok: false; error: 'empty-current' | 'empty-next' | 'incorrect' };
+
+type AppLockUnlockResult =
+  | { ok: true }
+  | { ok: false; error: 'empty' | 'incorrect' };
+
+type AppLockSystemUnlockStatus = {
+  supported: boolean;
+  available: boolean;
+  enabled: boolean;
+  platform: 'darwin' | 'win32' | 'unsupported';
+  label: 'Touch ID' | 'Windows Hello' | null;
+  reason: string | null;
+};
+
+type AppLockSystemUnlockResult =
+  | { ok: true }
+  | { ok: false; error: 'disabled' | 'not-locked' | 'unsupported' | 'unavailable' | 'cancelled' | 'failed' };
+
+type AppLockSystemUnlockSettingsResult =
+  | AppLockSettings
+  | { ok: false; error: 'empty-current' | 'incorrect' | 'locked' | 'unsupported' | 'unavailable' | 'cancelled' | 'failed' };
 
 declare global {
   interface NetcattyBridge {
     setTheme?(theme: 'light' | 'dark' | 'system'): Promise<boolean>;
     setBackgroundColor?(color: string): Promise<boolean>;
+    setWindowOpacity?(opacity: number): Promise<boolean>;
+    setAppIconVariant?(variant: import('../../domain/appIconVariant').AppIconVariant): Promise<boolean>;
     setLanguage?(language: string): Promise<boolean>;
     // Window controls for custom title bar (Windows/Linux)
     windowMinimize?(): Promise<void>;
@@ -12,7 +51,23 @@ declare global {
     windowIsMaximized?(): Promise<boolean>;
     windowIsFullscreen?(): Promise<boolean>;
     windowFocus?(): Promise<boolean>;
+    setTerminalKeyboardFocus?(focused: boolean): void;
+    setWindowTitle?(title: string): Promise<boolean>;
+    openSessionInNewWindow?(payload: {
+      title: string;
+      sourceSession: import("../../domain/models").TerminalSession;
+      localShellType?: import("../../domain/models").TerminalSession['shellType'];
+    }): Promise<{ success: boolean; error?: string }>;
+    onOpenSessionInNewWindow?(cb: (payload: {
+      title: string;
+      sourceSession: import("../../domain/models").TerminalSession;
+      localShellType?: import("../../domain/models").TerminalSession['shellType'];
+    }) => void): () => void;
+    onWindowCommandCloseRequested?(cb: () => void): () => void;
     onWindowFullScreenChanged?(cb: (isFullscreen: boolean) => void): () => void;
+    onWindowShown?(cb: () => void): () => void;
+    onWindowFocusRequested?(cb: () => void): () => void;
+    onWindowWillHide?(cb: () => void): () => void;
 
     // Settings window
     openSettingsWindow?(): Promise<boolean>;
@@ -21,10 +76,33 @@ declare global {
     // Cross-window settings sync
     notifySettingsChanged?(payload: { key: string; value: unknown }): void;
     onSettingsChanged?(cb: (payload: { key: string; value: unknown }) => void): () => void;
+    getAppLockRuntimeState?(): Promise<AppLockRuntimeState>;
+    getAppLockSettings?(): Promise<AppLockSettings>;
+    setAppLockTimeoutMinutes?(timeoutMinutes: number): Promise<AppLockSettings>;
+    requestAppLockEnable?(): Promise<AppLockSettings | AppLockSettingsMutationError>;
+    requestAppLockDisable?(currentPassword: string): Promise<AppLockSettings | AppLockSettingsMutationError>;
+    requestAppLockReset?(currentPassword: string): Promise<AppLockSettings | AppLockSettingsMutationError>;
+    requestAppLockPasswordChange?(input: {
+      currentPassword?: string;
+      nextPassword: string;
+    }): Promise<AppLockSettings | AppLockSettingsMutationError>;
+    setAppLockRuntimeLocked?(reason: Exclude<AppLockRuntimeReason, null>): Promise<AppLockRuntimeState>;
+    requestAppLockUnlock?(password: string): Promise<AppLockUnlockResult>;
+    getAppLockSystemUnlockStatus?(): Promise<AppLockSystemUnlockStatus>;
+    setAppLockSystemUnlockEnabled?(input: {
+      enabled: boolean;
+      currentPassword?: string;
+      autoPromptEnabled?: boolean;
+    }): Promise<AppLockSystemUnlockSettingsResult>;
+    requestAppLockSystemUnlock?(): Promise<AppLockSystemUnlockResult>;
+    reportAppLockActivity?(): Promise<void>;
+    onAppLockSettingsChanged?(cb: (settings: AppLockSettings) => void): () => void;
+    onAppLockRuntimeStateChanged?(cb: (state: AppLockRuntimeState) => void): () => void;
 
     // Cloud sync master password (stored in-memory + persisted via Electron safeStorage)
     cloudSyncSetSessionPassword?(password: string): Promise<boolean>;
     cloudSyncGetSessionPassword?(): Promise<string | null>;
+    onCloudSyncSessionPasswordAvailable?(callback: () => void): () => void;
     cloudSyncClearSessionPassword?(): Promise<boolean>;
 
     // Cloud sync network operations (proxied via main process)
@@ -48,10 +126,24 @@ declare global {
     startPortForward?(options: PortForwardOptions): Promise<PortForwardResult>;
     stopPortForward?(tunnelId: string): Promise<PortForwardResult>;
     getPortForwardStatus?(tunnelId: string): Promise<PortForwardStatusResult>;
-    listPortForwards?(): Promise<{ tunnelId: string; type: string; status: string }[]>;
+    listPortForwards?(): Promise<{ ruleId?: string; tunnelId: string; type: string; status: string; error?: string }[]>;
+    getPortForwardSnapshot?(): Promise<PortForwardRuntimeSnapshot>;
+    subscribePortForwardRuntime?(): Promise<PortForwardRuntimeSnapshot>;
+    unsubscribePortForwardRuntime?(): Promise<{ success: boolean }>;
+    subscribePortForward?(tunnelId: string): Promise<{
+      tunnelId: string;
+      type?: string;
+      status: 'inactive' | 'connecting' | 'active' | 'error';
+      error?: string;
+    }>;
     stopAllPortForwards?(): Promise<void>;
-    stopPortForwardByRuleId?(ruleId: string): Promise<{ stopped: number }>;
+    stopPortForwardByRuleId?(ruleId: string): Promise<{
+      stopped: number;
+      failed?: number;
+      errors?: string[];
+    }>;
     onPortForwardStatus?(tunnelId: string, cb: PortForwardStatusCallback): () => void;
+    onPortForwardRuntime?(cb: PortForwardRuntimeEventCallback): () => void;
 
     // Known Hosts
     readKnownHosts?(): Promise<string | null>;
@@ -78,6 +170,7 @@ declare global {
       reason: 'app_version_change' | 'before_restore';
       sourceAppVersion?: string;
       targetAppVersion?: string;
+      syncDataVersion?: number;
       maxCount?: number;
     }): Promise<{
       created: boolean;
@@ -92,6 +185,7 @@ declare global {
           hostCount: number;
           keyCount: number;
           snippetCount: number;
+          noteCount: number;
           identityCount: number;
           portForwardingRuleCount: number;
         };
@@ -108,6 +202,7 @@ declare global {
         hostCount: number;
         keyCount: number;
         snippetCount: number;
+        noteCount: number;
         identityCount: number;
         portForwardingRuleCount: number;
       };
@@ -124,6 +219,7 @@ declare global {
           hostCount: number;
           keyCount: number;
           snippetCount: number;
+          noteCount: number;
           identityCount: number;
           portForwardingRuleCount: number;
         };
@@ -138,6 +234,9 @@ declare global {
 
     // Notify main process the renderer has mounted/painted (used to avoid initial blank screen).
     rendererReady?(): void;
+    // Fired when an existing main renderer window is shown again from tray,
+    // global hotkey, dock activation, or second-instance focusing.
+    onAppLockReopen?(listener: () => void): () => void;
 
     // Quit guard: subscribe to main-process quit requests that query for dirty editors.
     // Listener is called with no arguments; return value is an unsubscribe function.
@@ -150,6 +249,10 @@ declare global {
     // Chain progress listener for jump host connections
     // Callback receives: (sessionId: string, currentHop: number, totalHops: number, hostLabel: string, status: string, error?: string)
     onChainProgress?(cb: (sessionId: string, hop: number, total: number, label: string, status: string, error?: string) => void): () => void;
+
+    // Fired when a requested SSH connection reuse cannot be honored and the
+    // session falls back to a regular fresh connection.
+    onConnectionReuseFallback?(cb: (sessionId: string, sourceSessionId?: string) => void): () => void;
 
     // SFTP connection progress listener (auth method logs)
     onSftpConnectionProgress?(cb: (sessionId: string, label: string, status: string, detail?: string) => void): () => void;
@@ -179,6 +282,7 @@ declare global {
       error_description?: string;
     }>;
     githubCancelDeviceFlowPoll?(pollId: string): Promise<void>;
+    githubDownloadGistRawContent?(options: { accessToken: string; rawUrl: string }): Promise<string>;
 
     // Google OAuth (cloud sync) - proxied via main process to avoid CORS
     googleExchangeCodeForTokens?(options: {

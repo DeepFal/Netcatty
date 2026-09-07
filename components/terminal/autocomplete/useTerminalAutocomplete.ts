@@ -18,40 +18,72 @@ import {
 import { getCompletions, parseCommandLine, type CompletionSuggestion } from "./completionEngine";
 import type { Snippet } from "../../../domain/models";
 import { recordCommand } from "./commandHistoryStore";
+import { seedLocalShellHistoryFromHistfiles } from "./localShellHistorySeed";
 import { shellEscape } from "./completionEngine";
 import { preloadCommonSpecs } from "./figSpecLoader";
-import { listDirectoryEntries, normalizePathTokenForLookup } from "./remotePathCompleter";
+import {
+  listDirectoryEntries,
+  normalizePathTokenForLookup,
+  shouldPreferRemoteShellCwd,
+} from "./remotePathCompleter";
 import { decideGhostSuggestion } from "./ghostSuggestionPolicy";
-import { computeLivePreviewWrite } from "./livePreviewSequence";
+import { isWindowsShellLineInput, shouldWriteAutocompleteLivePreview } from "./livePreviewSequence";
 import {
   areSubDirPanelsEqual,
   areSuggestionsEqual,
-  calculatePopupPosition,
-  resolveAutocompleteCwd,
+  nextAutocompletePopupAnchorViewport,
+  resolveAutocompleteCursorCell,
+  resolveAutocompleteCwdWithSource,
+  resolveAutocompletePopupAnchorInViewport,
+  resolvePreservedSuggestionIndex,
 } from "./terminalAutocompleteLayout";
 import { handleTerminalAutocompleteInput } from "./terminalAutocompleteInput";
 import { handleTerminalAutocompleteKeyEvent } from "./terminalAutocompleteKeyEvent";
+import {
+  computeAutocompleteAcceptWrite,
+  isSameAutocompleteQuery,
+  resolveAutocompleteQueryInput,
+  shouldBlockAutocompleteForSensitivePrompt,
+} from "./terminalAutocompletePrompt";
+import { sliceStringByCellColumns } from "./terminalStringCellWidth";
+import { isTerminalAlternateScreenActive } from "../terminalHibernateRuntime";
+
 
 export interface AutocompleteSettings {
   enabled: boolean;
   showGhostText: boolean;
   showPopupMenu: boolean;
+  /** Whether popup navigation should render the highlighted candidate into the terminal input line. */
+  livePreview: boolean;
+  /** Whether accepting a candidate may clear/replace the current input line. */
+  allowLineReplacement: boolean;
   debounceMs: number;
   minChars: number;
   maxSuggestions: number;
   /** Typing speed threshold — suppress suggestions when typing faster than this (ms between keystrokes) */
   fastTypingThresholdMs: number;
+  /** Whether Shift+Enter is reserved for the terminal's configured send text. */
+  shiftEnterNewlineEnabled: boolean;
+  /** Which history pool suggestions draw from (current host vs all hosts). */
+  historyScope: "host" | "global";
 }
 
 export const DEFAULT_AUTOCOMPLETE_SETTINGS: AutocompleteSettings = {
   enabled: true,
   showGhostText: true,
   showPopupMenu: true,
+  livePreview: true,
+  allowLineReplacement: true,
   debounceMs: 100,
   minChars: 1,
-  maxSuggestions: 8,
+  maxSuggestions: 50,
   fastTypingThresholdMs: 40,
+  shiftEnterNewlineEnabled: true,
+  historyScope: "host",
 };
+
+/** Max time to poll for shell echo after a pre-echo debounce cycle (#2813). */
+const ECHO_VALIDATION_MAX_WAIT_MS = 3000;
 
 /**
  * Whether completion work is worth doing — i.e. whether anything would
@@ -70,9 +102,7 @@ const EMPTY_STATE: AutocompleteState = Object.freeze({
   suggestions: [],
   selectedIndex: -1,
   popupVisible: false,
-  popupPosition: { x: 0, y: 0 },
-  popupCursorLineTop: 0,
-  popupCursorLineBottom: 0,
+  popupAnchorViewport: { left: 0, top: 0, bottom: 0 },
   expandUpward: false,
   subDirPanels: [],
   subDirFocusLevel: -1,
@@ -96,9 +126,7 @@ export interface AutocompleteState {
   suggestions: CompletionSuggestion[];
   selectedIndex: number;
   popupVisible: boolean;
-  popupPosition: { x: number; y: number };
-  popupCursorLineTop: number;
-  popupCursorLineBottom: number;
+  popupAnchorViewport: { left: number; top: number; bottom: number };
   expandUpward: boolean;
   /** Stack of sub-directory panels (cascading: panel 0 → panel 1 → ...) */
   subDirPanels: SubDirPanel[];
@@ -106,10 +134,89 @@ export interface AutocompleteState {
   subDirFocusLevel: number;
 }
 
+function isSubsequence(query: string, target: string): boolean {
+  let queryIndex = 0;
+  for (let targetIndex = 0; targetIndex < target.length && queryIndex < query.length; targetIndex++) {
+    if (target[targetIndex] === query[queryIndex]) queryIndex++;
+  }
+  return queryIndex === query.length;
+}
+
+/**
+ * Remove history rows that no longer match the edited input while a debounced
+ * provider refresh is pending. Other sources keep their provider-specific
+ * matching semantics (snippet search, plugin replacement, etc.).
+ */
+export function reconcileAutocompletePopupState(
+  prev: AutocompleteState,
+  input: string | null,
+): AutocompleteState {
+  if (!prev.popupVisible || prev.suggestions.length === 0) return prev;
+  if (input === null) return { ...EMPTY_STATE };
+
+  const normalizedInput = input.toLowerCase();
+  const inputContext = parseCommandLine(input);
+  const allowFuzzyHistory = input.length >= 2 && inputContext.wordIndex === 0;
+  const suggestions = prev.suggestions.filter((suggestion) => {
+    if (suggestion.source !== "history") return true;
+    const text = suggestion.text.toLowerCase();
+    if (suggestion.historyMatch === "path-argument") {
+      const suggestionContext = parseCommandLine(suggestion.text);
+      const currentArgument = inputContext.currentWord
+        .replace(/^['"]/, "")
+        .replace(/['"]$/, "")
+        .replace(/\\ /g, " ")
+        .toLowerCase();
+      const suggestionArgument = suggestionContext.currentWord
+        .replace(/^['"]/, "")
+        .replace(/['"]$/, "")
+        .replace(/\\ /g, " ")
+        .toLowerCase();
+      return suggestionContext.commandName.toLowerCase() === inputContext.commandName.toLowerCase()
+        && suggestionArgument.startsWith(currentArgument);
+    }
+    if (text.length <= normalizedInput.length) return false;
+    return text.startsWith(normalizedInput)
+      || (allowFuzzyHistory && isSubsequence(normalizedInput, text));
+  });
+
+  if (suggestions.length === 0) return { ...EMPTY_STATE };
+  if (
+    prev.selectedIndex === -1
+    && prev.subDirFocusLevel === -1
+    && prev.subDirPanels.length === 0
+    && areSuggestionsEqual(prev.suggestions, suggestions)
+  ) {
+    return prev;
+  }
+
+  return {
+    ...prev,
+    suggestions,
+    selectedIndex: -1,
+    subDirPanels: [],
+    subDirFocusLevel: -1,
+  };
+}
+
+type HostCompletionProviderOptions = Parameters<typeof getCompletions>[1] & {
+  /** Host-owned prompt identity used to gate third-party Provider access. */
+  promptText: string;
+  /**
+   * False when input was synthesized from the pre-echo keystroke buffer.
+   * External Providers must stay disabled until the live line validates input.
+   */
+  allowExternalProviders?: boolean;
+  /** Aborted whenever the prompt/session security state invalidates this query. */
+  signal?: AbortSignal;
+};
+
 interface UseTerminalAutocompleteOptions {
   termRef: RefObject<XTerm | null>;
+  containerRef: RefObject<HTMLElement | null>;
   sessionId: string;
   hostId: string;
+  hostGroup?: string;
   hostOs: "linux" | "windows" | "macos";
   settings?: Partial<AutocompleteSettings>;
   /** Callback to write text to the terminal session — replaces CustomEvent */
@@ -122,6 +229,21 @@ interface UseTerminalAutocompleteOptions {
   snippets?: Snippet[];
   /** Accept a snippet — clears typed input then runs it (host-canonical send) */
   onAcceptSnippet?: (snippet: Snippet) => void;
+  /**
+   * Host-owned password/auth prompt latch. When true, suppress autocomplete
+   * even if the PS1 still looks like a normal shell (e.g. `read -s -p '$ '`).
+   */
+  sensitiveInputActiveRef?: RefObject<boolean>;
+  /** Host-owned completion Provider adapter; defaults to Netcatty's built-in Provider. */
+  provideCompletions?: (
+    input: string,
+    options: HostCompletionProviderOptions,
+  ) => Promise<CompletionSuggestion[]>;
+  /**
+   * Vendor bastion / network-device CLI. Live-preview PTY rewrites (Ctrl-U)
+   * disconnect these sessions, so the popup stays and preview writes no-op (#1193).
+   */
+  isNetworkDevice?: boolean;
 }
 
 export interface TerminalAutocompleteHandle {
@@ -133,14 +255,36 @@ export interface TerminalAutocompleteHandle {
   repositionPopup: () => void;
   closePopup: () => void;
   dispose: () => void;
+  showSudoHint: (text: string) => boolean;
+  hideSudoHint: () => void;
 }
 
-export { getCommandToRecordOnEnter } from "./terminalAutocompletePrompt";
+export {
+  computeAutocompleteAcceptWrite,
+  getCommandToRecordOnEnter,
+  resolveAutocompleteQueryInput,
+} from "./terminalAutocompletePrompt";
 
 export function useTerminalAutocomplete(
   options: UseTerminalAutocompleteOptions,
 ): TerminalAutocompleteHandle {
-  const { termRef, sessionId, hostId, hostOs, settings: userSettings, onAcceptText, protocol, getCwd, snippets, onAcceptSnippet } = options;
+  const {
+    termRef,
+    containerRef,
+    sessionId,
+    hostId,
+    hostGroup,
+    hostOs,
+    settings: userSettings,
+    onAcceptText,
+    protocol,
+    getCwd,
+    snippets,
+    onAcceptSnippet,
+    sensitiveInputActiveRef,
+    provideCompletions,
+    isNetworkDevice = false,
+  } = options;
   const rawSettings: AutocompleteSettings = {
     ...DEFAULT_AUTOCOMPLETE_SETTINGS,
     ...userSettings,
@@ -155,6 +299,7 @@ export function useTerminalAutocomplete(
   const settings: AutocompleteSettings = {
     ...rawSettings,
     showGhostText: rawSettings.showPopupMenu ? false : rawSettings.showGhostText,
+    livePreview: shouldWriteAutocompleteLivePreview(rawSettings.livePreview, isNetworkDevice),
   };
 
   // Use refs for values accessed in callbacks to avoid stale closures
@@ -168,19 +313,33 @@ export function useTerminalAutocomplete(
   onAcceptSnippetRef.current = onAcceptSnippet;
   const hostIdRef = useRef(hostId);
   hostIdRef.current = hostId;
+  const hostGroupRef = useRef(hostGroup);
+  hostGroupRef.current = hostGroup;
   const hostOsRef = useRef(hostOs);
   hostOsRef.current = hostOs;
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
   const protocolRef = useRef(protocol);
   protocolRef.current = protocol;
+  const isNetworkDeviceRef = useRef(isNetworkDevice);
+  isNetworkDeviceRef.current = isNetworkDevice;
   const getCwdRef = useRef(getCwd);
   getCwdRef.current = getCwd;
+  const provideCompletionsRef = useRef(provideCompletions ?? getCompletions);
+  provideCompletionsRef.current = provideCompletions ?? getCompletions;
 
   const [state, setState] = useState<AutocompleteState>(EMPTY_STATE);
 
   const ghostAddonRef = useRef<GhostTextAddon | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Pre-echo debounce cycles must poll until the live line validates the
+   * keystroke buffer (or we give up). PTY echo updates xterm only and does
+   * not schedule another fetchSuggestions — without this, whole-word IME /
+   * high-latency SSH commits never show completions until the next key.
+   */
+  const echoValidationTypedRef = useRef<string | null>(null);
+  const echoValidationStartedAtRef = useRef<number | null>(null);
   const lastKeystrokeRef = useRef<number>(0);
   const lastPromptRef = useRef<PromptDetectionResult | null>(null);
   const disposedRef = useRef(false);
@@ -190,8 +349,11 @@ export function useTerminalAutocomplete(
   const suppressNextEnterRecordRef = useRef(false);
   /** Monotonic counter to invalidate stale async completion results */
   const fetchVersionRef = useRef(0);
+  const completionAbortRef = useRef<AbortController | null>(null);
   /** Last accepted suggestion text — for accurate history recording on fast Enter after accept */
   const lastAcceptedCommandRef = useRef<string | null>(null);
+  /** Deadline for treating the next `.` / `_` as readline Meta after Esc dismissed the popup. */
+  const escMetaPrefixUntilRef = useRef(0);
   /** The user's typed input that produced the current popup suggestions (live-preview baseline). */
   const previewBaselineRef = useRef<string>("");
   /** Whether a popup candidate is currently rendered into the command line (#1005). */
@@ -231,6 +393,16 @@ export function useTerminalAutocomplete(
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Local Terminal: seed autocomplete history from ~/.zsh_history (etc.) once
+  // per stable hostId so prefix suggestions match Ghostty-style histfile recall
+  // (#2037). Remote sessions keep reading history via the side panel instead.
+  useEffect(() => {
+    if (!settings.enabled) return;
+    if (protocol !== "local") return;
+    if (!hostId) return;
+    void seedLocalShellHistoryFromHistfiles(hostId, hostOs);
+  }, [settings.enabled, protocol, hostId, hostOs]);
 
   // Initialize ghost text addon — poll for termRef since it's set after xterm runtime creation
   // Also clears popup/ghost when autocomplete is disabled at runtime
@@ -303,7 +475,11 @@ export function useTerminalAutocomplete(
       clearTimeout(debounceTimerRef.current);
       debounceTimerRef.current = null;
     }
+    echoValidationTypedRef.current = null;
+    echoValidationStartedAtRef.current = null;
     ghostAddonRef.current?.hide();
+    completionAbortRef.current?.abort();
+    completionAbortRef.current = null;
     // Bump version to invalidate any in-flight async completions
     fetchVersionRef.current++;
     subDirFetchVersionRef.current++;
@@ -311,6 +487,70 @@ export function useTerminalAutocomplete(
       prev.popupVisible || prev.suggestions.length > 0 ? { ...EMPTY_STATE } : prev,
     );
   }, []);
+
+  /**
+   * Reconcile the visible popup with the newly edited input synchronously.
+   * The full provider refresh remains debounced, but rows from the previous
+   * query must not remain actionable while that refresh is pending.
+   */
+  const syncPopupToInput = useCallback((input: string | null) => {
+    completionAbortRef.current?.abort();
+    completionAbortRef.current = null;
+    fetchVersionRef.current++;
+    subDirFetchVersionRef.current++;
+
+    setState((prev) => reconcileAutocompletePopupState(prev, input));
+  }, []);
+
+  const repositionPopup = useCallback(() => {
+    // Skip the React setter entirely while the popup is closed so a line-feed
+    // burst cannot stall the renderer (#3204).
+    if (!stateRef.current.popupVisible || stateRef.current.suggestions.length === 0) return;
+    const term = termRef.current;
+    if (!term) return;
+
+    setState((prev) => {
+      if (!prev.popupVisible || prev.suggestions.length === 0) return prev;
+      const { prompt } = getAlignedPrompt(term, typedInputBufferRef.current, typedBufferReliableRef.current);
+      const queryInput = resolveAutocompleteQueryInput(
+        prompt,
+        typedInputBufferRef.current,
+        typedBufferReliableRef.current,
+      );
+      // Prefer resolved query input for anchoring so lagging remote echo does
+      // not leave the popup behind the typed command (main CursorCell helper).
+      const cursorCell = prompt.isAtPrompt && queryInput !== null
+        ? resolveAutocompleteCursorCell(term, {
+          promptText: prompt.promptText,
+          userInput: queryInput,
+        })
+        : {
+          column: term.buffer.active.cursorX,
+          row: term.buffer.active.cursorY,
+        };
+      // Pin to the wrapped command start after wrap/scroll so the popup
+      // follows the first physical line instead of covering it (#3061).
+      const anchor = resolveAutocompletePopupAnchorInViewport(
+        term,
+        containerRef.current,
+        prev.suggestions.length,
+        cursorCell.column,
+        cursorCell.row,
+      );
+      const nextAnchor = nextAutocompletePopupAnchorViewport(
+        prev.popupAnchorViewport,
+        prev.expandUpward,
+        anchor,
+      );
+      if (!nextAnchor) return prev;
+
+      return {
+        ...prev,
+        popupAnchorViewport: nextAnchor.viewport,
+        expandUpward: nextAnchor.expandUpward,
+      };
+    });
+  }, [containerRef, termRef]);
 
   /** Fetch directory listing via IPC. */
   const fetchDirEntries = useCallback(async (dirPath: string): Promise<SubDirEntry[]> => {
@@ -342,18 +582,29 @@ export function useTerminalAutocomplete(
       typedBufferReliableRef.current,
     );
     const activePrompt = livePrompt.isAtPrompt ? livePrompt : lastPromptRef.current;
-    const activeWord = activePrompt?.isAtPrompt
-      ? parseCommandLine(activePrompt.userInput).currentWord
+    const activeLine = activePrompt
+      ? resolveAutocompleteQueryInput(
+        activePrompt,
+        typedInputBufferRef.current,
+        typedBufferReliableRef.current,
+      )
+      : null;
+    const activeWord = activeLine !== null
+      ? parseCommandLine(activeLine).currentWord
       : parseCommandLine(item.text).currentWord;
-    const cwd = resolveAutocompleteCwd(
+    const cwdResolution = resolveAutocompleteCwdWithSource(
       activePrompt?.promptText ?? "",
       activeWord,
       getCwdRef.current?.(),
       hostOsRef.current,
     );
-    const dirPath = normalizePathTokenForLookup(parseCommandLine(item.text).currentWord, cwd, {
-      preferRelativeCwd: Boolean(
-        sessionIdRef.current && protocolRef.current !== "local" && hostOsRef.current === "linux",
+    const dirPath = normalizePathTokenForLookup(parseCommandLine(item.text).currentWord, cwdResolution.cwd, {
+      preferRelativeCwd: shouldPreferRemoteShellCwd(
+        protocolRef.current,
+        sessionIdRef.current,
+        hostOsRef.current,
+        cwdResolution.cwd,
+        cwdResolution.source,
       ),
     });
     if (!dirPath) return;
@@ -379,8 +630,13 @@ export function useTerminalAutocomplete(
           };
         });
       });
+      // Adding/removing sub-dir panels changes the popup's total width, which
+      // can push it off-screen. Recompute placement after state settles.
+      requestAnimationFrame(() => {
+        repositionPopup();
+      });
     });
-  }, [fetchDirEntries, termRef]);
+  }, [fetchDirEntries, repositionPopup, termRef]);
 
   /** Expand a directory at the given panel level → fetch contents and push new panel.
    *  Does NOT change focus level — use moveFocus param to override. */
@@ -463,31 +719,15 @@ export function useTerminalAutocomplete(
   // Ref to fetchSuggestions (avoids circular dep — defined after fetchSuggestions)
   const fetchSuggestionsRef = useRef<() => void>(() => {});
 
-  const repositionPopup = useCallback(() => {
-    const term = termRef.current;
-    if (!term) return;
-
-    setState((prev) => {
-      if (!prev.popupVisible || prev.suggestions.length === 0) return prev;
-      const { position, cursorLineTop, cursorLineBottom, expandUpward } = calculatePopupPosition(term, prev.suggestions.length);
-
-      // Force a re-render even when the relative cursor cell hasn't changed.
-      // The terminal container may have moved in the viewport after a fit/resize.
-      return {
-        ...prev,
-        popupPosition: position,
-        popupCursorLineTop: cursorLineTop,
-        popupCursorLineBottom: cursorLineBottom,
-        expandUpward,
-      };
-    });
-  }, [termRef]);
-
   /**
    * Render the full path for a sub-dir entry into the line WITHOUT finalizing
    * (no clearState). Used for live-preview while navigating sub-dir panels (#1005).
    */
   const renderSubDirPath = useCallback((level: number, entry: SubDirEntry) => {
+    if (!shouldWriteAutocompleteLivePreview(
+      settingsRef.current.livePreview,
+      isNetworkDeviceRef.current,
+    )) return;
     const s = stateRef.current;
     const term = termRef.current;
     if (!term) return;
@@ -496,8 +736,13 @@ export function useTerminalAutocomplete(
     const { prompt } = getAlignedPrompt(
       term, typedInputBufferRef.current, typedBufferReliableRef.current,
     );
-    if (!prompt.isAtPrompt) return;
-    const parsed = parseCommandLine(prompt.userInput);
+    const line = resolveAutocompleteQueryInput(
+      prompt,
+      typedInputBufferRef.current,
+      typedBufferReliableRef.current,
+    );
+    if (line === null) return;
+    const parsed = parseCommandLine(line);
     const cmdPrefix = parsed.tokens.slice(0, parsed.wordIndex).join(" ")
       + (parsed.wordIndex > 0 ? " " : "");
     const currentToken = parsed.currentWord;
@@ -508,8 +753,12 @@ export function useTerminalAutocomplete(
     const entryName = quotePrefix || !/[\\$'"|!<>;#~` ]/.test(entry.name)
       ? entry.name : shellEscape(entry.name);
     const newCommand = cmdPrefix + `${quotePrefix}${panel.dirPath}${entryName}${suffix}${quoteSuffix}`;
-    const seq = computeLivePreviewWrite({
-      currentLine: prompt.userInput, candidate: newCommand, os: hostOsRef.current,
+    const seq = computeAutocompleteAcceptWrite({
+      prompt,
+      typedBuffer: typedInputBufferRef.current,
+      typedBufferReliable: typedBufferReliableRef.current,
+      candidate: newCommand,
+      os: hostOsRef.current,
     });
     if (seq) writeToTerminal(seq);
     typedInputBufferRef.current = newCommand;
@@ -529,15 +778,21 @@ export function useTerminalAutocomplete(
     const panel = s.subDirPanels[level];
     if (!panel) return;
 
-    // Get current prompt to know what command prefix to keep (e.g., "cd ").
     // getAlignedPrompt handles robbyrussell-style themes by trimming the
     // cwd marker out of userInput when the typed buffer is aligned (#806).
+    // Mutation baseline still prefers the reliable typed buffer when echo lags
+    // (#2830), matching suggestion matching / live-preview.
     const { prompt } = getAlignedPrompt(term, typedInputBufferRef.current, typedBufferReliableRef.current);
-    if (!prompt.isAtPrompt) return;
+    const line = resolveAutocompleteQueryInput(
+      prompt,
+      typedInputBufferRef.current,
+      typedBufferReliableRef.current,
+    );
+    if (line === null) return;
 
     // Find the command part (everything before the path argument)
     // e.g., userInput = "cd /usr/" → command prefix = "cd ", we replace the whole path
-    const parsedPrompt = parseCommandLine(prompt.userInput);
+    const parsedPrompt = parseCommandLine(line);
     const cmdPrefix = parsedPrompt.tokens
       .slice(0, parsedPrompt.wordIndex)
       .join(" ") + (parsedPrompt.wordIndex > 0 ? " " : "");
@@ -552,14 +807,16 @@ export function useTerminalAutocomplete(
       : shellEscape(entry.name);
     const fullPath = panel.dirPath + entryName + suffix;
     const replacementPath = `${quotePrefix}${fullPath}${quoteSuffix}`;
-
-    // Clear current input and write: cmdPrefix + fullPath
-    const isWindows = hostOsRef.current === "windows";
-    const clearSeq = isWindows
-      ? "\b".repeat(prompt.userInput.length)
-      : "\x15";
     const newCommand = cmdPrefix + replacementPath;
-    writeToTerminal(clearSeq + newCommand);
+    const payload = computeAutocompleteAcceptWrite({
+      prompt,
+      typedBuffer: typedInputBufferRef.current,
+      typedBufferReliable: typedBufferReliableRef.current,
+      candidate: newCommand,
+      os: hostOsRef.current,
+    });
+    if (payload === null) return;
+    if (payload) writeToTerminal(payload);
     // Sub-dir selection rewrote the whole command line; re-align the
     // keystroke buffer so the next Enter records the executed command
     // instead of whatever partial input we had before (P2 from #814).
@@ -582,6 +839,19 @@ export function useTerminalAutocomplete(
       return;
     }
 
+    // Suppress autocomplete for the entire alternate screen buffer (codex CLI,
+    // vim, htop, less, …). Full-screen apps own their own input UI there;
+    // Netcatty's popup/ghost text would clash — e.g. codex's "/" slash-command
+    // menu gets covered because the composer line also matches the shell-prompt
+    // heuristic. This is intentionally unconditional: multiplexers (tmux/screen)
+    // also keep the outer xterm on the alternate buffer for the whole session,
+    // so Netcatty autocomplete is off while attached — same simple tradeoff as
+    // other terminal hosts, rather than chasing TUI-vs-shell heuristics. #2530
+    if (isTerminalAlternateScreenActive(term)) {
+      clearState();
+      return;
+    }
+
     // Nothing will be rendered when both the popup and ghost text are off, so
     // don't run the (potentially expensive) completion query just to throw the
     // result away. Clear any stale state and bail before touching history,
@@ -591,13 +861,71 @@ export function useTerminalAutocomplete(
       return;
     }
 
+    const { prompt, allowExternalProviders = true } = getAlignedPrompt(
+      term,
+      typedInputBufferRef.current,
+      typedBufferReliableRef.current,
+    );
+    lastPromptRef.current = prompt;
+
+    // Explicit password / auth-challenge prompts (and host-latched sensitive
+    // input) stay fail-closed even when echo has already validated the line.
+    if (
+      shouldBlockAutocompleteForSensitivePrompt({
+        sensitiveInputActive: sensitiveInputActiveRef?.current === true,
+        promptText: prompt.promptText,
+      })
+    ) {
+      clearState();
+      return;
+    }
+
+    // Pre-echo keystroke buffer can look identical to an echo-disabled
+    // password prompt (`read -s -p '$ '`). Do not render or accept
+    // built-in history/snippet suggestions until the shell echoes input.
+    // Incoming PTY echo does not re-schedule fetches, so keep polling this
+    // debounce cycle until the live line validates — or until max wait
+    // (silent prompts never echo). clearState cancels timers and echo-wait
+    // refs; re-arm the wait afterward when still within the window.
+    // Partial echo still reaches resolveAutocompleteQueryInput below (#2830).
+    if (allowExternalProviders === false) {
+      const typed = typedInputBufferRef.current;
+      const startedAt =
+        echoValidationTypedRef.current === typed &&
+        echoValidationStartedAtRef.current != null
+          ? echoValidationStartedAtRef.current
+          : Date.now();
+      clearState();
+      const withinWait =
+        typed.length > 0 &&
+        !disposedRef.current &&
+        Date.now() - startedAt < ECHO_VALIDATION_MAX_WAIT_MS;
+      if (withinWait) {
+        echoValidationTypedRef.current = typed;
+        echoValidationStartedAtRef.current = startedAt;
+        debounceTimerRef.current = setTimeout(() => {
+          debounceTimerRef.current = null;
+          void fetchSuggestionsRef.current();
+        }, settingsRef.current.debounceMs);
+      }
+      return;
+    }
+
+    echoValidationTypedRef.current = null;
+    echoValidationStartedAtRef.current = null;
+
     // Capture version at start — if it changes during async work, discard results
     const version = ++fetchVersionRef.current;
 
-    const { prompt } = getAlignedPrompt(term, typedInputBufferRef.current, typedBufferReliableRef.current);
-    lastPromptRef.current = prompt;
-
-    if (!prompt.isAtPrompt || prompt.userInput.length < settingsRef.current.minChars) {
+    // Prefer the reliable keystroke buffer when remote echo lags (#2830).
+    // getAlignedPrompt intentionally stays stricter for Enter recording.
+    // `prompt` was already resolved above for the echo-validation gate.
+    const input = resolveAutocompleteQueryInput(
+      prompt,
+      typedInputBufferRef.current,
+      typedBufferReliableRef.current,
+    );
+    if (!prompt.isAtPrompt || input === null || input.length < settingsRef.current.minChars) {
       clearState();
       return;
     }
@@ -605,16 +933,21 @@ export function useTerminalAutocomplete(
     // Suppress autocomplete when cursor is not at end of input —
     // inserting text mid-line would corrupt the command (e.g., "git st|tus" → "git statustus")
     const buffer = term.buffer.active;
-    const lineAfterCursor = buffer.getLine(buffer.cursorY + buffer.baseY)
-      ?.translateToString(false).substring(buffer.cursorX).trimEnd();
+    const cursorLine = buffer.getLine(buffer.cursorY + buffer.baseY);
+    const lineAfterCursor = cursorLine
+      ? sliceStringByCellColumns(
+        cursorLine.translateToString(false),
+        Math.max(0, buffer.cursorX),
+        undefined,
+        term,
+      ).trimEnd()
+      : "";
     if (lineAfterCursor && lineAfterCursor.length > 0) {
       clearState();
       return;
     }
-
-    const input = prompt.userInput;
     const parsedInput = parseCommandLine(input);
-    const cwd = resolveAutocompleteCwd(
+    const cwdResolution = resolveAutocompleteCwdWithSource(
       prompt.promptText,
       parsedInput.currentWord,
       getCwdRef.current?.(),
@@ -622,91 +955,256 @@ export function useTerminalAutocomplete(
     );
 
     // Single query for both ghost text and popup
-    const completions = await getCompletions(input, {
-      hostId: hostIdRef.current,
-      os: hostOsRef.current,
-      maxResults: settingsRef.current.maxSuggestions,
-      sessionId: sessionIdRef.current,
-      protocol: protocolRef.current,
-      cwd,
-      snippets: snippetsRef.current,
-    });
+    completionAbortRef.current?.abort();
+    const completionController = new AbortController();
+    completionAbortRef.current = completionController;
+    // Retain the first (budgeted) result so a late path listing for cache-bypassed
+    // relative SSH cwd can merge path suggestions without another IPC round-trip.
+    let settledCompletions: CompletionSuggestion[] | null = null;
+    let pendingLatePathSuggestions: CompletionSuggestion[] | null = null;
 
-    if (disposedRef.current || version !== fetchVersionRef.current) return;
-
-    // Discard stale results: if the user kept typing while getCompletions was running,
-    // the current prompt input will have changed. Re-detect and compare.
-    const { prompt: currentPrompt } = getAlignedPrompt(term, typedInputBufferRef.current, typedBufferReliableRef.current);
-    if (!currentPrompt.isAtPrompt || currentPrompt.userInput !== input) {
-      return; // Input changed — these completions are stale
-    }
-
-    // Ghost text: keep the active prediction stable while the user's
-    // input still fits within it. Only swap to a fresh prediction once
-    // the current one no longer matches the typed prefix.
-    if (settingsRef.current.showGhostText) {
-      const ghost = ghostAddonRef.current;
-      const activeSuggestion = ghost?.isActive() ? ghost.getSuggestion() : null;
-      // Snippets are popup-only — never used as inline ghost text.
-      const nextSuggestion = completions.find((c) => c.source !== "snippet")?.text ?? null;
-      const ghostDecision = decideGhostSuggestion(activeSuggestion, input, nextSuggestion);
-      if (ghostDecision.type === "show") {
-        ghost?.show(ghostDecision.suggestion, input);
-      } else if (ghostDecision.type === "hide") {
-        ghost?.hide();
+    const mergeLatePathSuggestions = (
+      base: CompletionSuggestion[],
+      latePathSuggestions: CompletionSuggestion[],
+    ): CompletionSuggestion[] => {
+      const withoutPaths = base.filter((entry) => entry.source !== "path");
+      const indexByText = new Map<string, number>();
+      const merged = [...withoutPaths];
+      for (let index = 0; index < withoutPaths.length; index++) {
+        indexByText.set(withoutPaths[index].text, index);
       }
-    }
-
-    // Popup
-    if (settingsRef.current.showPopupMenu && completions.length > 0) {
-      // Live-preview baseline: the typed input these suggestions completed.
-      previewBaselineRef.current = input;
-      previewActiveRef.current = false;
-      const { position, cursorLineTop, cursorLineBottom, expandUpward } = calculatePopupPosition(term, completions.length);
-      startTransition(() => {
-        setState((prev) => {
-          if (version !== fetchVersionRef.current) return prev;
-
-          const nextState: AutocompleteState = {
-            suggestions: completions,
-            selectedIndex: -1,
-            popupVisible: true,
-            popupPosition: position,
-            popupCursorLineTop: cursorLineTop,
-            popupCursorLineBottom: cursorLineBottom,
-            expandUpward,
-            subDirPanels: [],
-            subDirFocusLevel: -1,
-          };
-
-          if (
-            prev.popupVisible &&
-            prev.selectedIndex === nextState.selectedIndex &&
-            prev.expandUpward === nextState.expandUpward &&
-            prev.popupPosition.x === nextState.popupPosition.x &&
-            prev.popupPosition.y === nextState.popupPosition.y &&
-            prev.popupCursorLineTop === nextState.popupCursorLineTop &&
-            prev.popupCursorLineBottom === nextState.popupCursorLineBottom &&
-            prev.subDirFocusLevel === -1 &&
-            prev.subDirPanels.length === 0 &&
-            areSuggestionsEqual(prev.suggestions, nextState.suggestions)
-          ) {
-            return prev;
-          }
-
-          return nextState;
-        });
-      });
-    } else {
-      startTransition(() => {
-        setState((prev) =>
-          prev.popupVisible || prev.suggestions.length > 0
-            ? { ...EMPTY_STATE }
-            : prev,
+      for (const suggestion of latePathSuggestions) {
+        const existingIndex = indexByText.get(suggestion.text);
+        if (existingIndex !== undefined) {
+          // Prefer late path over duplicate history/plugin text so directory
+          // candidates keep fileType for cascading path panels (matches
+          // in-budget score-sort + dedup where path at 750 beats recent history).
+          merged[existingIndex] = suggestion;
+          continue;
+        }
+        indexByText.set(suggestion.text, merged.length);
+        merged.push(suggestion);
+      }
+      merged.sort((left, right) => right.score - left.score);
+      // Cap to the configured popup limit. provideTerminalCompletions already
+      // slices built-in+plugin results to request.maximum; late path merges
+      // bypass that path and must honor the same user setting (including when
+      // it is below getCompletions' internal path-active floor of 24).
+      const limit = Math.max(1, settingsRef.current.maxSuggestions);
+      const limited = merged.slice(0, limit);
+      if (!settingsRef.current.allowLineReplacement) {
+        return limited.filter((completion) =>
+          completion.source !== "snippet" && completion.text.startsWith(input),
         );
+      }
+      return limited;
+    };
+
+    const applyCompletions = (
+      completions: CompletionSuggestion[],
+      currentPrompt: ReturnType<typeof getAlignedPrompt>["prompt"],
+      options?: { preserveSelection?: boolean },
+    ) => {
+      // Echo-lag-aware logical caret: resolved query `input` can be ahead of
+      // the live xterm cursor / currentPrompt.userInput. When a late path
+      // refresh lands while live-preview has already rewritten the shell line,
+      // anchor from that resolved command line instead — keep `input` only for
+      // query-staleness checks above.
+      const caretUserInput =
+        options?.preserveSelection && previewActiveRef.current
+          ? (resolveAutocompleteQueryInput(
+            currentPrompt,
+            typedInputBufferRef.current,
+            typedBufferReliableRef.current,
+          ) ?? typedInputBufferRef.current)
+          : input;
+      const cursorCell = resolveAutocompleteCursorCell(term, {
+        promptText: currentPrompt.promptText,
+        userInput: caretUserInput,
       });
+
+      if (settingsRef.current.showGhostText) {
+        const ghost = ghostAddonRef.current;
+        const activeSuggestion = ghost?.isActive() ? ghost.getSuggestion() : null;
+        // Snippets are popup-only — never used as inline ghost text.
+        const nextSuggestion = completions.find((c) => c.source !== "snippet")?.text ?? null;
+        const ghostDecision = decideGhostSuggestion(
+          activeSuggestion,
+          caretUserInput,
+          nextSuggestion,
+        );
+        if (ghostDecision.type === "show") {
+          // Pre-echo probe in GhostTextAddon handles lagging SSH echo.
+          ghost?.show(ghostDecision.suggestion, caretUserInput);
+        } else if (ghostDecision.type === "hide") {
+          ghost?.hide();
+        }
+      }
+
+      // Popup
+      if (settingsRef.current.showPopupMenu && completions.length > 0) {
+        // Live-preview baseline: the typed input these suggestions completed.
+        previewBaselineRef.current = input;
+        // Ordinary new queries clear preview; same-query late-path refreshes
+        // keep it so Escape can still restore the typed baseline after a
+        // highlight that remains written into the shell line.
+        if (!options?.preserveSelection) {
+          previewActiveRef.current = false;
+        }
+        const anchor = resolveAutocompletePopupAnchorInViewport(
+          term,
+          containerRef.current,
+          completions.length,
+          cursorCell.column,
+          cursorCell.row,
+        );
+        startTransition(() => {
+          setState((prev) => {
+            if (version !== fetchVersionRef.current) return prev;
+
+            // Only late-path refreshes for *this* query preserve highlight.
+            // Ordinary keystroke-driven queries must reset selection; otherwise
+            // preview-off Enter can accept a stale row that still matches.
+            const selectedIndex = options?.preserveSelection && prev.popupVisible
+              ? resolvePreservedSuggestionIndex(
+                prev.suggestions,
+                prev.selectedIndex,
+                completions,
+              )
+              : -1;
+
+            const nextState: AutocompleteState = {
+              suggestions: completions,
+              selectedIndex,
+              popupVisible: true,
+              popupAnchorViewport: {
+                left: anchor.anchorLeft,
+                top: anchor.anchorTop,
+                bottom: anchor.anchorBottom,
+              },
+              expandUpward: anchor.expandUpward,
+              subDirPanels: [],
+              subDirFocusLevel: -1,
+            };
+
+            if (
+              prev.popupVisible &&
+              prev.selectedIndex === nextState.selectedIndex &&
+              prev.expandUpward === nextState.expandUpward &&
+              prev.popupAnchorViewport.left === nextState.popupAnchorViewport.left &&
+              prev.popupAnchorViewport.top === nextState.popupAnchorViewport.top &&
+              prev.popupAnchorViewport.bottom === nextState.popupAnchorViewport.bottom &&
+              prev.subDirFocusLevel === -1 &&
+              prev.subDirPanels.length === 0 &&
+              areSuggestionsEqual(prev.suggestions, nextState.suggestions)
+            ) {
+              return prev;
+            }
+
+            return nextState;
+          });
+        });
+      } else {
+        startTransition(() => {
+          setState((prev) =>
+            prev.popupVisible || prev.suggestions.length > 0
+              ? { ...EMPTY_STATE }
+              : prev,
+          );
+        });
+      }
+    };
+
+    const isCurrentQueryStillActive = (): ReturnType<typeof getAlignedPrompt>["prompt"] | null => {
+      if (disposedRef.current || version !== fetchVersionRef.current) return null;
+      if (isTerminalAlternateScreenActive(term)) {
+        clearState();
+        return null;
+      }
+      // Discard stale results: if the user kept typing while getCompletions was running,
+      // the current prompt input will have changed. Re-detect and compare. Use the same
+      // echo-lag-aware resolver as the query so catching-up remote echo alone does not
+      // drop local matches (#2830).
+      const { prompt: currentPrompt } = getAlignedPrompt(
+        term,
+        typedInputBufferRef.current,
+        typedBufferReliableRef.current,
+      );
+      const currentInput = resolveAutocompleteQueryInput(
+        currentPrompt,
+        typedInputBufferRef.current,
+        typedBufferReliableRef.current,
+      );
+      if (
+        !currentPrompt.isAtPrompt
+        || !isSameAutocompleteQuery({
+          queryInput: input,
+          currentInput,
+          previewActive: previewActiveRef.current,
+          previewBaseline: previewBaselineRef.current,
+        })
+      ) {
+        return null;
+      }
+      return currentPrompt;
+    };
+
+    let completions: CompletionSuggestion[];
+    try {
+      completions = await provideCompletionsRef.current(input, {
+        hostId: hostIdRef.current,
+        hostGroup: hostGroupRef.current,
+        os: hostOsRef.current,
+        maxResults: settingsRef.current.maxSuggestions,
+        historyScope: settingsRef.current.historyScope,
+        sessionId: sessionIdRef.current,
+        protocol: protocolRef.current,
+        cwd: cwdResolution.cwd,
+        cwdSource: cwdResolution.source,
+        snippets: snippetsRef.current,
+        promptText: prompt.promptText,
+        allowExternalProviders,
+        signal: completionController.signal,
+        onLatePathSuggestions: (latePathSuggestions) => {
+          if (completionController.signal.aborted) return;
+          const currentPrompt = isCurrentQueryStillActive();
+          if (!currentPrompt) return;
+          // Plugin merge may still be in flight after built-in getCompletions
+          // returns; hold late paths until the first settled result arrives.
+          if (settledCompletions === null) {
+            pendingLatePathSuggestions = latePathSuggestions;
+            return;
+          }
+          const next = mergeLatePathSuggestions(settledCompletions, latePathSuggestions);
+          settledCompletions = next;
+          applyCompletions(next, currentPrompt, { preserveSelection: true });
+        },
+      });
+    } finally {
+      if (completionAbortRef.current === completionController) completionAbortRef.current = null;
     }
-  }, [termRef, clearState]);
+    if (completionController.signal.aborted) return;
+    if (!settingsRef.current.allowLineReplacement) {
+      completions = completions.filter((completion) =>
+        completion.source !== "snippet" && completion.text.startsWith(input),
+      );
+    }
+
+    // Recheck after the async lookup: the terminal may have entered the alternate
+    // screen while completions were pending (e.g. launching codex/vim). Drop any
+    // result that would paint popup/ghost over a TUI. Same unconditional policy. #2530
+    const currentPrompt = isCurrentQueryStillActive();
+    if (!currentPrompt) {
+      return;
+    }
+
+    if (pendingLatePathSuggestions) {
+      completions = mergeLatePathSuggestions(completions, pendingLatePathSuggestions);
+      pendingLatePathSuggestions = null;
+    }
+    settledCompletions = completions;
+    applyCompletions(completions, currentPrompt);
+  }, [termRef, clearState, containerRef, sensitiveInputActiveRef]);
 
   // Keep ref in sync so handleSubDirSelect can call it
   fetchSuggestionsRef.current = fetchSuggestions;
@@ -723,6 +1221,7 @@ export function useTerminalAutocomplete(
         lastAcceptedCommandRef,
         typedInputBufferRef,
         typedBufferReliableRef,
+        previewBaselineRef,
         previewActiveRef,
         termRef,
         hostIdRef,
@@ -730,10 +1229,11 @@ export function useTerminalAutocomplete(
         ghostAddonRef,
         debounceTimerRef,
         clearState,
+        syncPopupToInput,
         fetchSuggestions,
       });
     },
-    [fetchSuggestions, termRef, clearState],
+    [fetchSuggestions, termRef, clearState, syncPopupToInput],
   );
 
   /**
@@ -749,6 +1249,7 @@ export function useTerminalAutocomplete(
       typedBufferReliableRef,
       previewActiveRef,
       lastAcceptedCommandRef,
+      escMetaPrefixUntilRef,
       setState,
       expandSubDir,
       writeToTerminal,
@@ -757,6 +1258,7 @@ export function useTerminalAutocomplete(
       handleSubDirSelect,
       fetchSubDirForIndex,
       renderPreviewSelection,
+      acceptPreviewlessSelection,
       acceptSnippet,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- handler uses refs and callbacks initialized below.
@@ -768,6 +1270,10 @@ export function useTerminalAutocomplete(
    * live-preview, #1005). `index < 0` restores the user's typed baseline.
    */
   const renderPreviewSelection = useCallback((index: number) => {
+    if (!shouldWriteAutocompleteLivePreview(
+      settingsRef.current.livePreview,
+      isNetworkDeviceRef.current,
+    )) return;
     const s = stateRef.current;
     const term = termRef.current;
     if (!term) return;
@@ -782,29 +1288,43 @@ export function useTerminalAutocomplete(
       typedInputBufferRef.current,
       typedBufferReliableRef.current,
     );
-    if (!prompt.isAtPrompt) return;
-    const seq = computeLivePreviewWrite({
-      currentLine: prompt.userInput,
+    const seq = computeAutocompleteAcceptWrite({
+      prompt,
+      typedBuffer: typedInputBufferRef.current,
+      typedBufferReliable: typedBufferReliableRef.current,
       candidate,
       os: hostOsRef.current,
     });
+    if (seq === null) return;
     if (seq) writeToTerminal(seq);
     typedInputBufferRef.current = candidate;
     typedBufferReliableRef.current = true;
     const isPreview = index >= 0 && candidate !== baseline;
     previewActiveRef.current = isPreview;
     lastAcceptedCommandRef.current = isPreview ? candidate : null;
-  }, [termRef, writeToTerminal]);
+    // Live-preview can move/wrap the cursor. Recompute the anchor after xterm
+    // has processed the write so the popup doesn't drift or flip into a stale
+    // position (fixes #1710).
+    requestAnimationFrame(() => {
+      repositionPopup();
+    });
+  }, [termRef, writeToTerminal, repositionPopup]);
 
   /** Accept a snippet: clear the user's typed input, then run it via the
    *  host-canonical send path (onAcceptSnippet). */
-  const acceptSnippet = useCallback((snippet: Snippet) => {
+  const acceptSnippet = useCallback((snippet: Snippet): boolean => {
     const term = termRef.current;
     if (term) {
       const { prompt } = getAlignedPrompt(term, typedInputBufferRef.current, typedBufferReliableRef.current);
-      if (prompt.isAtPrompt && prompt.userInput.length > 0) {
-        const clearSequence = hostOsRef.current === "windows"
-          ? "\b".repeat(prompt.userInput.length)
+      const line = resolveAutocompleteQueryInput(
+        prompt,
+        typedInputBufferRef.current,
+        typedBufferReliableRef.current,
+      );
+      if (line !== null && line.length > 0) {
+        if (!settingsRef.current.allowLineReplacement) return false;
+        const clearSequence = isWindowsShellLineInput(hostOsRef.current, prompt.promptText)
+          ? "\b".repeat(line.length)
           : "\x15"; // Ctrl+U (readline kill-line)
         writeToTerminal(clearSequence);
       }
@@ -813,6 +1333,7 @@ export function useTerminalAutocomplete(
     typedBufferReliableRef.current = true;
     onAcceptSnippetRef.current?.(snippet);
     clearState();
+    return true;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- clearState is stable
   }, [termRef, writeToTerminal]);
 
@@ -823,29 +1344,22 @@ export function useTerminalAutocomplete(
   const insertSuggestion = useCallback(
     (suggestion: CompletionSuggestion, execute: boolean) => {
       const term = termRef.current;
-      if (!term) return;
+      if (!term) return false;
 
       // Always use real-time prompt detection — lastPromptRef may be stale
       // if the user typed more characters after suggestions were fetched.
+      // Accept writes must use the echo-lag-aware line baseline (#2830).
       const { prompt } = getAlignedPrompt(term, typedInputBufferRef.current, typedBufferReliableRef.current);
-      if (!prompt.isAtPrompt) return;
-
-      // If suggestion starts with the current input, insert only the remaining part.
-      // Otherwise (fuzzy match), clear the line first and write the full suggestion.
-      let payload: string;
-      if (suggestion.text.startsWith(prompt.userInput)) {
-        const textToInsert = suggestion.text.substring(prompt.userInput.length);
-        payload = execute ? textToInsert + "\r" : textToInsert;
-      } else {
-        // Fuzzy match: clear current input, then write full command.
-        // Ctrl+U works on POSIX shells (bash/zsh/fish).
-        // On Windows (cmd.exe/PowerShell), use backspaces to erase instead.
-        const isWindows = hostOsRef.current === "windows";
-        const clearSequence = isWindows
-          ? "\b".repeat(prompt.userInput.length) // Backspace to erase
-          : "\x15"; // Ctrl+U (readline kill-line)
-        payload = clearSequence + suggestion.text + (execute ? "\r" : "");
-      }
+      const payload = computeAutocompleteAcceptWrite({
+        prompt,
+        typedBuffer: typedInputBufferRef.current,
+        typedBufferReliable: typedBufferReliableRef.current,
+        candidate: suggestion.text,
+        os: hostOsRef.current,
+        execute,
+        allowLineReplacement: settingsRef.current.allowLineReplacement,
+      });
+      if (payload === null) return false;
 
       if (payload) {
         writeToTerminal(payload);
@@ -878,10 +1392,20 @@ export function useTerminalAutocomplete(
       }
 
       clearState();
+      return true;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- clearState is stable
     [termRef, writeToTerminal],
   );
+
+  const acceptPreviewlessSelection = useCallback((index: number): boolean => {
+    const suggestion = stateRef.current.suggestions[index];
+    if (!suggestion) return false;
+    if (suggestion.source === "snippet" && suggestion.snippet) {
+      return acceptSnippet(suggestion.snippet);
+    }
+    return insertSuggestion(suggestion, true);
+  }, [acceptSnippet, insertSuggestion]);
 
   /**
    * Select a suggestion from the popup (Tab / mouse click — insert only, no execute).
@@ -903,6 +1427,8 @@ export function useTerminalAutocomplete(
 
   const dispose = useCallback(() => {
     disposedRef.current = true;
+    completionAbortRef.current?.abort();
+    completionAbortRef.current = null;
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
     }
@@ -910,7 +1436,22 @@ export function useTerminalAutocomplete(
     ghostAddonRef.current = null;
   }, []);
 
+  const showSudoHint = useCallback((text: string): boolean => {
+    const addon = ghostAddonRef.current;
+    if (!addon) return false;
+    addon.showHint(text);
+    return addon.isHintActive();
+  }, []);
+  const hideSudoHint = useCallback(() => {
+    ghostAddonRef.current?.hideHint();
+  }, []);
+
   useEffect(() => {
+    // Fast Refresh preserves refs across effect teardown/re-run. dispose() sets
+    // disposedRef=true on cleanup; without resetting here, every HMR of this
+    // module (or TerminalAutocomplete) permanently kills fetchSuggestions while
+    // handleInput keeps scheduling — matches "fetch-scheduled but no popup".
+    disposedRef.current = false;
     return () => { dispose(); };
   }, [dispose]);
 
@@ -923,5 +1464,7 @@ export function useTerminalAutocomplete(
     repositionPopup,
     closePopup,
     dispose,
+    showSudoHint,
+    hideSudoHint,
   };
 }

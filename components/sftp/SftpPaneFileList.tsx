@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, ChevronDown, ClipboardCopy, Copy, Download, Edit2, ExternalLink, FilePlus, Folder, FolderPlus, Loader2, Pencil, RefreshCw, Shield, Trash2, Unplug, Upload } from "lucide-react";
+import { AppWindow, Archive, ArrowDown, ArrowRight, ArrowUp, ChevronDown, ClipboardCopy, Copy, Download, Edit2, ExternalLink, FilePlus, Folder, FolderPlus, Loader2, Pencil, RefreshCw, Shield, Trash2, Unplug, Upload } from "lucide-react";
 import { Button } from "../ui/button";
 import {
   ContextMenu,
@@ -14,9 +14,14 @@ import type { SftpFileEntry } from "../../types";
 import type { SftpPane } from "../../application/state/sftp/types";
 import type { SftpTransferSource } from "./SftpContext";
 import { sftpListOrderStore } from "./hooks/useSftpListOrderStore";
-import { buildSftpColumnTemplate, isNavigableDirectory, type ColumnWidths, type SortField, type SortOrder } from "./utils";
+import type { UseSftpPaneSortingResult } from "../../application/state/sftp/useSftpPaneSorting";
+import { buildSftpColumnTemplate, isNavigableDirectory, isSftpColumnMenuKey } from "./utils";
 import { isKnownBinaryFile } from "../../lib/sftpFileUtils";
+import { isExtractableArchive } from "../../domain/sftpArchive";
 import { SftpFileRow } from "./SftpFileRow";
+import type { SftpListDensity } from "../../domain/sftpListDensity";
+import { SftpColumnMenuItems } from "./SftpColumnMenuItems";
+import { getSftpVirtualListScrollTop } from "../../domain/sftpVirtualList";
 import {
   getSftpListUploadFilesTargetPath,
   getSftpUploadFilesLabelKey,
@@ -30,11 +35,7 @@ interface SftpPaneFileListProps {
   pane: SftpPane;
   side: "left" | "right";
   isPaneFocused: boolean;
-  columnWidths: ColumnWidths;
-  sortField: SortField;
-  sortOrder: SortOrder;
-  handleSort: (field: SortField) => void;
-  handleResizeStart: (field: keyof ColumnWidths, e: React.MouseEvent) => void;
+  sorting: UseSftpPaneSortingResult;
   fileListRef: React.RefObject<HTMLDivElement>;
   handleFileListScroll: (e: React.UIEvent<HTMLDivElement>) => void;
   shouldVirtualize: boolean;
@@ -61,10 +62,12 @@ interface SftpPaneFileListProps {
   handleEntryDrop: (entry: SftpFileEntry, e: React.DragEvent) => void;
   onCopyToOtherPane: (files: SftpTransferSource[]) => void;
   onMoveEntriesToPath: (sourcePaths: string[], targetPath: string) => Promise<void>;
+  onOpenFileWithSystemDefault?: (entry: SftpFileEntry) => void;
   onOpenFileWith?: (entry: SftpFileEntry) => void;
   onEditFile?: (entry: SftpFileEntry) => void;
   onDownloadFile?: (entry: SftpFileEntry) => void;
   onDownloadFiles?: (entries: SftpFileEntry[]) => void;
+  onExtractArchive?: (entry: SftpFileEntry) => void;
   onEditPermissions?: (entry: SftpFileEntry) => void;
   onUploadExternalFileList?: (fileList: FileList, targetPath?: string) => Promise<void> | void;
   onUploadExternalFolder?: (targetPath?: string) => Promise<void> | void;
@@ -75,6 +78,7 @@ interface SftpPaneFileListProps {
   openDeleteConfirm: (targets: string[]) => void;
   rowHeight: number;
   visibleRows: { entry: SftpFileEntry; index: number; top: number }[];
+  listDensity?: SftpListDensity;
 }
 
 const SftpErrorWithLogs: React.FC<{
@@ -122,11 +126,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
   pane,
   side,
   isPaneFocused,
-  columnWidths,
-  sortField,
-  sortOrder,
-  handleSort,
-  handleResizeStart,
+  sorting,
   fileListRef,
   handleFileListScroll,
   shouldVirtualize,
@@ -152,10 +152,12 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
   handleEntryDrop,
   onCopyToOtherPane,
   onMoveEntriesToPath,
+  onOpenFileWithSystemDefault,
   onOpenFileWith,
   onEditFile,
   onDownloadFile,
   onDownloadFiles,
+  onExtractArchive,
   onEditPermissions,
   onUploadExternalFileList,
   onUploadExternalFolder,
@@ -164,7 +166,19 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
   openDeleteConfirm,
   rowHeight,
   visibleRows,
+  listDensity = "comfortable",
 }) => {
+  const {
+    columnWidths,
+    visibleColumns,
+    directoriesFirst,
+    sortField,
+    sortOrder,
+    handleSort,
+    handleResizeStart,
+    toggleColumnVisibility,
+    toggleDirectoriesFirst,
+  } = sorting;
   const filesByName = useMemo(() => {
     const map = new Map<string, SftpFileEntry>();
     sortedDisplayFiles.forEach((entry) => {
@@ -192,8 +206,21 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
 
     const row = Array.from(container.querySelectorAll<HTMLElement>('[data-sftp-row="true"]'))
       .find((element) => element.dataset.entryName === selectedName);
-    row?.scrollIntoView({ block: "nearest" });
-  }, [fileListRef, pane.selectedFiles]);
+    if (row) {
+      row.scrollIntoView({ block: "nearest" });
+      return;
+    }
+
+    if (!shouldVirtualize || rowHeight <= 0) return;
+    const itemIndex = sortedDisplayFiles.findIndex((entry) => entry.name === selectedName);
+    if (itemIndex < 0) return;
+    container.scrollTop = getSftpVirtualListScrollTop({
+      itemIndex,
+      rowHeight,
+      currentScrollTop: container.scrollTop,
+      viewportHeight: container.clientHeight,
+    });
+  }, [fileListRef, pane.selectedFiles, rowHeight, shouldVirtualize, sortedDisplayFiles]);
 
   // Use refs for frequently-changing values in context-menu actions
   const selectedFilesRef = useRef(pane.selectedFiles);
@@ -256,6 +283,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
             showSelectionHighlight={isPaneFocused}
             isDragOver={dragOverEntry === entry.name}
             columnWidths={columnWidths}
+            visibleColumns={visibleColumns}
             onSelect={handleRowSelect}
             onOpen={handleRowOpen}
             onDragStart={handleFileDragStart}
@@ -263,6 +291,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
             onDragOver={handleEntryDragOver}
             onDragLeave={handleRowDragLeave}
             onDrop={handleEntryDrop}
+            density={listDensity}
           />
         </ContextMenuTrigger>
         {entry.name !== ".." && (
@@ -282,6 +311,12 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
             {isNavigableDirectory(entry) && (
               <ContextMenuItem onClick={() => onNavigateTo(joinPath(pane.connection.currentPath, entry.name))}>
                 <ArrowRight size={14} className="mr-2" /> {t("sftp.context.navigateTo")}
+              </ContextMenuItem>
+            )}
+            {!isNavigableDirectory(entry) && onOpenFileWithSystemDefault && (
+              <ContextMenuItem onClick={() => onOpenFileWithSystemDefault(entry)}>
+                <AppWindow size={14} className="mr-2" />{" "}
+                {t("sftp.context.openWithDefault")}
               </ContextMenuItem>
             )}
             {!isNavigableDirectory(entry) && onOpenFileWith && (
@@ -317,6 +352,12 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
               >
                 <Download size={14} className="mr-2" />{" "}
                 {t("sftp.context.download")}
+              </ContextMenuItem>
+            )}
+            {!isNavigableDirectory(entry) && onExtractArchive && isExtractableArchive(entry.name) && (
+              <ContextMenuItem onClick={() => onExtractArchive(entry)}>
+                <Archive size={14} className="mr-2" />{" "}
+                {t("sftp.context.extract")}
               </ContextMenuItem>
             )}
             <ContextMenuSeparator />
@@ -430,6 +471,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
     ),
     [
       columnWidths,
+      visibleColumns,
       filesByName,
       handleEntryDragOver,
       handleEntryDrop,
@@ -443,10 +485,12 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
       onMoveEntriesToPath,
       onDownloadFile,
       onDownloadFiles,
+      onExtractArchive,
       onDragEnd,
       onEditFile,
       onEditPermissions,
       onNavigateTo,
+      onOpenFileWithSystemDefault,
       onOpenFileWith,
       onRefresh,
       onUploadExternalFileList,
@@ -457,6 +501,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
       openRenameDialog,
       pane.connection,
       pane.selectedFiles,
+      listDensity,
       setShowNewFolderDialog,
       setShowNewFileDialog,
       t,
@@ -493,76 +538,126 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
   return (
     <>
       {/* File list header */}
-    <div
-      className="text-[11px] uppercase tracking-wide text-muted-foreground px-4 py-2 border-b border-border/40 bg-secondary/10 select-none"
-      style={{
-        display: "grid",
-        gridTemplateColumns: buildSftpColumnTemplate(columnWidths),
-      }}
-    >
-      <div
-        className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 overflow-hidden"
-        onClick={() => handleSort("name")}
-      >
-        <span className="truncate whitespace-nowrap">{t("sftp.columns.name")}</span>
-        {sortField === "name" && (
-          <span className="shrink-0 text-primary">
-            {sortOrder === "asc" ? "↑" : "↓"}
-          </span>
-        )}
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
         <div
-          className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
-          onMouseDown={(e) => handleResizeStart("name", e)}
+          className="text-[11px] uppercase tracking-wide text-muted-foreground px-4 py-2 border-b border-border/40 bg-secondary/10 select-none"
+          data-section="terminal-sftp-list-header"
+          tabIndex={0}
+          aria-label={t("sftp.columns.configure")}
+          onKeyDown={(e) => {
+            if (!isSftpColumnMenuKey(e.key, e.shiftKey)) return;
+            e.preventDefault();
+            const rect = e.currentTarget.getBoundingClientRect();
+            e.currentTarget.dispatchEvent(new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: rect.left + 16,
+              clientY: rect.top + rect.height / 2,
+            }));
+          }}
+          style={{
+            display: "grid",
+            gridTemplateColumns: buildSftpColumnTemplate(columnWidths, visibleColumns),
+          }}
+        >
+          <div
+            className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 overflow-hidden"
+            onClick={() => handleSort("name")}
+          >
+            <span className="truncate whitespace-nowrap">{t("sftp.columns.name")}</span>
+            {sortField === "name" && (
+              <span className="shrink-0 text-primary">
+                {sortOrder === "asc" ? "↑" : "↓"}
+              </span>
+            )}
+            <div
+              className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
+              onMouseDown={(e) => handleResizeStart("name", e)}
+            />
+          </div>
+          {visibleColumns.modified && (
+            <div
+              className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 overflow-hidden"
+              onClick={() => handleSort("modified")}
+            >
+              <span className="truncate whitespace-nowrap">{t("sftp.columns.modified")}</span>
+              {sortField === "modified" && (
+                <span className="shrink-0 text-primary">
+                  {sortOrder === "asc" ? "↑" : "↓"}
+                </span>
+              )}
+              <div
+                className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
+                onMouseDown={(e) => handleResizeStart("modified", e)}
+              />
+            </div>
+          )}
+          {visibleColumns.size && (
+            <div
+              className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 justify-end overflow-hidden"
+              onClick={() => handleSort("size")}
+            >
+              {sortField === "size" && (
+                <span className="shrink-0 text-primary">
+                  {sortOrder === "asc" ? "↑" : "↓"}
+                </span>
+              )}
+              <span className="truncate whitespace-nowrap">{t("sftp.columns.size")}</span>
+              <div
+                className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
+                onMouseDown={(e) => handleResizeStart("size", e)}
+              />
+            </div>
+          )}
+          {visibleColumns.type && (
+            <div
+              className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 justify-end overflow-hidden"
+              onClick={() => handleSort("type")}
+            >
+              {sortField === "type" && (
+                <span className="shrink-0 text-primary">
+                  {sortOrder === "asc" ? "↑" : "↓"}
+                </span>
+              )}
+              <span className="truncate whitespace-nowrap">{t("sftp.columns.kind")}</span>
+              <div
+                className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
+                onMouseDown={(e) => handleResizeStart("type", e)}
+              />
+            </div>
+          )}
+          {visibleColumns.owner && (
+            <div
+              className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground justify-end overflow-hidden"
+              onClick={() => handleSort("owner")}
+            >
+              {sortField === "owner" && (
+                <span className="shrink-0 text-primary">
+                  {sortOrder === "asc" ? "↑" : "↓"}
+                </span>
+              )}
+              <span className="truncate whitespace-nowrap">{t("sftp.columns.owner")}</span>
+            </div>
+          )}
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <SftpColumnMenuItems
+          visibleColumns={visibleColumns}
+          directoriesFirst={directoriesFirst}
+          toggleColumnVisibility={toggleColumnVisibility}
+          toggleDirectoriesFirst={toggleDirectoriesFirst}
         />
-      </div>
-      <div
-        className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 overflow-hidden"
-        onClick={() => handleSort("modified")}
-      >
-        <span className="truncate whitespace-nowrap">{t("sftp.columns.modified")}</span>
-        {sortField === "modified" && (
-          <span className="shrink-0 text-primary">
-            {sortOrder === "asc" ? "↑" : "↓"}
-          </span>
-        )}
-        <div
-          className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
-          onMouseDown={(e) => handleResizeStart("modified", e)}
-        />
-      </div>
-      <div
-        className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground relative pr-2 justify-end overflow-hidden"
-        onClick={() => handleSort("size")}
-      >
-        {sortField === "size" && (
-          <span className="shrink-0 text-primary">
-            {sortOrder === "asc" ? "↑" : "↓"}
-          </span>
-        )}
-        <span className="truncate whitespace-nowrap">{t("sftp.columns.size")}</span>
-        <div
-          className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 transition-colors"
-          onMouseDown={(e) => handleResizeStart("size", e)}
-        />
-      </div>
-      <div
-        className="flex min-w-0 items-center gap-1 cursor-pointer hover:text-foreground justify-end overflow-hidden"
-        onClick={() => handleSort("type")}
-      >
-        {sortField === "type" && (
-          <span className="shrink-0 text-primary">
-            {sortOrder === "asc" ? "↑" : "↓"}
-          </span>
-        )}
-        <span className="truncate whitespace-nowrap">{t("sftp.columns.kind")}</span>
-      </div>
-    </div>
+      </ContextMenuContent>
+    </ContextMenu>
 
     {/* File list with empty area context menu */}
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
           ref={fileListRef}
+          data-section="terminal-sftp-list"
           className={cn(
             "flex-1 min-h-0 overflow-y-auto relative",
             isDragOverPane && "ring-2 ring-primary/30 ring-inset",
@@ -671,7 +766,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
     </div>
 
     {/* Loading overlay - covers entire pane when navigating or reconnecting */}
-    {pane.loading && sortedDisplayFiles.length > 0 && !pane.reconnecting && (
+    {pane.loading && !pane.connection?.reusedConnection && sortedDisplayFiles.length > 0 && !pane.reconnecting && (
       <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/40 backdrop-blur-[1px] z-10">
         <Loader2 size={24} className="animate-spin text-muted-foreground" />
         {pane.connectionLogs.length > 0 && (

@@ -7,24 +7,34 @@
  * - Debounced sync to avoid too frequent API calls
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useCloudSync } from './useCloudSync';
 import { useI18n } from '../i18n/I18nProvider';
 import { getCloudSyncManager } from '../../infrastructure/services/CloudSyncManager';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
 import {
   findSyncPayloadEncryptedCredentialPaths,
+  healPoisonedSecretsForMerge,
+  stripSyncPayloadEncryptedCredentials,
 } from '../../domain/credentials';
-import { isProviderReadyForSync, type CloudProvider, type SyncPayload } from '../../domain/sync';
+import { isProviderReadyForSync, SYNC_STORAGE_KEYS, type CloudProvider, type SyncPayload } from '../../domain/sync';
 import { mergeSyncPayloads } from '../../domain/syncMerge';
-import { resolveCloudSyncConflictAction } from '../../domain/syncStrategy';
+import { materializeSyncPayloadFromConvergentState } from '../../domain/convergentSync';
+import {
+  resolveCloudSyncConflictAction,
+  type CloudSyncConflictAction,
+} from '../../domain/syncStrategy';
 import {
   SYNCABLE_SETTING_STORAGE_KEYS,
-  collectSyncableSettings,
+  collectCloudSyncableSettings,
   getEffectivePortForwardingRulesForSync,
+  hasCloudSyncEntityData,
   hasMeaningfulCloudSyncData,
+  sanitizeHostsForSync,
+  sanitizePortForwardingRulesForSync,
   shouldPromptCloudVaultRecovery,
 } from '../syncPayload';
+import { commitPluginSidecarsAfterSuccessfulSync } from '../pluginSyncSidecarBridge';
 import { readInterruptedVaultApply } from '../localVaultBackups';
 import {
   STORAGE_KEY_VAULT_RESTORE_IN_PROGRESS_UNTIL,
@@ -33,13 +43,30 @@ import {
   LOCAL_STORAGE_ADAPTER_CHANGED_EVENT,
   localStorageAdapter,
 } from '../../infrastructure/persistence/localStorageAdapter';
+import { getConvergentSyncLocalConfig } from '../../infrastructure/services/convergentSyncConfig';
 import { notify } from '../notification';
 import {
   getRuntimeRemoteCheckIntervalMs,
   shouldRunRuntimeRemoteCheck,
 } from './autoSyncRemoteSchedule';
+import { resolveAutoSyncHashDecision } from './autoSyncHashDecision';
+import { getNotesSnapshot, subscribeNotes } from './notesStore';
+
+/** Prefer dedicated SYNC_PREFERENCES; fall back to legacy SYNC_CONFIG fields. */
+function isPersistedAutoSyncEnabled(fallback: boolean): boolean {
+  const preferences = localStorageAdapter.read<{ autoSync?: boolean }>(
+    SYNC_STORAGE_KEYS.SYNC_PREFERENCES,
+  );
+  if (preferences && typeof preferences === 'object' && preferences.autoSync !== undefined) {
+    return Boolean(preferences.autoSync);
+  }
+  const stored = localStorageAdapter.read<{ autoSync?: boolean }>(SYNC_STORAGE_KEYS.SYNC_CONFIG);
+  if (!stored || typeof stored !== 'object') return fallback;
+  return Boolean(stored.autoSync);
+}
 
 interface AutoSyncConfig {
+  enabled?: boolean;
   // Data to sync
   hosts: SyncPayload['hosts'];
   keys: SyncPayload['keys'];
@@ -48,6 +75,8 @@ interface AutoSyncConfig {
   snippets: SyncPayload['snippets'];
   customGroups: SyncPayload['customGroups'];
   snippetPackages?: SyncPayload['snippetPackages'];
+  notes?: SyncPayload['notes'];
+  noteGroups?: SyncPayload['noteGroups'];
   portForwardingRules?: SyncPayload['portForwardingRules'];
   groupConfigs?: SyncPayload['groupConfigs'];
   /** Opaque token that changes whenever a synced setting changes. */
@@ -56,11 +85,30 @@ interface AutoSyncConfig {
 
   // Callbacks
   onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
+  onApplyConvergentPayload: (
+    payload: SyncPayload,
+    commitReplica: () => Promise<void>,
+  ) => Promise<void>;
 }
 
 // Get manager singleton for direct state access
 const manager = getCloudSyncManager();
 const AUTO_SYNC_PROVIDER_ORDER: CloudProvider[] = ['github', 'google', 'onedrive', 'webdav', 's3'];
+
+/** Prefer built-in order, then any connected namespaced plugin provider. */
+function pickConnectedAutoSyncProvider(
+  providers: Record<string, { status?: string; tokens?: unknown; config?: unknown }>,
+): CloudProvider | undefined {
+  for (const id of AUTO_SYNC_PROVIDER_ORDER) {
+    const conn = providers[id];
+    if (conn && isProviderReadyForSync(conn as never)) return id;
+  }
+  for (const [id, conn] of Object.entries(providers)) {
+    if (AUTO_SYNC_PROVIDER_ORDER.includes(id as CloudProvider)) continue;
+    if (conn && isProviderReadyForSync(conn as never)) return id as CloudProvider;
+  }
+  return undefined;
+}
 const SYNCABLE_SETTING_STORAGE_KEY_SET = new Set<string>(SYNCABLE_SETTING_STORAGE_KEYS);
 
 // Cross-window restore barrier: stored as an epoch-ms deadline. Any value
@@ -96,10 +144,31 @@ const isRestoreInProgress = (): boolean => {
   return true;
 };
 
+const getSyncPayloadDataHash = (payload: SyncPayload): string => {
+  return JSON.stringify({
+    hosts: sanitizeHostsForSync(payload.hosts),
+    keys: payload.keys,
+    identities: payload.identities,
+    proxyProfiles: payload.proxyProfiles,
+    snippets: payload.snippets,
+    customGroups: payload.customGroups,
+    snippetPackages: payload.snippetPackages,
+    notes: payload.notes,
+    noteGroups: payload.noteGroups,
+    portForwardingRules: sanitizePortForwardingRulesForSync(payload.portForwardingRules),
+    groupConfigs: payload.groupConfigs,
+    settings: payload.settings,
+    pluginSidecars: payload.pluginSidecars,
+  });
+};
+
 type SyncTrigger = 'auto' | 'manual';
 
 interface SyncNowOptions {
   trigger?: SyncTrigger;
+  notifyOnFailure?: boolean;
+  conflictActionOverride?: CloudSyncConflictAction;
+  allowEmptyConvergentSync?: boolean;
 }
 
 interface RemoteVersionCheckOptions {
@@ -108,12 +177,23 @@ interface RemoteVersionCheckOptions {
 }
 
 export const useAutoSync = (config: AutoSyncConfig) => {
+  const enabled = config.enabled !== false;
+  // Subscribe so note edits still trigger getSyncSnapshot rebuilds even when
+  // App omits notes props (notes live in notesStore, not App render).
+  const notesSnapshot = useSyncExternalStore(subscribeNotes, getNotesSnapshot, getNotesSnapshot);
   const { t } = useI18n();
+  const tRef = useRef(t);
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
   const sync = useCloudSync();
-  const { onApplyPayload } = config;
+  const convergentSyncPaused = sync.convergentSyncConfig.initialized
+    && !sync.convergentSyncConfig.enabled;
+  const { onApplyPayload, onApplyConvergentPayload } = config;
   const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSyncedDataRef = useRef<string>('');
   const hasCheckedRemoteRef = useRef(false);
+  const inspectFailureToastShownRef = useRef(false);
   /** True once checkRemoteVersion has completed (success or failure). Until
    *  this is set, the debounced auto-sync effect will not fire, preventing
    *  an empty local vault from racing ahead and overwriting a non-empty
@@ -121,7 +201,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
   const remoteCheckDoneRef = useRef(false);
   const isInitializedRef = useRef(false);
   const isSyncRunningRef = useRef(false);
-  const skipNextSyncRef = useRef(false);
+  const skipNextSyncHashRef = useRef<string | null>(null);
 
   // State for the empty-vault-vs-cloud confirmation dialog (Fix D).
   // When checkRemoteVersion detects that the local vault is empty but
@@ -133,6 +213,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     keyCount: number;
     proxyProfileCount: number;
     snippetCount: number;
+    noteCount: number;
   } | null>(null);
   const emptyVaultResolveRef = useRef<((action: 'restore' | 'keep-empty') => void) | null>(null);
 
@@ -142,6 +223,21 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     const handler = () => setBookmarksVersion((v) => v + 1);
     window.addEventListener('sftp-bookmarks-changed', handler);
     return () => window.removeEventListener('sftp-bookmarks-changed', handler);
+  }, []);
+
+  // Plugin settings live in the main-process DB; contribution change events
+  // are the renderer signal that sidecar-backed values may have changed.
+  const [pluginSidecarsVersion, setPluginSidecarsVersion] = useState(0);
+  useEffect(() => {
+    const bridge = netcattyBridge.get() as {
+      onPluginContributionsChanged?: (callback: () => void) => () => void;
+    } | null | undefined;
+    const unsubscribe = bridge?.onPluginContributionsChanged?.(() => {
+      setPluginSidecarsVersion((v) => v + 1);
+    });
+    return () => {
+      unsubscribe?.();
+    };
   }, []);
 
   const [syncableSettingsStorageVersion, setSyncableSettingsStorageVersion] = useState(0);
@@ -169,13 +265,17 @@ export const useAutoSync = (config: AutoSyncConfig) => {
 
   const getSyncSnapshot = useCallback(() => {
     return {
-      hosts: config.hosts,
+      hosts: sanitizeHostsForSync(config.hosts),
       keys: config.keys,
       identities: config.identities,
       proxyProfiles: config.proxyProfiles,
       snippets: config.snippets,
       customGroups: config.customGroups,
       snippetPackages: config.snippetPackages,
+      // Prefer explicit overrides (tests); otherwise read the live notes store so
+      // App does not have to re-render on every note edit to keep sync current.
+      notes: config.notes ?? (notesSnapshot.notes as SyncPayload['notes']),
+      noteGroups: config.noteGroups ?? (notesSnapshot.noteGroups as SyncPayload['noteGroups']),
       portForwardingRules: getEffectivePortForwardingRulesForSync(config.portForwardingRules),
       groupConfigs: config.groupConfigs,
     };
@@ -187,27 +287,51 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     config.snippets,
     config.customGroups,
     config.snippetPackages,
+    config.notes,
+    config.noteGroups,
     config.portForwardingRules,
     config.groupConfigs,
+    notesSnapshot.notes,
+    notesSnapshot.noteGroups,
   ]);
 
-  // Build sync payload
-  const buildPayload = useCallback((): SyncPayload => {
-    return {
+  // Build sync payload (includes plugin sidecars when host is available)
+  const buildPayload = useCallback(async (): Promise<SyncPayload> => {
+    const { withPluginSyncSidecars } = await import('../syncPayload');
+    const { collectPluginSyncSidecarsFromHost } = await import('../pluginSyncSidecarBridge');
+    const base: SyncPayload = {
       ...getSyncSnapshot(),
-      settings: collectSyncableSettings(),
+      settings: await collectCloudSyncableSettings(),
       syncedAt: Date.now(),
     };
+    const sidecars = await collectPluginSyncSidecarsFromHost();
+    return withPluginSyncSidecars(base, sidecars);
   }, [getSyncSnapshot]);
   
-  // Create a hash of current data for comparison (includes settings)
-  const getDataHash = useCallback(() => {
-    return JSON.stringify({ ...getSyncSnapshot(), settings: collectSyncableSettings() });
-  }, [getSyncSnapshot]);
+  // Create a hash of current data for comparison (includes settings + sidecars)
+  const getDataHash = useCallback(async () => {
+    const payload = await buildPayload();
+    return getSyncPayloadDataHash(payload);
+  }, [buildPayload]);
   
   // Sync now handler - get fresh state directly from manager
-  const syncNow = useCallback(async (options?: SyncNowOptions) => {
+  const syncNow = useCallback(async (options?: SyncNowOptions): Promise<boolean> => {
+    if (!enabled) return false;
+    // Read through the shared external store at the operation boundary too.
+    // This closes the small window between a Settings toggle and React
+    // committing the subscription update in this hook instance.
+    const currentConvergentConfig = getConvergentSyncLocalConfig();
+    if (currentConvergentConfig.initialized && !currentConvergentConfig.enabled) {
+      return false;
+    }
     const trigger: SyncTrigger = options?.trigger ?? 'auto';
+
+    // Defense for #2976: auto pushes must honor the persisted preference even
+    // when this window's React/manager snapshot is briefly stale after another
+    // window disables auto-sync.
+    if (trigger === 'auto' && !isPersistedAutoSyncEnabled(manager.getState().autoSyncEnabled)) {
+      return false;
+    }
 
     isSyncRunningRef.current = true;
     try {
@@ -223,7 +347,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       if (syncing) {
         if (trigger === 'auto') {
           console.info('[AutoSync] Skipping overlapping auto-sync because another sync is already running.');
-          return;
+          return false;
         }
         throw new Error(t('sync.autoSync.alreadySyncing'));
       }
@@ -243,7 +367,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       if (isRestoreInProgress()) {
         if (trigger === 'auto') {
           console.info('[AutoSync] Skipping: a vault restore is in progress in another window.');
-          return;
+          return false;
         }
         throw new Error(t('sync.autoSync.restoreInProgress'));
       }
@@ -267,7 +391,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
             '[AutoSync] Skipping: previous apply was interrupted — refusing to push partial state.',
             interruptedApply,
           );
-          return;
+          return false;
         }
         throw new Error(t('sync.autoSync.interruptedApplyMessage'));
       }
@@ -290,10 +414,13 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         throw new Error(t('sync.autoSync.vaultLocked'));
       }
 
-      const dataHash = getDataHash();
-      const payload = buildPayload();
+      const payload = await buildPayload();
+      const dataHash = getSyncPayloadDataHash(payload);
       const encryptedCredentialPaths = findSyncPayloadEncryptedCredentialPaths(payload);
-      if (encryptedCredentialPaths.length > 0) {
+      if (
+        encryptedCredentialPaths.length > 0
+        && options?.conflictActionOverride !== 'download-remote'
+      ) {
         console.warn('[AutoSync] Blocked: encrypted credential placeholders found at:', encryptedCredentialPaths.join(', '));
         throw new Error(t('sync.credentialsUnavailable'));
       }
@@ -309,15 +436,27 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       // checkRemoteVersion below: if inspect transiently errors we still
       // let auto-sync run, trusting this guard to refuse if local is
       // truly empty rather than letting an empty state clobber remote.
-      if (!hasMeaningfulCloudSyncData(payload)) {
+      if (
+        !hasMeaningfulCloudSyncData(payload)
+        && options?.conflictActionOverride !== 'download-remote'
+        && options?.allowEmptyConvergentSync !== true
+      ) {
         if (trigger === 'auto') {
           console.warn('[AutoSync] Blocked: refusing to auto-sync an empty vault to cloud');
-          return;
+          return false;
         }
         throw new Error(t('sync.autoSync.emptyVaultManual'));
       }
 
-      const results = await sync.syncNow(payload);
+      const results = await sync.syncNow(
+        payload,
+        {
+          ...(options?.conflictActionOverride
+            ? { conflictActionOverride: options.conflictActionOverride }
+            : {}),
+          applyConvergentPayload: onApplyConvergentPayload,
+        },
+      );
 
       // Apply merged payloads first (before checking for failures) so local
       // state gets updated even when some providers failed
@@ -326,14 +465,15 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         && resultList.every((result) => result.success);
 
       for (const result of resultList) {
-        if (result.mergedPayload) {
-          await Promise.resolve(onApplyPayload(result.mergedPayload));
+        if (result.mergedPayload && !result.mergedPayloadApplied) {
+          const portableMerged = stripSyncPayloadEncryptedCredentials(result.mergedPayload);
+          await Promise.resolve(onApplyPayload(portableMerged));
           if (result.remoteFile) {
-            await sync.commitRemoteInspection(result.provider, result.remoteFile, result.mergedPayload, {
+            await sync.commitRemoteInspection(result.provider, result.remoteFile, portableMerged, {
               recordDownload: true,
             });
           }
-          skipNextSyncRef.current = allProvidersSynced;
+          skipNextSyncHashRef.current = allProvidersSynced ? getSyncPayloadDataHash(portableMerged) : null;
           if (!allProvidersSynced) {
             console.warn('[AutoSync] Remote payload applied locally, but not every provider synced; leaving next auto-sync enabled for retry.');
           }
@@ -350,7 +490,12 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         }
       }
 
+      // Commit sidecar last-known after a successful sync (also done inside
+      // useCloudSync.syncNow; keep here as defense for this path's merge logic).
+      commitPluginSidecarsAfterSuccessfulSync(payload, resultList);
+
       lastSyncedDataRef.current = dataHash;
+      manager.setPendingLocalSync(false);
 
       // Successful sync implies a successful per-provider
       // `checkProviderConflict` (which inspects remote) — equivalent
@@ -363,19 +508,28 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       // would require the user to manually sync after every edit.
       hasCheckedRemoteRef.current = true;
       remoteCheckDoneRef.current = true;
+      return true;
     } catch (error) {
       if (trigger === 'manual') {
         throw error;
       }
       console.error('[AutoSync] Sync failed:', error);
-      notify.error(
-        error instanceof Error ? error.message : t('common.unknownError'),
-        t('sync.autoSync.failedTitle'),
-      );
+      if (options?.notifyOnFailure !== false) {
+        notify.error(
+          error instanceof Error ? error.message : t('common.unknownError'),
+          t('sync.autoSync.failedTitle'),
+        );
+      }
+      return false;
     } finally {
       isSyncRunningRef.current = false;
     }
-  }, [sync, buildPayload, getDataHash, onApplyPayload, t]);
+  }, [enabled, sync, buildPayload, onApplyConvergentPayload, onApplyPayload, t]);
+
+  const syncNowRef = useRef(syncNow);
+  useEffect(() => {
+    syncNowRef.current = syncNow;
+  }, [syncNow]);
 
   // One-shot toast per mount when a previous apply was interrupted, so the
   // user understands why auto-sync is silently paused and where to go to
@@ -384,6 +538,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
   // after the user completes a recovery.
   const interruptedApplyNotifiedRef = useRef(false);
   useEffect(() => {
+    if (!enabled) return;
     if (interruptedApplyNotifiedRef.current) return;
     if (!sync.isUnlocked) return;
     const interrupted = readInterruptedVaultApply();
@@ -393,7 +548,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       t('sync.autoSync.interruptedApplyMessage'),
       t('sync.autoSync.interruptedApplyTitle'),
     );
-  }, [sync.isUnlocked, t]);
+  }, [enabled, sync.isUnlocked, t]);
 
   // Stabilize the fields `checkRemoteVersion` reads from `config`.
   // AutoSyncConfig is a fresh object literal on every App render, so a
@@ -422,6 +577,39 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     getDataHashRef.current = getDataHash;
   }, [getDataHash]);
 
+  const refreshPendingLocalSync = useCallback(async () => {
+    if (
+      !enabled
+      || convergentSyncPaused
+      || !sync.hasAnyConnectedProvider
+      || !sync.isUnlocked
+    ) {
+      manager.setPendingLocalSync(false);
+      return;
+    }
+    if (!remoteCheckDoneRef.current) {
+      return;
+    }
+    try {
+      const currentHash = await getDataHashRef.current();
+      const hashDecision = resolveAutoSyncHashDecision({
+        currentHash,
+        lastSyncedHash: lastSyncedDataRef.current,
+        appliedSkipHash: skipNextSyncHashRef.current,
+      });
+      manager.setPendingLocalSync(hashDecision === 'sync');
+    } catch (error) {
+      // Sidecar collect can throw on host DB/runtime errors; leave the
+      // pending indicator unchanged rather than surfacing an unhandled rejection.
+      console.warn('[AutoSync] Failed to refresh pending local sync:', error);
+    }
+  }, [convergentSyncPaused, enabled, sync.hasAnyConnectedProvider, sync.isUnlocked]);
+
+  const refreshPendingLocalSyncRef = useRef(refreshPendingLocalSync);
+  useEffect(() => {
+    refreshPendingLocalSyncRef.current = refreshPendingLocalSync;
+  }, [refreshPendingLocalSync]);
+
   // Serialize `checkRemoteVersion` invocations. Overlapping runs would
   // race on `commitRemoteInspection` + `onApplyPayload`: two merges
   // could both write-then-clear the apply-in-progress sentinel around
@@ -434,6 +622,13 @@ export const useAutoSync = (config: AutoSyncConfig) => {
 
   // Check remote version and pull if newer (on startup)
   const checkRemoteVersion = useCallback(async (options?: RemoteVersionCheckOptions) => {
+    if (!enabled) {
+      return;
+    }
+    const currentConvergentConfig = getConvergentSyncLocalConfig();
+    if (currentConvergentConfig.initialized && !currentConvergentConfig.enabled) {
+      return;
+    }
     if (checkRemoteInFlightRef.current) {
       return;
     }
@@ -451,9 +646,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     // "nothing to check" early return doesn't leak the lock and wedge
     // the retry timer. Any path that takes the lock MUST reach the
     // finally-release below.
-    const connectedProvider = AUTO_SYNC_PROVIDER_ORDER.find((provider) =>
-      isProviderReadyForSync(state.providers[provider]),
-    ) ?? null;
+    const connectedProvider = pickConnectedAutoSyncProvider(state.providers) ?? null;
 
     if (!connectedProvider) {
       // Nothing to check — mark as done so the auto-sync gate opens.
@@ -466,9 +659,76 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     // Track whether the startup path completed in a state where the anchor/base
     // are consistent with the local vault. Only then should we latch
     // hasCheckedRemoteRef so that transient failures are retryable.
+    const hadInitialBaseline = isInitializedRef.current;
     let startupConsistent = false;
     let markCurrentDataSynced = true;
+    let inspectedRemoteChange = false;
+    const requestEmptyVaultRecovery = async (remotePayload: SyncPayload) => {
+      const userAction = await new Promise<'restore' | 'keep-empty'>((resolve) => {
+        emptyVaultResolveRef.current = resolve;
+        setEmptyVaultConflict({
+          remotePayload,
+          hostCount: remotePayload.hosts?.length ?? 0,
+          keyCount: remotePayload.keys?.length ?? 0,
+          proxyProfileCount: remotePayload.proxyProfiles?.length ?? 0,
+          snippetCount: remotePayload.snippets?.length ?? 0,
+          noteCount: remotePayload.notes?.length ?? 0,
+        });
+      });
+      setEmptyVaultConflict(null);
+      emptyVaultResolveRef.current = null;
+      return userAction;
+    };
     try {
+      if (currentConvergentConfig.initialized && currentConvergentConfig.enabled) {
+        // A v2 remote check must join the provider replicas through the CRDT
+        // runtime. Inspecting the materialized v1 snapshot here would discard
+        // retained candidates and could turn the deterministic winner into a
+        // local write that silently resolves a real field conflict.
+        const localPayload = await buildPayloadRef.current();
+        let recoveryPayload: SyncPayload | null = null;
+        if (!hasCloudSyncEntityData(localPayload)) {
+          recoveryPayload = await manager.previewConvergentRecovery();
+          if (recoveryPayload && shouldPromptCloudVaultRecovery(localPayload, recoveryPayload)) {
+            const userAction = await requestEmptyVaultRecovery(recoveryPayload);
+            if (userAction === 'restore') {
+              // Explicit recovery must not honor the auto-sync preference gate:
+              // the user already confirmed Restore in the dialog.
+              const restored = await syncNowRef.current({
+                trigger: 'manual',
+                notifyOnFailure,
+                conflictActionOverride: 'download-remote',
+              });
+              if (restored) {
+                notify.success(
+                  tRef.current('sync.autoSync.restoredMessage'),
+                  tRef.current('sync.autoSync.restoredTitle'),
+                );
+              }
+            } else {
+              notify.info(
+                tRef.current('sync.autoSync.keptLocalMessage'),
+                tRef.current('sync.autoSync.keptLocalTitle'),
+              );
+            }
+            return;
+          }
+        }
+        let allowEmptyConvergentSync = false;
+        if (!hasMeaningfulCloudSyncData(localPayload)) {
+          const replica = await manager.loadConvergentReplica();
+          const replicaPayload = replica
+            ? materializeSyncPayloadFromConvergentState(replica.state, { syncedAt: Date.now() })
+            : null;
+          allowEmptyConvergentSync = (
+            (!recoveryPayload || !hasMeaningfulCloudSyncData(recoveryPayload))
+            && (!replicaPayload || !hasMeaningfulCloudSyncData(replicaPayload))
+          );
+        }
+        await syncNowRef.current({ notifyOnFailure, allowEmptyConvergentSync });
+        return;
+      }
+
       // Load base BEFORE observing the remote payload (commitRemoteInspection overwrites the base).
       const base = await manager.loadSyncBase(connectedProvider);
       const inspection = await manager.inspectProviderRemote(connectedProvider);
@@ -479,27 +739,21 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         startupConsistent = true;
         return;
       }
+      inspectedRemoteChange = true;
 
       const remoteFile = inspection.remoteFile;
-      const remotePayload = inspection.payload;
-      const localPayload = buildPayloadRef.current();
+      const remoteRaw = inspection.payload;
+      // Strip device-bound enc:v1 for download/apply paths so poisoned cloud
+      // snapshots restore usable host shells. Smart-merge heals from local/base
+      // separately below so good secrets are not treated as remote deletions.
+      const remotePayload = stripSyncPayloadEncryptedCredentials(remoteRaw);
+      const localPayload = await buildPayloadRef.current();
 
       // If local vault is empty but cloud has data, this almost certainly
       // means the user's data was lost (update, storage corruption, etc.).
       // Pause and ask the user what to do instead of silently merging.
       if (shouldPromptCloudVaultRecovery(localPayload, remotePayload)) {
-        const userAction = await new Promise<'restore' | 'keep-empty'>((resolve) => {
-          emptyVaultResolveRef.current = resolve;
-          setEmptyVaultConflict({
-            remotePayload,
-            hostCount: remotePayload.hosts?.length ?? 0,
-            keyCount: remotePayload.keys?.length ?? 0,
-            proxyProfileCount: remotePayload.proxyProfiles?.length ?? 0,
-            snippetCount: remotePayload.snippets?.length ?? 0,
-          });
-        });
-        setEmptyVaultConflict(null);
-        emptyVaultResolveRef.current = null;
+        const userAction = await requestEmptyVaultRecovery(remotePayload);
 
         if (userAction === 'restore') {
           // Apply remote FIRST; only commit anchor/base after the UI-side
@@ -511,9 +765,9 @@ export const useAutoSync = (config: AutoSyncConfig) => {
           await manager.commitRemoteInspection(connectedProvider, remoteFile, remotePayload, {
             recordDownload: true,
           });
-          skipNextSyncRef.current = true;
+          skipNextSyncHashRef.current = getSyncPayloadDataHash(remotePayload);
           startupConsistent = true;
-          notify.success(t('sync.autoSync.restoredMessage'), t('sync.autoSync.restoredTitle'));
+          notify.success(tRef.current('sync.autoSync.restoredMessage'), tRef.current('sync.autoSync.restoredTitle'));
         } else {
           // User chose to keep the empty vault. Deliberately do NOT advance
           // the anchor or base — the next sync must still treat remote as
@@ -521,7 +775,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
           // keeps protecting the cloud copy. startupConsistent stays false
           // so hasCheckedRemoteRef is not latched and the next startup will
           // re-prompt if the user still has not added anything.
-          notify.info(t('sync.autoSync.keptLocalMessage'), t('sync.autoSync.keptLocalTitle'));
+          notify.info(tRef.current('sync.autoSync.keptLocalMessage'), tRef.current('sync.autoSync.keptLocalTitle'));
         }
         return;
       }
@@ -545,23 +799,35 @@ export const useAutoSync = (config: AutoSyncConfig) => {
           conflictActionOverride: 'upload-local',
         });
         const roundTripResultList = Array.from(roundTripResults.values());
+        commitPluginSidecarsAfterSuccessfulSync(remotePayload, roundTripResultList);
         const wasShrinkBlocked = roundTripResultList.some((result) => result.shrinkBlocked === true);
         const roundTripFullySynced = roundTripResultList.length > 0
           && roundTripResultList.every((result) => result.success);
-        skipNextSyncRef.current = roundTripFullySynced || wasShrinkBlocked;
+        skipNextSyncHashRef.current = (roundTripFullySynced || wasShrinkBlocked)
+          ? getSyncPayloadDataHash(remotePayload)
+          : null;
         markCurrentDataSynced = roundTripFullySynced || wasShrinkBlocked;
         if (wasShrinkBlocked) {
           console.warn('[AutoSync] Cloud-wins round-trip was shrink-blocked; cloud data applied locally, leaving sync blocked for user review.');
         } else if (!roundTripFullySynced) {
           console.warn('[AutoSync] Cloud-wins round-trip did not update every provider; leaving next auto-sync enabled for retry.');
         }
-        notify.success(t('sync.autoSync.syncedMessage'), t('sync.autoSync.syncedTitle'));
+        notify.success(tRef.current('sync.autoSync.syncedMessage'), tRef.current('sync.autoSync.syncedTitle'));
         return;
       }
 
       if (conflictAction === 'upload-local') {
+        const encryptedCredentialPaths = findSyncPayloadEncryptedCredentialPaths(localPayload);
+        if (encryptedCredentialPaths.length > 0) {
+          console.warn(
+            '[AutoSync] Startup local-wins blocked: encrypted credential placeholders found at:',
+            encryptedCredentialPaths.join(', '),
+          );
+          throw new Error(tRef.current('sync.credentialsUnavailable'));
+        }
         const pushResults = await manager.syncAllProviders(localPayload);
         const results = Array.from(pushResults.values());
+        commitPluginSidecarsAfterSuccessfulSync(localPayload, results);
         const allProvidersSynced = results.length > 0
           && results.every((result) => result.success);
         const wasShrinkBlocked = results.some((result) => result.shrinkBlocked === true);
@@ -578,19 +844,24 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         throw new Error('Startup local-wins sync failed for one or more providers');
       }
 
-      const mergeResult = mergeSyncPayloads(base, localPayload, remotePayload);
+      // Prefer usable secrets from the opposite side / base over enc:v1
+      // placeholders before merge. Otherwise smart-merge can pick a "changed"
+      // local entity whose only secret change is ciphertext, then strip +
+      // upload and wipe usable cloud passwords. Same for remote-side poison.
+      const localHealed = healPoisonedSecretsForMerge(localPayload, remoteRaw, base);
+      const remoteHealed = healPoisonedSecretsForMerge(remoteRaw, localPayload, base);
+      const mergeResult = mergeSyncPayloads(base, localHealed, remoteHealed);
 
       // Apply merged payload to local state BEFORE committing. If the apply
       // throws, the next startup will re-run the merge with fresh data.
-      await Promise.resolve(onApplyPayloadRef.current(mergeResult.payload));
-      // Base is the last-agreed remote snapshot; `commitRemoteInspection`
-      // stores remotePayload as the base so the next diff is computed
-      // against what the cloud actually has, not against the merged
-      // local-only state.
+      const portableMerge = stripSyncPayloadEncryptedCredentials(mergeResult.payload);
+      await Promise.resolve(onApplyPayloadRef.current(portableMerge));
+      // Base is the last-agreed remote snapshot; store the portable remote
+      // view so future diffs never treat device-bound enc:v1 as cloud truth.
       await manager.commitRemoteInspection(connectedProvider, remoteFile, remotePayload);
       startupConsistent = true;
       markCurrentDataSynced = false;
-      notify.success(t('sync.autoSync.syncedMessage'), t('sync.autoSync.syncedTitle'));
+      notify.success(tRef.current('sync.autoSync.syncedMessage'), tRef.current('sync.autoSync.syncedTitle'));
 
       // If the three-way merge introduced any local-only additions that the
       // remote does not yet have, we MUST round-trip those to the cloud.
@@ -607,8 +878,9 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       // that only approximated the correct ordering.
       if (mergeResult.payload) {
         try {
-          const roundTripResults = await manager.syncAllProviders(mergeResult.payload);
+          const roundTripResults = await manager.syncAllProviders(portableMerge);
           const roundTripResultList = Array.from(roundTripResults.values());
+          commitPluginSidecarsAfterSuccessfulSync(portableMerge, roundTripResultList);
           const wasShrinkBlocked = roundTripResultList.some((r) => r.shrinkBlocked === true);
           const roundTripFullySynced = roundTripResultList.length > 0
             && roundTripResultList.every((result) => result.success);
@@ -628,7 +900,9 @@ export const useAutoSync = (config: AutoSyncConfig) => {
           // once React commits the applied state, since we've just
           // already pushed that exact payload upstream. If some provider
           // failed, allow the follow-up tick to retry the applied payload.
-          skipNextSyncRef.current = roundTripFullySynced || wasShrinkBlocked;
+          skipNextSyncHashRef.current = (roundTripFullySynced || wasShrinkBlocked)
+            ? getSyncPayloadDataHash(mergeResult.payload)
+            : null;
           markCurrentDataSynced = roundTripFullySynced || wasShrinkBlocked;
         } catch (error) {
           // Non-fatal: the next user edit will drive another sync cycle.
@@ -637,14 +911,13 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       }
     } catch (error) {
       console.error('[AutoSync] Failed to check remote version:', error);
-      if (notifyOnFailure) {
-        // Surface a degraded-sync hint to the user rather than silently
-        // opening the auto-sync gate. Auto-sync will still retry on next
-        // data change (see finally block), but without this toast the user
-        // has no visible signal that startup reconciliation failed.
+      if (notifyOnFailure && !inspectFailureToastShownRef.current) {
+        // Surface a degraded-sync hint once per session. Retries and
+        // incidental re-triggers (e.g. effect restarts) must not spam toasts.
+        inspectFailureToastShownRef.current = true;
         notify.error(
-          t('sync.autoSync.inspectFailedMessage'),
-          t('sync.autoSync.inspectFailedTitle'),
+          tRef.current('sync.autoSync.inspectFailedMessage'),
+          tRef.current('sync.autoSync.inspectFailedTitle'),
         );
       }
       // Leave hasCheckedRemoteRef=false so the next startup (or the next
@@ -654,9 +927,13 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         if (!isInitializedRef.current) {
           isInitializedRef.current = true;
         }
-        if (markCurrentDataSynced) {
-          lastSyncedDataRef.current = getDataHashRef.current();
-        } else {
+        if (markCurrentDataSynced && (!hadInitialBaseline || inspectedRemoteChange)) {
+          try {
+            lastSyncedDataRef.current = await getDataHashRef.current();
+          } catch (error) {
+            console.warn('[AutoSync] Failed to capture post-inspect baseline hash:', error);
+          }
+        } else if (!markCurrentDataSynced) {
           lastSyncedDataRef.current = '';
         }
         hasCheckedRemoteRef.current = true;
@@ -669,6 +946,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
         // unlock/startupReady transition, and a manual sync from
         // Settings remains available as an escape hatch.
         remoteCheckDoneRef.current = true;
+        await refreshPendingLocalSyncRef.current();
       }
       checkRemoteInFlightRef.current = false;
     }
@@ -677,12 +955,54 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     // identity flips (every vault edit produces a fresh `buildPayload`
     // and a fresh AutoSyncConfig literal) cannot re-memoize this
     // callback and restart the retry-timer's exponential backoff.
-  }, [t]);
+    // `t` is read through tRef so locale updates don't rebuild this
+    // callback and re-fire the startup retry effect on unrelated renders.
+  }, [enabled]);
+
+  const checkRemoteVersionRef = useRef(checkRemoteVersion);
+  useEffect(() => {
+    checkRemoteVersionRef.current = checkRemoteVersion;
+  }, [checkRemoteVersion]);
   
   // Debounced auto-sync when data changes
   useEffect(() => {
+    if (!enabled) return;
+
+    let cancelled = false;
+
+    // Establish the initial baseline immediately. If this were delayed by
+    // the debounce below, an edit made right after startup could become the
+    // baseline and never be pushed. A paused replica still captures this
+    // one-time baseline so edits made while paused remain pending on resume.
+    const establishInitialBaseline = () => {
+      isInitializedRef.current = true;
+      void (async () => {
+        try {
+          const currentHash = await getDataHash();
+          if (cancelled) return;
+          lastSyncedDataRef.current = currentHash;
+        } catch (error) {
+          console.warn('[AutoSync] Failed to establish sync baseline hash:', error);
+        }
+      })();
+    };
+
+    if (convergentSyncPaused) {
+      if (!isInitializedRef.current) {
+        establishInitialBaseline();
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
     // Skip if not ready
     if (!sync.hasAnyConnectedProvider || !sync.autoSyncEnabled || !sync.isUnlocked) {
+      // Drop any pending debounce when auto-sync (or readiness) turns off so a
+      // timer scheduled while enabled cannot fire after the toggle (#2976).
+      if (syncTimeoutRef.current) {
+        clearTimeout(syncTimeoutRef.current);
+        syncTimeoutRef.current = null;
+      }
       return;
     }
 
@@ -694,62 +1014,90 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       return;
     }
 
-    // Skip initial render
-    if (!isInitializedRef.current) {
-      isInitializedRef.current = true;
-      lastSyncedDataRef.current = getDataHash();
-      return;
-    }
-    
-    const currentHash = getDataHash();
-
-    // After a merge, onApplyPayload changes local state which triggers
-    // this effect. Skip that cycle and just update the hash baseline.
-    if (skipNextSyncRef.current) {
-      skipNextSyncRef.current = false;
-      lastSyncedDataRef.current = currentHash;
-      return;
-    }
-
-    // Skip if data hasn't changed
-    if (currentHash === lastSyncedDataRef.current) {
-      return;
-    }
-
-    // Wait for the current sync to finish, then this effect will re-run
-    // because sync.isSyncing changed.
-    if (sync.isSyncing || isSyncRunningRef.current) {
-      return;
-    }
-
-    // Hold off on scheduling a new push while another window is applying
-    // a restore — the restore is about to land via localStorage and the
-    // debounce-fired syncNow would otherwise race it. The next data-
-    // change tick after the restore barrier clears will re-enter here.
-    if (isRestoreInProgress()) {
-      return;
-    }
-
-    // Don't even schedule a push while the apply-in-progress sentinel
-    // is held. The syncNow path re-checks and refuses too, but dropping
-    // the debounced schedule here avoids spinning a 3-second timer for
-    // every keystroke while the user is in the Restore UI working
-    // through recovery.
-    if (readInterruptedVaultApply()) {
-      return;
-    }
-    
-    // Clear existing timeout
     if (syncTimeoutRef.current) {
       clearTimeout(syncTimeoutRef.current);
     }
-    
-    // Debounce sync by 3 seconds
+
+    if (!isInitializedRef.current) {
+      establishInitialBaseline();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Debounce first, then build the expensive full-data hash. This keeps
+    // rapid edit bursts from serializing the whole vault on every keystroke.
     syncTimeoutRef.current = setTimeout(() => {
-      syncNow();
+      syncTimeoutRef.current = null;
+      void (async () => {
+        let currentHash: string;
+        try {
+          currentHash = await getDataHash();
+        } catch (error) {
+          console.warn('[AutoSync] Failed to hash local vault before auto-sync:', error);
+          return;
+        }
+        if (cancelled) return;
+
+        // After a remote apply or merge, skip only that exact applied data.
+        // If the user edits before this timer fires, the hash differs and the
+        // edit still syncs normally.
+        const skipHash = skipNextSyncHashRef.current;
+
+        const hashDecision = resolveAutoSyncHashDecision({
+          currentHash,
+          lastSyncedHash: lastSyncedDataRef.current,
+          appliedSkipHash: skipHash,
+        });
+        if (hashDecision === 'skip-applied') {
+          if (skipNextSyncHashRef.current === skipHash) {
+            skipNextSyncHashRef.current = null;
+          }
+          lastSyncedDataRef.current = currentHash;
+          return;
+        }
+        if (hashDecision === 'unchanged') {
+          return;
+        }
+
+        // Re-check at fire time: auto-sync may have been disabled in another
+        // window during the debounce window (#2976).
+        if (!isPersistedAutoSyncEnabled(manager.getState().autoSyncEnabled)) {
+          return;
+        }
+
+        // Wait for the current sync to finish, then this effect will re-run
+        // because sync.isSyncing changed.
+        if (sync.isSyncing || isSyncRunningRef.current) {
+          return;
+        }
+
+        // Hold off on scheduling a new push while another window is applying
+        // a restore — the restore is about to land via localStorage and the
+        // debounce-fired syncNow would otherwise race it. The next data-
+        // change tick after the restore barrier clears will re-enter here.
+        if (isRestoreInProgress()) {
+          return;
+        }
+
+        // Don't even schedule a push while the apply-in-progress sentinel
+        // is held. The syncNow path re-checks and refuses too, but dropping
+        // the debounced schedule here avoids spinning a 3-second timer for
+        // every keystroke while the user is in the Restore UI working
+        // through recovery.
+        if (readInterruptedVaultApply()) {
+          return;
+        }
+
+        const didSync = await syncNow();
+        if (didSync && skipHash !== null && skipNextSyncHashRef.current === skipHash) {
+          skipNextSyncHashRef.current = null;
+        }
+      })();
     }, 3000);
     
     return () => {
+      cancelled = true;
       if (syncTimeoutRef.current) {
         clearTimeout(syncTimeoutRef.current);
       }
@@ -762,7 +1110,26 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     getDataHash,
     syncNow,
     config.settingsVersion,
+    enabled,
     bookmarksVersion,
+    pluginSidecarsVersion,
+    convergentSyncPaused,
+    syncableSettingsStorageVersion,
+  ]);
+
+  // Reflect unsynced local edits in the top-bar cloud indicator.
+  useEffect(() => {
+    void refreshPendingLocalSync();
+  }, [
+    refreshPendingLocalSync,
+    getDataHash,
+    sync.hasAnyConnectedProvider,
+    sync.isUnlocked,
+    sync.isSyncing,
+    config.settingsVersion,
+    enabled,
+    bookmarksVersion,
+    pluginSidecarsVersion,
     syncableSettingsStorageVersion,
   ]);
   
@@ -773,6 +1140,8 @@ export const useAutoSync = (config: AutoSyncConfig) => {
   // sync from Settings — the 30s/60s/90s cadence below lets a short
   // outage (network blip, provider rate-limit) self-heal.
   useEffect(() => {
+    if (!enabled) return;
+    if (convergentSyncPaused) return;
     if (
       !sync.hasAnyConnectedProvider ||
       !sync.isUnlocked ||
@@ -789,7 +1158,10 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     const tick = () => {
       if (cancelled) return;
       void (async () => {
-        await checkRemoteVersion();
+        const notifyOnFailure = attempt === 0;
+        await checkRemoteVersionRef.current(
+          notifyOnFailure ? undefined : { notifyOnFailure: false },
+        );
         if (cancelled || hasCheckedRemoteRef.current) return;
         // Cap retries at ~5 minutes total (30s + 60s + 120s + 240s). A
         // persistent failure beyond that is almost certainly a
@@ -824,9 +1196,12 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       cancelled = true;
       if (timerId) clearTimeout(timerId);
     };
-  }, [sync.hasAnyConnectedProvider, sync.isUnlocked, config.startupReady, checkRemoteVersion]);
+  }, [convergentSyncPaused, enabled, sync.hasAnyConnectedProvider, sync.isUnlocked, config.startupReady]);
 
   const runRuntimeRemoteCheck = useCallback(async (options?: { force?: boolean }) => {
+    if (!enabled) return;
+    const currentConvergentConfig = getConvergentSyncLocalConfig();
+    if (currentConvergentConfig.initialized && !currentConvergentConfig.enabled) return;
     const now = Date.now();
     const minIntervalMs = getRuntimeRemoteCheckIntervalMs(sync.autoSyncInterval);
     if (!shouldRunRuntimeRemoteCheck({
@@ -849,6 +1224,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     await checkRemoteVersion({ force: true, notifyOnFailure: false });
   }, [
     checkRemoteVersion,
+    enabled,
     sync.autoSyncEnabled,
     sync.autoSyncInterval,
     sync.hasAnyConnectedProvider,
@@ -860,6 +1236,8 @@ export const useAutoSync = (config: AutoSyncConfig) => {
   // another device uploads changes after our startup inspection but before
   // this device edits anything locally.
   useEffect(() => {
+    if (!enabled) return;
+    if (convergentSyncPaused) return;
     if (!sync.hasAnyConnectedProvider || !sync.autoSyncEnabled || !sync.isUnlocked) {
       return;
     }
@@ -871,6 +1249,8 @@ export const useAutoSync = (config: AutoSyncConfig) => {
 
     return () => window.clearInterval(timerId);
   }, [
+    convergentSyncPaused,
+    enabled,
     runRuntimeRemoteCheck,
     sync.autoSyncEnabled,
     sync.autoSyncInterval,
@@ -880,6 +1260,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
 
   // Also re-check when the user returns to the app or the network comes back.
   useEffect(() => {
+    if (!enabled) return;
     if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
     const handleVisibilityChange = () => {
@@ -897,16 +1278,17 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('online', handleOnline);
     };
-  }, [runRuntimeRemoteCheck]);
+  }, [enabled, runRuntimeRemoteCheck]);
   
   // Reset check flags when provider disconnects
   useEffect(() => {
+    if (!enabled) return;
     if (!sync.hasAnyConnectedProvider) {
       hasCheckedRemoteRef.current = false;
       remoteCheckDoneRef.current = false;
       lastRuntimeRemoteCheckAtRef.current = null;
     }
-  }, [sync.hasAnyConnectedProvider]);
+  }, [enabled, sync.hasAnyConnectedProvider]);
 
   // On unmount, release any pending empty-vault confirmation. Without
   // this, an unmount mid-dialog (window close, workspace switch) leaves

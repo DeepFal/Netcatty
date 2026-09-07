@@ -1,6 +1,5 @@
 import {
   AlertTriangle,
-  Check,
   ChevronDown,
   Copy,
   Globe,
@@ -11,17 +10,29 @@ import {
   Plus,
   Route,
   Settings2,
+  SquareTerminal,
   Trash2,
 } from "lucide-react";
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useStoredViewMode } from "../application/state/useStoredViewMode";
-import { isValidProxyPort, removeProxyProfileReferences } from "../domain/proxyProfiles";
+import {
+  formatProxyConfigEndpoint,
+  hasIncompleteProxyIdentity,
+  hasMissingProxyIdentity,
+  hasUnreadableProxyCredential,
+  isProxyCommandConfig,
+  isValidProxyPort,
+  normalizeManualProxyConfig,
+  removeProxyProfileReferences,
+  updateProxyConfigField,
+} from "../domain/proxyProfiles";
+import { reorderVaultItems, sortByVaultOrder } from "../domain/vaultOrder";
 import {
   STORAGE_KEY_VAULT_PROXY_PROFILES_VIEW_MODE,
 } from "../infrastructure/config/storageKeys";
 import { cn } from "../lib/utils";
-import type { GroupConfig, Host, ProxyConfig, ProxyProfile } from "../types";
+import type { GroupConfig, Host, Identity, ProxyConfig, ProxyProfile } from "../types";
 import {
   AsidePanel,
   AsidePanelContent,
@@ -47,22 +58,77 @@ import {
 } from "./ui/dialog";
 import { Dropdown, DropdownContent, DropdownTrigger } from "./ui/dropdown";
 import { Input } from "./ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { toast } from "./ui/toast";
 import {
   VaultHeaderSearch,
   VaultPageHeader,
   vaultHeaderIconButtonClass,
   vaultHeaderSecondaryButtonClass,
+  vaultSectionTitleClass,
 } from "./vault/VaultPageHeader";
+import {
+  VaultEntityIcon,
+  vaultProxyCommandIconClass,
+  vaultProxyHttpIconClass,
+  vaultProxySocksIconClass,
+} from "./vault/VaultEntityIcon";
+import { useVaultItemReorder } from "./vault/vaultReorderDrag";
 
 interface ProxyProfilesManagerProps {
   proxyProfiles: ProxyProfile[];
   hosts: Host[];
   groupConfigs: GroupConfig[];
+  identities: Identity[];
   onUpdateProxyProfiles: (profiles: ProxyProfile[]) => void;
   onUpdateHosts: (hosts: Host[]) => void;
   onUpdateGroupConfigs: (configs: GroupConfig[]) => void;
 }
+
+export type ProxyProfileSaveError =
+  | "required"
+  | "port"
+  | "missingIdentity"
+  | "incompleteIdentity"
+  | "unreadableIdentity";
+
+export const prepareProxyProfileForSave = (
+  draft: ProxyProfile,
+  identities: Identity[],
+  updatedAt = Date.now(),
+): { saved?: ProxyProfile; error?: ProxyProfileSaveError } => {
+  const label = draft.label.trim();
+  const host = draft.config.host.trim();
+  const command = draft.config.command?.trim() || "";
+  const isCommand = isProxyCommandConfig(draft.config);
+  if (!label || (isCommand ? !command : (!host || !draft.config.port))) {
+    return { error: "required" };
+  }
+  if (!isCommand && !isValidProxyPort(draft.config.port)) {
+    return { error: "port" };
+  }
+  if (!isCommand && hasMissingProxyIdentity(draft.config, identities)) {
+    return { error: "missingIdentity" };
+  }
+  if (!isCommand && hasIncompleteProxyIdentity(draft.config, identities)) {
+    return { error: "incompleteIdentity" };
+  }
+  if (!isCommand && hasUnreadableProxyCredential(draft.config, identities)) {
+    return { error: "unreadableIdentity" };
+  }
+
+  const normalizedConfig = normalizeManualProxyConfig(draft.config);
+  if (!normalizedConfig) return { error: "required" };
+
+  return {
+    saved: {
+      ...draft,
+      label,
+      config: normalizedConfig,
+      updatedAt,
+    },
+  };
+};
 
 const createDraftProfile = (): ProxyProfile => {
   const now = Date.now();
@@ -93,15 +159,21 @@ const proxyProtocolMeta = {
   http: {
     label: "HTTP",
     Icon: Globe,
-    iconClassName: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    iconClassName: vaultProxyHttpIconClass,
   },
   socks5: {
     label: "SOCKS5",
     Icon: Route,
-    iconClassName: "bg-sky-500/10 text-sky-600 dark:text-sky-400",
+    iconClassName: vaultProxySocksIconClass,
+  },
+  command: {
+    labelKey: "hostDetails.proxyPanel.command",
+    Icon: SquareTerminal,
+    iconClassName: vaultProxyCommandIconClass,
   },
 } satisfies Record<ProxyConfig["type"], {
-  label: string;
+  label?: string;
+  labelKey?: string;
   Icon: React.ComponentType<{ size?: number; className?: string }>;
   iconClassName: string;
 }>;
@@ -111,6 +183,7 @@ interface ProxyProfileCardProps {
   usageCount: number;
   viewMode: ProxyProfilesViewMode;
   isSelected: boolean;
+  reorderProps?: React.ButtonHTMLAttributes<HTMLButtonElement>;
   onClick: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
@@ -122,6 +195,7 @@ const ProxyProfileCard: React.FC<ProxyProfileCardProps> = ({
   usageCount,
   viewMode,
   isSelected,
+  reorderProps,
   onClick,
   onEdit,
   onDuplicate,
@@ -130,41 +204,42 @@ const ProxyProfileCard: React.FC<ProxyProfileCardProps> = ({
   const { t } = useI18n();
   const usageLabel = t("proxyProfiles.usage", { count: usageCount });
   const protocol = proxyProtocolMeta[profile.config.type];
+  const protocolLabel = protocol.labelKey ? t(protocol.labelKey) : protocol.label;
   const ProtocolIcon = protocol.Icon;
-  const accessibleLabel = `${profile.label}, ${protocol.label}, ${profile.config.host}:${profile.config.port}, ${usageLabel}`;
+  const endpoint = formatProxyConfigEndpoint(profile.config);
+  const accessibleLabel = `${profile.label}, ${protocolLabel}, ${endpoint}, ${usageLabel}`;
 
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <button
+          {...reorderProps}
           type="button"
           aria-label={accessibleLabel}
           className={cn(
+            reorderProps && "vault-drop-indicator-row",
             "group w-full text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
             viewMode === "grid"
               ? "soft-card elevate rounded-xl h-[68px] px-3 py-2"
               : "h-14 px-3 py-2 hover:bg-secondary/60 rounded-lg transition-colors",
             isSelected && "ring-2 ring-primary",
+            reorderProps?.className,
           )}
           onClick={onClick}
         >
           <div className="flex items-center gap-3 h-full">
-            <div
-              className={cn(
-                "h-11 w-11 rounded-xl flex items-center justify-center",
-                protocol.iconClassName,
-              )}
-              title={protocol.label}
-            >
-              <ProtocolIcon size={18} />
-            </div>
+            <VaultEntityIcon
+              className={protocol.iconClassName}
+              title={protocolLabel}
+              icon={<ProtocolIcon size={18} />}
+            />
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 min-w-0">
                 <div className="text-sm font-semibold truncate">{profile.label}</div>
               </div>
               <div className="text-[11px] font-mono text-muted-foreground truncate">
-                {profile.config.host}:{profile.config.port} -{" "}
-                {protocol.label}
+                {endpoint} -{" "}
+                {protocolLabel}
               </div>
             </div>
           </div>
@@ -193,6 +268,7 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
   proxyProfiles,
   hosts,
   groupConfigs,
+  identities,
   onUpdateProxyProfiles,
   onUpdateHosts,
   onUpdateGroupConfigs,
@@ -207,6 +283,19 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
     viewMode === "list" ? "list" : "grid";
   const [draft, setDraft] = useState<ProxyProfile | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ProxyProfile | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const manualCredentialsValue = "__manual_credentials__";
+  const missingIdentityValue = "__missing_identity__";
+  const selectedDraftIdentity = useMemo(
+    () => identities.find((identity) => identity.id === draft?.config.identityId),
+    [draft?.config.identityId, identities],
+  );
+  const hasMissingDraftIdentity = hasMissingProxyIdentity(draft?.config, identities);
+  const hasIncompleteDraftIdentity = hasIncompleteProxyIdentity(draft?.config, identities);
+  const hasUnreadableDraftIdentity = hasUnreadableProxyCredential(draft?.config, identities);
+  const selectedDraftIdentityValue =
+    selectedDraftIdentity?.id ||
+    (hasMissingDraftIdentity ? missingIdentityValue : manualCredentialsValue);
 
   const usageByProfileId = useMemo(() => {
     const map = new Map<string, number>();
@@ -218,23 +307,32 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
 
   const filteredProfiles = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return proxyProfiles;
-    return proxyProfiles.filter((profile) =>
+    const result = !q ? proxyProfiles : proxyProfiles.filter((profile) =>
       profile.label.toLowerCase().includes(q) ||
       profile.config.host.toLowerCase().includes(q) ||
+      (profile.config.command || "").toLowerCase().includes(q) ||
       profile.config.type.toLowerCase().includes(q),
     );
+    return sortByVaultOrder(result);
   }, [proxyProfiles, search]);
 
-  const updateDraftConfig = (field: keyof ProxyConfig, value: string | number) => {
+  const profileReorder = useVaultItemReorder({
+    containerRef: listRef,
+    viewMode: proxyProfilesViewMode,
+    dragType: "proxy-profile-id",
+    targetAttribute: "data-proxy-profile-id",
+    disabled: search.trim().length > 0,
+    onReorder: (sourceId, targetId, position) => {
+      onUpdateProxyProfiles(reorderVaultItems(proxyProfiles, sourceId, targetId, position));
+    },
+  });
+
+  const updateDraftConfig = (field: keyof ProxyConfig, value: ProxyConfig[keyof ProxyConfig]) => {
     setDraft((prev) => {
       if (!prev) return prev;
       return {
         ...prev,
-        config: {
-          ...prev.config,
-          [field]: value,
-        },
+        config: updateProxyConfigField(prev.config, field, value),
       };
     });
   };
@@ -267,29 +365,21 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
 
   const saveDraft = () => {
     if (!draft) return;
-    const label = draft.label.trim();
-    const host = draft.config.host.trim();
-    if (!label || !host || !draft.config.port) {
-      toast.error(t("proxyProfiles.error.required"));
+    const result = prepareProxyProfileForSave(draft, identities);
+    if (!result.saved) {
+      const messageKey = result.error === "port"
+        ? "proxyProfiles.error.port"
+        : result.error === "missingIdentity"
+          ? "hostDetails.proxyPanel.missingIdentity"
+          : result.error === "incompleteIdentity"
+            ? "hostDetails.proxyPanel.incompleteIdentity"
+            : result.error === "unreadableIdentity"
+              ? "hostDetails.proxyPanel.unreadableIdentity"
+              : "proxyProfiles.error.required";
+      toast.error(t(messageKey));
       return;
     }
-    if (!isValidProxyPort(draft.config.port)) {
-      toast.error(t("proxyProfiles.error.port"));
-      return;
-    }
-
-    const saved: ProxyProfile = {
-      ...draft,
-      label,
-      config: {
-        ...draft.config,
-        host,
-        port: Number(draft.config.port),
-        username: draft.config.username?.trim() || undefined,
-        password: draft.config.password || undefined,
-      },
-      updatedAt: Date.now(),
-    };
+    const saved = result.saved;
 
     onUpdateProxyProfiles(
       proxyProfiles.some((profile) => profile.id === saved.id)
@@ -370,10 +460,17 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
             </div>
         </VaultPageHeader>
 
-        <div className="flex-1 overflow-y-auto">
+        <div
+          ref={listRef}
+          className="flex-1 overflow-y-auto"
+          onDragOverCapture={profileReorder.handleDragOverCapture}
+          onDragOver={profileReorder.handleDragOver}
+          onDropCapture={profileReorder.handleDropCapture}
+          onDragEndCapture={profileReorder.handleDragEndCapture}
+        >
           <div className="space-y-3 p-3">
             <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-muted-foreground">
+              <h2 className={vaultSectionTitleClass}>
                 {t("proxyProfiles.section.proxies")}
               </h2>
               <span className="text-xs text-muted-foreground">
@@ -412,6 +509,7 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
                     usageCount={usageByProfileId.get(profile.id) ?? 0}
                     viewMode={proxyProfilesViewMode}
                     isSelected={draft?.id === profile.id}
+                    reorderProps={profileReorder.getItemReorderProps(profile.id, `proxy:${profile.id}`)}
                     onClick={() => openEdit(profile)}
                     onEdit={() => openEdit(profile)}
                     onDuplicate={() => duplicateProfile(profile)}
@@ -446,56 +544,64 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
             </Card>
 
             <Card className="p-3 space-y-3 bg-card border-border/80">
-              <div className="flex items-center justify-between gap-3">
+              <div className="space-y-2">
                 <div className="flex items-center gap-2">
                   <Globe size={14} className="text-muted-foreground" />
                   <p className="text-xs font-semibold">{t("field.type")}</p>
                 </div>
-                <div className="flex gap-2">
-                  <Button
-                    variant={draft.config.type === "http" ? "secondary" : "ghost"}
-                    size="sm"
-                    className={cn("h-8", draft.config.type === "http" && "bg-primary/15")}
-                    onClick={() => updateDraftConfig("type", "http")}
-                  >
-                    <Check size={14} className={cn("mr-1", draft.config.type !== "http" && "opacity-0")} />
-                    HTTP
-                  </Button>
-                  <Button
-                    variant={draft.config.type === "socks5" ? "secondary" : "ghost"}
-                    size="sm"
-                    className={cn("h-8", draft.config.type === "socks5" && "bg-primary/15")}
-                    onClick={() => updateDraftConfig("type", "socks5")}
-                  >
-                    <Check size={14} className={cn("mr-1", draft.config.type !== "socks5" && "opacity-0")} />
-                    SOCKS5
-                  </Button>
-                </div>
+                <Select
+                  value={draft.config.type}
+                  onValueChange={(value) => updateDraftConfig("type", value as ProxyConfig["type"])}
+                >
+                  <SelectTrigger aria-label={t("field.type")} className="h-10">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="http">HTTP</SelectItem>
+                    <SelectItem value="socks5">SOCKS5</SelectItem>
+                    <SelectItem value="command">{t("hostDetails.proxyPanel.command")}</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
 
-              <div className="flex gap-2">
-                <Input
-                  aria-label={t("hostDetails.proxyPanel.hostPlaceholder")}
-                  value={draft.config.host}
-                  onChange={(event) => updateDraftConfig("host", event.target.value)}
-                  placeholder={t("hostDetails.proxyPanel.hostPlaceholder")}
-                  className="h-10 flex-1"
-                />
-                <Input
-                  aria-label={t("hostDetails.port")}
-                  type="number"
-                  value={draft.config.port || ""}
-                  onChange={(event) => updateDraftConfig("port", event.target.value === "" ? 0 : Number(event.target.value))}
-                  placeholder="3128"
-                  min={1}
-                  max={65535}
-                  step={1}
-                  className="h-10 w-24 text-center"
-                />
-              </div>
+              {isProxyCommandConfig(draft.config) ? (
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    {t("hostDetails.proxyPanel.commandHelp")}
+                  </p>
+                  <Input
+                    aria-label={t("hostDetails.proxyPanel.commandPlaceholder")}
+                    value={draft.config.command || ""}
+                    onChange={(event) => updateDraftConfig("command", event.target.value)}
+                    placeholder={t("hostDetails.proxyPanel.commandPlaceholder")}
+                    className="h-10 font-mono text-xs"
+                  />
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <Input
+                    aria-label={t("hostDetails.proxyPanel.hostPlaceholder")}
+                    value={draft.config.host}
+                    onChange={(event) => updateDraftConfig("host", event.target.value)}
+                    placeholder={t("hostDetails.proxyPanel.hostPlaceholder")}
+                    className="h-10 flex-1"
+                  />
+                  <Input
+                    aria-label={t("hostDetails.port")}
+                    type="number"
+                    value={draft.config.port || ""}
+                    onChange={(event) => updateDraftConfig("port", event.target.value === "" ? 0 : Number(event.target.value))}
+                    placeholder="3128"
+                    min={1}
+                    max={65535}
+                    step={1}
+                    className="h-10 w-24 text-center"
+                  />
+                </div>
+              )}
             </Card>
 
-            <Card className="p-3 space-y-3 bg-card border-border/80">
+            {!isProxyCommandConfig(draft.config) && <Card className="p-3 space-y-3 bg-card border-border/80">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <KeyRound size={14} className="text-muted-foreground" />
@@ -503,22 +609,91 @@ export const ProxyProfilesManager: React.FC<ProxyProfilesManagerProps> = ({
                 </div>
                 <Badge variant="secondary" className="text-xs">{t("common.optional")}</Badge>
               </div>
-              <Input
-                aria-label={t("hostDetails.proxyPanel.usernamePlaceholder")}
-                value={draft.config.username || ""}
-                onChange={(event) => updateDraftConfig("username", event.target.value)}
-                placeholder={t("hostDetails.proxyPanel.usernamePlaceholder")}
-                className="h-10"
-              />
-              <Input
-                aria-label={t("hostDetails.proxyPanel.passwordPlaceholder")}
-                type="password"
-                value={draft.config.password || ""}
-                onChange={(event) => updateDraftConfig("password", event.target.value)}
-                placeholder={t("hostDetails.proxyPanel.passwordPlaceholder")}
-                className="h-10"
-              />
-            </Card>
+              {identities.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    {t("hostDetails.proxyPanel.keychainIdentity")}
+                  </p>
+                  <Select
+                    value={selectedDraftIdentityValue}
+                    onValueChange={(value) => {
+                      if (value === missingIdentityValue) return;
+                      updateDraftConfig(
+                        "identityId",
+                        value === manualCredentialsValue ? undefined : value,
+                      );
+                    }}
+                  >
+                    <SelectTrigger
+                      aria-label={t("hostDetails.proxyPanel.keychainIdentity")}
+                      className="h-10"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={manualCredentialsValue}>
+                        {t("hostDetails.proxyPanel.manualCredentials")}
+                      </SelectItem>
+                      {hasMissingDraftIdentity && (
+                        <SelectItem value={missingIdentityValue}>
+                          {t("hostDetails.proxyPanel.missingIdentity")}
+                        </SelectItem>
+                      )}
+                      {identities.map((identity) => (
+                        <SelectItem key={identity.id} value={identity.id}>
+                          {identity.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              {hasMissingDraftIdentity && (
+                <div className="min-w-0 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+                  {t("hostDetails.proxyPanel.missingIdentity")}
+                </div>
+              )}
+              {hasIncompleteDraftIdentity && (
+                <div className="min-w-0 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+                  {t("hostDetails.proxyPanel.incompleteIdentity")}
+                </div>
+              )}
+              {hasUnreadableDraftIdentity && (
+                <div className="min-w-0 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+                  {t("hostDetails.proxyPanel.unreadableIdentity")}
+                </div>
+              )}
+              {selectedDraftIdentity ? (
+                <div className="min-w-0 rounded-md bg-secondary/50 p-2 text-sm">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Badge variant="secondary" className="text-xs shrink-0">
+                      {t("hostDetails.proxyPanel.keychainIdentity")}
+                    </Badge>
+                    <span className="truncate">
+                      {selectedDraftIdentity.label} - {selectedDraftIdentity.username}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <Input
+                    aria-label={t("hostDetails.proxyPanel.usernamePlaceholder")}
+                    value={draft.config.username || ""}
+                    onChange={(event) => updateDraftConfig("username", event.target.value)}
+                    placeholder={t("hostDetails.proxyPanel.usernamePlaceholder")}
+                    className="h-10"
+                  />
+                  <Input
+                    aria-label={t("hostDetails.proxyPanel.passwordPlaceholder")}
+                    type="password"
+                    value={draft.config.password || ""}
+                    onChange={(event) => updateDraftConfig("password", event.target.value)}
+                    placeholder={t("hostDetails.proxyPanel.passwordPlaceholder")}
+                    className="h-10"
+                  />
+                </>
+              )}
+            </Card>}
           </AsidePanelContent>
           <AsidePanelFooter>
             <Button className="w-full" onClick={saveDraft}>

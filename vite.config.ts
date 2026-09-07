@@ -1,7 +1,7 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 
 // Custom plugin to suppress monaco-editor source map warnings
 const suppressMonacoSourcemapWarning = () => ({
@@ -15,6 +15,53 @@ const suppressMonacoSourcemapWarning = () => ({
       if (msg.includes('loader.js.map')) return;
       originalWarn(msg, options);
     };
+  },
+});
+
+const devContentSecurityPolicy = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'",
+  "worker-src 'self' blob:",
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:",
+  "connect-src 'self' data: blob: ws: wss: https: http://localhost:5173",
+  "img-src 'self' data: https:",
+].join("; ");
+
+const devContentSecurityPolicyPlugin = () => ({
+  name: 'dev-content-security-policy',
+  apply: 'serve' as const,
+  transformIndexHtml(html: string) {
+    return html.replace(
+      /content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' data: blob: ws: wss: https:; img-src 'self' data: https:;"/,
+      `content="${devContentSecurityPolicy}"`,
+    );
+  },
+});
+
+/**
+ * Stale pre-bundles return 504 after git pull / npm install. Vite retries the
+ * module once optimize finishes — do not full-reload the Electron window.
+ * Opening the lazy AI panel pulls `ai` / streamdown; a 504 there used to flash
+ * the boot splash and wipe renderer state.
+ */
+const warnOnOutdatedOptimizeDep = (): Plugin => ({
+  name: 'warn-on-outdated-optimize-dep',
+  apply: 'serve',
+  configureServer(server) {
+    server.middlewares.use((req, res, next) => {
+      res.on('finish', () => {
+        if (
+          res.statusCode === 504
+          && req.url?.includes('/node_modules/.vite/deps/')
+        ) {
+          server.config.logger.warn(
+            `[vite] stale optimize dep 504 for ${req.url} (not reloading the app)`,
+          );
+        }
+      });
+      next();
+    });
   },
 });
 
@@ -51,12 +98,12 @@ export default defineConfig(() => {
                 '@radix-ui/react-popover',
                 '@radix-ui/react-scroll-area',
                 '@radix-ui/react-select',
-                '@radix-ui/react-slot',
                 '@radix-ui/react-tabs',
               ],
               'vendor-xterm': [
                 '@xterm/xterm',
                 '@xterm/addon-fit',
+                '@xterm/addon-image',
                 '@xterm/addon-search',
                 '@xterm/addon-serialize',
                 '@xterm/addon-web-links',
@@ -73,7 +120,19 @@ export default defineConfig(() => {
           },
         },
       },
-      plugins: [suppressMonacoSourcemapWarning(), tailwindcss(), react()],
+      plugins: [suppressMonacoSourcemapWarning(), devContentSecurityPolicyPlugin(), warnOnOutdatedOptimizeDep(), tailwindcss(), react()],
+      optimizeDeps: {
+        include: [
+          'ai',
+          '@ai-sdk/openai',
+          '@ai-sdk/anthropic',
+          '@ai-sdk/google',
+          'streamdown',
+          '@streamdown/cjk',
+          '@streamdown/code',
+          'zod',
+        ],
+      },
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),

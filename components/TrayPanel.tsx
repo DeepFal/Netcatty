@@ -8,14 +8,17 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { cn } from "../lib/utils";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { I18nProvider } from "../application/i18n/I18nProvider";
-import { useSettingsState } from "../application/state/useSettingsState";
 import { useTrayPanelBackend } from "../application/state/useTrayPanelBackend";
 import { useActiveTabId } from "../application/state/activeTabStore";
 import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig";
 import { materializeHostProxyProfile } from "../domain/proxyProfiles";
-import type { Host } from "../domain/models";
+import { upsertKnownHost } from "../domain/knownHosts";
+import type { Host, KnownHost } from "../domain/models";
+import { getEffectiveKnownHosts } from "../infrastructure/syncHelpers";
+import { PortForwardHostKeyTrayPrompt } from "./port-forwarding";
 import { X, Maximize2, ChevronRight, ChevronDown, Power } from "lucide-react";
 import { AppLogo } from "./AppLogo";
+import type { AppLockGateRenderContext } from "./AppLockGate";
 
 const StatusDot: React.FC<{ status: "success" | "warning" | "error" | "neutral"; spinning?: boolean }> = ({
   status,
@@ -49,6 +52,8 @@ type TraySession = {
   status: "connecting" | "connected" | "disconnected";
   workspaceId?: string;
   workspaceTitle?: string;
+  /** Mirrors TerminalSession.hiddenFromTabs; marks AI-opened silent sessions. */
+  aiHidden?: boolean;
 };
 
 // Collapsible workspace group component
@@ -58,8 +63,9 @@ const WorkspaceGroup: React.FC<{
   sessions: TraySession[];
   activeTabId: string | null;
   jumpToSession: (sessionId: string) => Promise<void>;
+  onCloseSession: (sessionId: string) => void;
   t: (key: string) => string;
-}> = ({ workspaceId, title, sessions, activeTabId, jumpToSession, t }) => {
+}> = ({ workspaceId, title, sessions, activeTabId, jumpToSession, onCloseSession, t }) => {
   const [expanded, setExpanded] = useState(true);
   const isAnyActive = sessions.some((s) => s.id === activeTabId) || activeTabId === workspaceId;
 
@@ -81,26 +87,45 @@ const WorkspaceGroup: React.FC<{
           {sessions.map((s) => (
             <Tooltip key={s.id}>
               <TooltipTrigger asChild>
-                <button
-                  onClick={() => {
-                    // Jump to session (using session id)
-                    void jumpToSession(s.id);
-                  }}
+                <div
                   className={cn(
-                    "w-full text-left px-2 py-1 rounded hover:bg-muted flex items-center justify-between text-sm",
+                    "group w-full rounded hover:bg-muted flex items-center justify-between text-sm",
                     s.status === "connected" ? "" : "text-muted-foreground",
                     activeTabId === s.id ? "bg-muted/60" : "",
                   )}
                 >
-                  <span className="flex items-center gap-2 min-w-0">
-                    <StatusDot
-                      status={s.status === "connected" ? "success" : s.status === "connecting" ? "warning" : "error"}
-                      spinning={s.status === "connecting"}
-                    />
-                    <span className="truncate">{s.hostLabel || s.label}</span>
-                  </span>
-                  <span className="ml-2 text-xs text-muted-foreground">{t(`tray.status.${s.status}`)}</span>
-                </button>
+                  <button
+                    onClick={() => {
+                      // Jump to session (using session id)
+                      void jumpToSession(s.id);
+                    }}
+                    className="flex-1 min-w-0 text-left px-2 py-1 flex items-center justify-between gap-1"
+                  >
+                    <span className="flex items-center gap-2 min-w-0">
+                      <StatusDot
+                        status={s.status === "connected" ? "success" : s.status === "connecting" ? "warning" : "error"}
+                        spinning={s.status === "connecting"}
+                      />
+                      <span className="truncate">{s.hostLabel || s.label}</span>
+                      {s.aiHidden && (
+                        <span className="shrink-0 rounded px-1 py-0.5 text-[10px] font-medium leading-none bg-muted text-muted-foreground">
+                          AI
+                        </span>
+                      )}
+                    </span>
+                    <span className="ml-2 text-xs text-muted-foreground">{t(`tray.status.${s.status}`)}</span>
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseSession(s.id);
+                    }}
+                    className="shrink-0 mr-1 h-6 w-6 rounded inline-flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100 hover:bg-destructive/10 hover:text-destructive text-muted-foreground transition-opacity focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    aria-label={t("tray.closeSession")}
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
               </TooltipTrigger>
               <TooltipContent>{s.hostLabel || s.label}</TooltipContent>
             </Tooltip>
@@ -112,7 +137,7 @@ const WorkspaceGroup: React.FC<{
 };
 
 interface TrayPanelContentProps {
-  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
+  terminalSettings?: { verifyHostKeys: boolean; keepaliveInterval: number; keepaliveCountMax: number };
 }
 
 const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings }) => {
@@ -122,19 +147,41 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
     openMainWindow,
     quitApp,
     jumpToSession,
+    closeSessionFromTrayPanel,
     onTrayPanelCloseRequest,
     onTrayPanelRefresh,
     onTrayPanelMenuData,
   } = useTrayPanelBackend();
 
-  const { hosts, keys, identities, proxyProfiles, groupConfigs } = useVaultState();
-  useSessionState();
-  const { rules: portForwardingRules, startTunnel, stopTunnel } = usePortForwardingState();
+  const { hosts, keys, identities, proxyProfiles, groupConfigs, knownHosts, updateKnownHosts } = useVaultState();
+  // TrayPanel runs in its own BrowserWindow, so this hook's session state is
+  // independent from (and typically empty compared to) the main App's — it's
+  // used here only for its storage-sync side effects, never for closeSession.
+  useSessionState({ persistSessionRestore: false });
+  const {
+    rules: portForwardingRules,
+    startTunnel,
+    stopTunnel,
+    hasRuntimeTunnel,
+  } = usePortForwardingState();
   const activeTabId = useActiveTabId();
   const proxyProfileIdSet = useMemo(
     () => new Set(proxyProfiles.map((profile) => profile.id)),
     [proxyProfiles],
   );
+  const effectiveKnownHosts = useMemo(
+    () => getEffectiveKnownHosts(knownHosts) ?? [],
+    [knownHosts],
+  );
+  const handleAddKnownHost = useCallback((knownHost: KnownHost) => {
+    updateKnownHosts(upsertKnownHost(effectiveKnownHosts, knownHost));
+  }, [effectiveKnownHosts, updateKnownHosts]);
+
+  const handleCloseSession = useCallback((sessionId: string) => {
+    // Forwarded to the main window's App-owned closeSession, which is the
+    // instance that actually owns `sessions` and republishes tray menu data.
+    void closeSessionFromTrayPanel(sessionId);
+  }, [closeSessionFromTrayPanel]);
 
   const [traySessions, setTraySessions] = useState<TraySession[]>([]);
 
@@ -190,6 +237,12 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
       if (target instanceof HTMLElement && target.closest("button,a,input,select,textarea,[role='button']")) {
         return;
       }
+      if (
+        target instanceof HTMLElement &&
+        target.closest("[data-port-forward-host-key-dialog='true'],[data-port-forward-host-key-tray-prompt='true'],.port-forward-host-key-dialog-layer")
+      ) {
+        return;
+      }
       // Clicking on background should close panel
       const root = document.getElementById("tray-panel-root");
       if (root && !root.contains(target)) {
@@ -216,7 +269,8 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
   }, [quitApp]);
 
   return (
-    <div id="tray-panel-root" className="w-full h-full bg-background/95 supports-[backdrop-filter]:backdrop-blur-sm border border-border/60 rounded-lg shadow-lg overflow-hidden flex flex-col">
+    <>
+      <div id="tray-panel-root" className="w-full h-full bg-background/95 supports-[backdrop-filter]:backdrop-blur-sm border border-border/60 rounded-lg overflow-hidden flex flex-col">
       <div className="px-3 py-2 border-b border-border/60 flex items-center justify-between app-no-drag">
         <div className="flex items-center gap-2">
           <AppLogo className="w-5 h-5" />
@@ -243,8 +297,9 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
         </div>
       </div>
 
-      <div className="p-2 space-y-3 text-sm flex-1 overflow-y-auto min-h-0">
+      <PortForwardHostKeyTrayPrompt onAddKnownHost={handleAddKnownHost} />
 
+      <div className="p-2 space-y-3 text-sm flex-1 overflow-y-auto min-h-0">
         {jumpableSessions.length > 0 && (() => {
           // Group sessions by workspace
           const workspaceGroups = new Map<string, { title: string; sessions: typeof jumpableSessions }>();
@@ -279,6 +334,7 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
                     sessions={group.sessions}
                     activeTabId={activeTabId}
                     jumpToSession={jumpToSession}
+                    onCloseSession={handleCloseSession}
                     t={t}
                   />
                 ))}
@@ -286,25 +342,44 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
                 {soloSessions.map((s) => (
                   <Tooltip key={s.id}>
                     <TooltipTrigger asChild>
-                      <button
-                        onClick={() => {
-                          void jumpToSession(s.id);
-                        }}
+                      <div
                         className={cn(
-                          "w-full text-left px-2 py-1.5 rounded hover:bg-muted flex items-center justify-between",
+                          "group w-full rounded hover:bg-muted flex items-center justify-between",
                           s.status === "connected" ? "" : "text-muted-foreground",
                           activeTabId === s.id ? "bg-muted" : "",
                         )}
                       >
-                        <span className="flex items-center gap-2 min-w-0">
-                          <StatusDot
-                            status={s.status === "connected" ? "success" : s.status === "connecting" ? "warning" : "error"}
-                            spinning={s.status === "connecting"}
-                          />
-                          <span className="truncate">{s.hostLabel || s.label}</span>
-                        </span>
-                        <span className="ml-2 text-xs text-muted-foreground">{t(`tray.status.${s.status}`)}</span>
-                      </button>
+                        <button
+                          onClick={() => {
+                            void jumpToSession(s.id);
+                          }}
+                          className="flex-1 min-w-0 text-left px-2 py-1.5 flex items-center justify-between gap-1"
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <StatusDot
+                              status={s.status === "connected" ? "success" : s.status === "connecting" ? "warning" : "error"}
+                              spinning={s.status === "connecting"}
+                            />
+                            <span className="truncate">{s.hostLabel || s.label}</span>
+                            {s.aiHidden && (
+                              <span className="shrink-0 rounded px-1 py-0.5 text-[10px] font-medium leading-none bg-muted text-muted-foreground">
+                                AI
+                              </span>
+                            )}
+                          </span>
+                          <span className="ml-2 text-xs text-muted-foreground">{t(`tray.status.${s.status}`)}</span>
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleCloseSession(s.id);
+                          }}
+                          className="shrink-0 mr-1.5 h-6 w-6 rounded inline-flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100 hover:bg-destructive/10 hover:text-destructive text-muted-foreground transition-opacity focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          aria-label={t("tray.closeSession")}
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
                     </TooltipTrigger>
                     <TooltipContent>{s.hostLabel || s.label}</TooltipContent>
                   </Tooltip>
@@ -339,8 +414,15 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
             <div className="px-2 py-1 text-xs text-muted-foreground">{t("tray.portForwarding")}</div>
             <div className="space-y-1">
               {portForwardingRules.map((rule) => {
+                const isUnknown = rule.status === "unknown";
                 const isConnecting = rule.status === "connecting";
                 const isActive = rule.status === "active";
+                // unknown/stale: neither Start nor Stop until authority recovers,
+                // unless this window already holds a live runtime tunnel.
+                const isStoppable = !isUnknown && (
+                  isConnecting || isActive || hasRuntimeTunnel(rule.id)
+                );
+                const isActionDisabled = isConnecting || (isUnknown && !hasRuntimeTunnel(rule.id));
                 const label = rule.label || (rule.type === "dynamic"
                   ? `SOCKS:${rule.localPort}`
                   : `${rule.localPort} → ${rule.remoteHost}:${rule.remotePort}`);
@@ -349,15 +431,18 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
                   <Tooltip key={rule.id}>
                     <TooltipTrigger asChild>
                       <button
-                        disabled={isConnecting}
+                        disabled={isActionDisabled}
                         onClick={() => {
+                          if (isUnknown && !hasRuntimeTunnel(rule.id)) return;
                           const rawHost = rule.hostId ? hosts.find((h) => h.id === rule.hostId) : undefined;
                           if (!rawHost) {
                             toast.error(t("pf.error.hostNotFound"));
                             return;
                           }
-                          if (isActive) {
-                            void stopTunnel(rule.id);
+                          if (isStoppable) {
+                            void stopTunnel(rule.id).then((result) => {
+                              if (!result.success && result.error) toast.error(result.error);
+                            });
                           } else {
                             const resolveEffectiveHost = (host: Host) => {
                               const withGroupDefaults = host.group
@@ -368,12 +453,12 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
                             const host = resolveEffectiveHost(rawHost);
                             void startTunnel(rule, host, hosts.map(resolveEffectiveHost), keys, identities, (status, error) => {
                               if (status === "error" && error) toast.error(error);
-                            }, rule.autoStart, terminalSettings);
+                            }, rule.autoStart, terminalSettings, effectiveKnownHosts);
                           }
                         }}
                         className={cn(
                           "w-full text-left px-2 py-1.5 rounded hover:bg-muted flex items-center justify-between",
-                          isConnecting ? "opacity-60" : "",
+                          isActionDisabled ? "opacity-60" : "",
                         )}
                       >
                         <span className="flex items-center gap-2 min-w-0">
@@ -381,13 +466,13 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
                             status={
                               rule.status === "active"
                                 ? "success"
-                                : rule.status === "connecting"
+                                : rule.status === "connecting" || rule.status === "unknown"
                                   ? "warning"
                                   : rule.status === "error"
                                     ? "error"
                                     : "neutral"
                             }
-                            spinning={rule.status === "connecting"}
+                            spinning={rule.status === "connecting" || rule.status === "unknown"}
                           />
                           <span className="truncate">{label}</span>
                         </span>
@@ -424,12 +509,14 @@ const TrayPanelContent: React.FC<TrayPanelContentProps> = ({ terminalSettings })
           <span>{t("tray.quit")}</span>
         </button>
       </div>
-    </div>
+      </div>
+    </>
   );
 };
 
-const TrayPanel: React.FC = () => {
-  const settings = useSettingsState();
+type SettingsState = AppLockGateRenderContext["settings"];
+
+const TrayPanel: React.FC<{ settings: SettingsState }> = ({ settings }) => {
   return (
     <I18nProvider locale={settings.uiLanguage}>
       <TrayPanelContent terminalSettings={settings.terminalSettings} />

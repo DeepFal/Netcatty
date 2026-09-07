@@ -6,6 +6,7 @@
 
 import type { CompletionContext } from "./completionEngine";
 import type { FigArg } from "./figSpecLoader";
+import type { AutocompleteCwdSource } from "./terminalAutocompleteLayout";
 
 /** Directory entry returned from IPC */
 export interface DirEntry {
@@ -201,12 +202,13 @@ export async function getPathSuggestions(
     protocol?: string;
     os?: "linux" | "windows" | "macos";
     cwd?: string;
+    cwdSource?: AutocompleteCwdSource;
     foldersOnly: boolean;
   },
 ): Promise<{ name: string; type: DirEntry["type"] }[]> {
-  const { sessionId, protocol, os, cwd, foldersOnly } = options;
+  const { sessionId, protocol, os, cwd, cwdSource, foldersOnly } = options;
   const { dirToList, filterPrefix } = resolvePathComponents(ctx.currentWord, cwd, {
-    preferRelativeCwd: shouldUseRemoteShellCwd(protocol, sessionId, os),
+    preferRelativeCwd: shouldPreferRemoteShellCwd(protocol, sessionId, os, cwd, cwdSource),
   });
 
   const entries = await listDirectoryEntries(dirToList, {
@@ -249,8 +251,13 @@ export async function listDirectoryEntries(
   const fullCacheKey = `${baseKey}:all`;
   const filteredCacheKey = `${baseKey}:prefix:${normalizedPrefix}:${maxEntries}`;
   const bypassCache = shouldBypassCache(protocol, sessionId, os, dirPath);
+  const requestKey = normalizedPrefix ? filteredCacheKey : fullCacheKey;
 
   // Full directory cache can satisfy both full and filtered lookups.
+  // Relative SSH cwd paths bypass durable cache and in-flight reuse: the shell
+  // cwd can move, so a listing started for "." in directory A must not satisfy
+  // a later lookup after cd into B. Soft-budget timeout + late refresh already
+  // share one promise at the getCompletions call site.
   if (!bypassCache) {
     const fullCached = fullDirCache.get(fullCacheKey);
     if (isFresh(fullCached)) {
@@ -269,11 +276,9 @@ export async function listDirectoryEntries(
       return filterEntries(await inFlightFull, normalizedPrefix, maxEntries);
     }
 
-    const inFlight = inFlightRequests.get(normalizedPrefix ? filteredCacheKey : fullCacheKey);
+    const inFlight = inFlightRequests.get(requestKey);
     if (inFlight) return inFlight;
   }
-
-  const requestKey = normalizedPrefix ? filteredCacheKey : fullCacheKey;
 
   // Make IPC call
   const promise = (async (): Promise<DirEntry[]> => {
@@ -348,11 +353,14 @@ function resolveDirLookup(pathToken: string, cwd: string | undefined, preferRela
   return normalizePosixLikePath(pathToken);
 }
 
-function shouldUseRemoteShellCwd(
+export function shouldPreferRemoteShellCwd(
   protocol: string | undefined,
   sessionId: string | undefined,
   os?: "linux" | "windows" | "macos",
+  cwd?: string,
+  cwdSource?: AutocompleteCwdSource,
 ): boolean {
+  if (cwdSource === "prompt" && cwd?.startsWith("/")) return false;
   return Boolean(sessionId && protocol !== "local" && os === "linux");
 }
 
@@ -362,7 +370,7 @@ function shouldBypassCache(
   os: "linux" | "windows" | "macos" | undefined,
   dirPath: string,
 ): boolean {
-  if (!shouldUseRemoteShellCwd(protocol, sessionId, os)) return false;
+  if (!shouldPreferRemoteShellCwd(protocol, sessionId, os)) return false;
   return !dirPath.startsWith("/") && dirPath !== "~" && !dirPath.startsWith("~/");
 }
 

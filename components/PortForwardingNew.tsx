@@ -1,20 +1,24 @@
 import {
-  AlertTriangle,
   Check,
   ChevronDown,
   Globe,
   LayoutGrid,
   List as ListIcon,
+  Loader2,
+  Play,
   Server,
   Shuffle,
+  Square,
   Zap,
 } from "lucide-react";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { usePortForwardingState } from "../application/state/usePortForwardingState";
+import { STORAGE_KEY_PORT_FORWARDING_PANEL_WIDTH } from "../infrastructure/config/storageKeys";
 import {
   GroupConfig,
   Host,
+  KnownHost,
   ManagedSource,
   PortForwardingRule,
   PortForwardingType,
@@ -22,6 +26,10 @@ import {
   SSHKey,
 } from "../domain/models";
 import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig";
+import {
+  isPortForwardingRuleStartable,
+  isPortForwardingRuleStoppable,
+} from "../domain/portForwardingBulkActions";
 import { materializeHostProxyProfile } from "../domain/proxyProfiles";
 import { cn } from "../lib/utils";
 import SelectHostPanel from "./SelectHostPanel";
@@ -31,15 +39,8 @@ import {
   AsidePanelFooter,
 } from "./ui/aside-panel";
 import { Button } from "./ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "./ui/dialog";
 import { Dropdown, DropdownContent, DropdownTrigger } from "./ui/dropdown";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { SortDropdown } from "./ui/sort-dropdown";
 import { toast } from "./ui/toast";
 import {
@@ -47,7 +48,10 @@ import {
   VaultPageHeader,
   vaultHeaderIconButtonClass,
   vaultHeaderSecondaryButtonClass,
+  vaultSectionTitleClass,
 } from "./vault/VaultPageHeader";
+import { VaultDeleteConfirmDialog } from "./vault/VaultDeleteConfirmDialog";
+import { useVaultItemReorder } from "./vault/vaultReorderDrag";
 
 // Import components and utilities from port-forwarding module
 import {
@@ -56,6 +60,7 @@ import {
   getTypeMenuLabel,
   NewFormPanel,
   RuleCard,
+  stopRuntimeTunnelBeforeDelete,
   WizardContent,
 } from "./port-forwarding";
 
@@ -73,6 +78,7 @@ interface PortForwardingProps {
   keys: SSHKey[];
   identities?: import('../domain/models').Identity[];
   customGroups: string[];
+  knownHosts?: KnownHost[];
   managedSources?: ManagedSource[];
   groupConfigs?: GroupConfig[];
   proxyProfiles?: ProxyProfile[];
@@ -87,6 +93,7 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
   keys,
   identities = [],
   customGroups: _customGroups,
+  knownHosts = [],
   managedSources = [],
   groupConfigs = [],
   proxyProfiles = [],
@@ -96,8 +103,13 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
   terminalSettings,
 }) => {
   const { t } = useI18n();
+  const portForwardingPanelResizeProps = {
+    resizable: true as const,
+    persistWidthStorageKey: STORAGE_KEY_PORT_FORWARDING_PANEL_WIDTH,
+    resizeAriaLabel: t("vault.panel.resizeWidth"),
+  };
   const {
-    rules: _rules,
+    rules,
     selectedRuleId,
     viewMode,
     sortMode,
@@ -110,9 +122,14 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
     updateRule,
     deleteRule,
     duplicateRule,
+    reorderRule,
     setRuleStatus,
     startTunnel,
     stopTunnel,
+    startAllTunnels,
+    stopAllTunnels,
+    hasRuntimeTunnel,
+    hasAnyRuntimeTunnel,
     filteredRules,
     selectedRule: _selectedRule,
     preferFormMode,
@@ -123,10 +140,25 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
   const [pendingOperations, setPendingOperations] = useState<Set<string>>(
     new Set(),
   );
+  const [bulkAction, setBulkAction] = useState<"start" | "stop" | null>(null);
   const proxyProfileIdSet = useMemo(
     () => new Set(proxyProfiles.map((profile) => profile.id)),
     [proxyProfiles],
   );
+  const hostById = useMemo(
+    () => new Map(hosts.map((host) => [host.id, host])),
+    [hosts],
+  );
+  const ruleListRef = useRef<HTMLDivElement | null>(null);
+
+  const ruleReorder = useVaultItemReorder({
+    containerRef: ruleListRef,
+    viewMode,
+    dragType: "rule-id",
+    targetAttribute: "data-rule-id",
+    disabled: search.trim().length > 0,
+    onReorder: reorderRule,
+  });
 
   const resolveEffectiveHost = useCallback(
     (host: Host): Host => {
@@ -141,7 +173,8 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
   // Start a port forwarding tunnel
   const handleStartTunnel = useCallback(
     async (rule: PortForwardingRule) => {
-      const _rawHost = hosts.find((h) => h.id === rule.hostId);
+      if (bulkAction) return;
+      const _rawHost = hostById.get(rule.hostId);
       if (!_rawHost) {
         setRuleStatus(rule.id, "error", t("pf.error.hostNotFound"));
         toast.error(
@@ -176,6 +209,7 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
           },
           rule.autoStart, // Enable reconnect for auto-start rules
           terminalSettings,
+          knownHosts,
         );
         // Show error from result only if not already shown
         if (!result.success && result.error && !errorShown) {
@@ -193,16 +227,23 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
         });
       }
     },
-    [hosts, identities, keys, resolveEffectiveHost, setRuleStatus, startTunnel, t, terminalSettings],
+    [bulkAction, hostById, hosts, identities, keys, knownHosts, resolveEffectiveHost, setRuleStatus, startTunnel, t, terminalSettings],
   );
 
   // Stop a port forwarding tunnel
   const handleStopTunnel = useCallback(
     async (rule: PortForwardingRule) => {
+      if (bulkAction) return;
       setPendingOperations((prev) => new Set([...prev, rule.id]));
 
       try {
-        await stopTunnel(rule.id);
+        const result = await stopTunnel(rule.id);
+        if (!result.success && result.error) {
+          toast.error(
+            result.error,
+            t("pf.toast.titleWithLabel", { label: rule.label }),
+          );
+        }
       } finally {
         setPendingOperations((prev) => {
           const next = new Set(prev);
@@ -211,8 +252,116 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
         });
       }
     },
-    [stopTunnel],
+    [bulkAction, stopTunnel, t],
   );
+
+  const startableRules = useMemo(
+    () => rules.filter((rule) => isPortForwardingRuleStartable(rule, hasRuntimeTunnel(rule.id))),
+    [hasRuntimeTunnel, rules],
+  );
+  const stoppableRules = useMemo(
+    () => rules.filter((rule) => isPortForwardingRuleStoppable(rule, hasRuntimeTunnel(rule.id))),
+    [hasRuntimeTunnel, rules],
+  );
+  const hasAnyStoppableRuntime = hasAnyRuntimeTunnel();
+
+  const handleStartAll = useCallback(async () => {
+    if (bulkAction || startableRules.length === 0) return;
+    setBulkAction("start");
+    setPendingOperations((prev) => {
+      const next = new Set(prev);
+      for (const rule of startableRules) next.add(rule.id);
+      return next;
+    });
+    try {
+      const effectiveHosts = hosts.map((host) => resolveEffectiveHost(host));
+      const result = await startAllTunnels(
+        rules,
+        (rule) => {
+          const rawHost = rule.hostId ? hostById.get(rule.hostId) : undefined;
+          return rawHost ? resolveEffectiveHost(rawHost) : undefined;
+        },
+        effectiveHosts,
+        keys,
+        identities,
+        terminalSettings,
+        knownHosts,
+        t("pf.error.hostNotFound"),
+      );
+      if (result.failed > 0 && result.started > 0) {
+        toast.warning(
+          t("pf.toast.startAll.partial", { started: result.started, failed: result.failed }),
+          t("pf.action.startAll"),
+        );
+      } else if (result.failed > 0) {
+        toast.error(
+          t("pf.toast.startAll.failed", { count: result.failed }),
+          t("pf.action.startAll"),
+        );
+      } else if (result.started > 0) {
+        toast.success(
+          t("pf.toast.startAll.success", { count: result.started }),
+          t("pf.action.startAll"),
+        );
+      }
+    } finally {
+      setPendingOperations((prev) => {
+        const next = new Set(prev);
+        for (const rule of startableRules) next.delete(rule.id);
+        return next;
+      });
+      setBulkAction(null);
+    }
+  }, [
+    bulkAction,
+    hostById,
+    hosts,
+    identities,
+    keys,
+    knownHosts,
+    resolveEffectiveHost,
+    rules,
+    startAllTunnels,
+    startableRules,
+    t,
+    terminalSettings,
+  ]);
+
+  const handleStopAll = useCallback(async () => {
+    if (bulkAction || (stoppableRules.length === 0 && !hasAnyRuntimeTunnel())) return;
+    setBulkAction("stop");
+    setPendingOperations((prev) => {
+      const next = new Set(prev);
+      for (const rule of stoppableRules) next.add(rule.id);
+      return next;
+    });
+    try {
+      const result = await stopAllTunnels(rules);
+      if (result.failed > 0 && result.stopped > 0) {
+        toast.warning(
+          t("pf.toast.stopAll.partial", { stopped: result.stopped, failed: result.failed }),
+          t("pf.action.stopAll"),
+        );
+      } else if (result.failed > 0) {
+        toast.error(
+          t("pf.toast.stopAll.failed", { count: result.failed }),
+          t("pf.action.stopAll"),
+        );
+      } else if (result.stopped > 0) {
+        toast.success(
+          t("pf.toast.stopAll.success", { count: result.stopped }),
+          t("pf.action.stopAll"),
+        );
+      }
+    } finally {
+      setPendingOperations((prev) => {
+        const next = new Set(prev);
+        for (const rule of stoppableRules) next.delete(rule.id);
+        return next;
+      });
+      setBulkAction(null);
+    }
+  }, [bulkAction, hasAnyRuntimeTunnel, rules, stopAllTunnels, stoppableRules, t]);
 
   // Wizard state
   const [showWizard, setShowWizard] = useState(false);
@@ -291,6 +440,12 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
   // Start new rule - wizard or form based on user preference
   const startNewRule = (type: PortForwardingType) => {
     setShowNewMenu(false);
+    // The new-rule flow replaces an open editor; never leave both side panels mounted.
+    setShowEditPanel(false);
+    setEditingRule(null);
+    setEditDraft({});
+    setSelectedRuleId(null);
+    setShowHostSelector(false);
 
     if (preferFormMode) {
       // Form mode: show all-in-one form
@@ -415,33 +570,26 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
     setSelectedRuleId(null);
   }, [setSelectedRuleId]);
 
-  // Handle delete with confirmation for active tunnels
+  // Handle delete with confirmation
   const handleDeleteRule = useCallback(
     (rule: PortForwardingRule) => {
-      // If tunnel is active or connecting, show confirmation dialog
-      if (rule.status === "active" || rule.status === "connecting") {
-        setRuleToDelete(rule);
-        setShowDeleteConfirm(true);
-      } else {
-        // If inactive, delete directly
-        if (editingRule?.id === rule.id) {
-          closeEditPanel();
-        }
-        deleteRule(rule.id);
-      }
+      setRuleToDelete(rule);
+      setShowDeleteConfirm(true);
     },
-    [editingRule, deleteRule, closeEditPanel],
+    [],
   );
 
-  // Confirm delete of active tunnel: stop first, then delete
-  const confirmDeleteActiveRule = useCallback(async () => {
+  // Confirm delete; active tunnels are stopped first.
+  const confirmDeleteRule = useCallback(async () => {
     if (!ruleToDelete) return;
 
     setIsDeleting(true);
     try {
-      // Stop the tunnel first
-      await stopTunnel(ruleToDelete.id);
-      // Then delete the rule
+      const stopped = await stopRuntimeTunnelBeforeDelete(
+        ruleToDelete.id,
+        stopTunnel,
+      );
+      if (!stopped) return;
       if (editingRule?.id === ruleToDelete.id) {
         closeEditPanel();
       }
@@ -452,6 +600,10 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
       setRuleToDelete(null);
     }
   }, [ruleToDelete, stopTunnel, deleteRule, editingRule, closeEditPanel]);
+
+  const deleteTargetIsActive = Boolean(
+    ruleToDelete && hasRuntimeTunnel(ruleToDelete.id),
+  );
 
   // Handle wizard navigation
   // Flow for local: type -> local-config -> destination -> host-selection
@@ -586,8 +738,7 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
       {/* Main Content */}
       <div
         className={cn(
-          "flex-1 flex flex-col min-h-0",
-          showWizard || showEditPanel || showNewForm ? "mr-[360px]" : "",
+          "flex-1 min-w-0 flex flex-col min-h-0",
         )}
       >
         <VaultPageHeader className="z-20">
@@ -636,6 +787,46 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
             </DropdownContent>
           </Dropdown>
 
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="secondary"
+                className={vaultHeaderSecondaryButtonClass}
+                onClick={() => { void handleStartAll(); }}
+                disabled={bulkAction !== null || startableRules.length === 0}
+                aria-label={t("pf.action.startAll")}
+              >
+                {bulkAction === "start" ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Play size={14} />
+                )}
+                {t("pf.action.startAll")}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("pf.action.startAll")}</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="secondary"
+                className={vaultHeaderSecondaryButtonClass}
+                onClick={() => { void handleStopAll(); }}
+                disabled={bulkAction !== null || (stoppableRules.length === 0 && !hasAnyStoppableRuntime)}
+                aria-label={t("pf.action.stopAll")}
+              >
+                {bulkAction === "stop" ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Square size={14} />
+                )}
+                {t("pf.action.stopAll")}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("pf.action.stopAll")}</TooltipContent>
+          </Tooltip>
+
           <div className="ml-auto flex items-center gap-2">
             <VaultHeaderSearch
               placeholder={t("common.searchPlaceholder")}
@@ -683,16 +874,19 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
             {/* Sort mode toggle */}
             <SortDropdown
               value={sortMode}
-              onChange={setSortMode}
+              onChange={(mode) => {
+                if (mode !== "group") setSortMode(mode);
+              }}
+              modes={["manual", "az", "za", "newest", "oldest"]}
               className={vaultHeaderIconButtonClass}
             />
           </div>
         </VaultPageHeader>
 
         {/* Rules List */}
-        <div className="flex-1 overflow-auto p-4">
+        <div className="flex-1 overflow-y-auto">
           {!hasRules ? (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+            <div className="flex h-full flex-col items-center justify-center p-3 text-muted-foreground">
               <div className="h-16 w-16 rounded-2xl bg-secondary/80 flex items-center justify-center mb-4">
                 <Zap size={32} className="opacity-60" />
               </div>
@@ -704,29 +898,36 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
               </p>
             </div>
           ) : (
-            <div className="space-y-3">
+            <div className="space-y-3 p-3">
               <div className="flex items-center justify-between">
-                <h2 className="text-base font-semibold">{t("pf.title")}</h2>
+                <h2 className={vaultSectionTitleClass}>{t("pf.title")}</h2>
                 <span className="text-xs text-muted-foreground">
                   {t("pf.rulesCount", { count: filteredRules.length })}
                 </span>
               </div>
 
               <div
+                ref={ruleListRef}
                 className={cn(
                   viewMode === "grid"
                     ? "grid gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-3"
                     : "flex flex-col gap-2.5",
                 )}
+                onDragOverCapture={ruleReorder.handleDragOverCapture}
+                onDragOver={ruleReorder.handleDragOver}
+                onDropCapture={ruleReorder.handleDropCapture}
+                onDragEndCapture={ruleReorder.handleDragEndCapture}
               >
                 {filteredRules.map((rule) => (
                   <RuleCard
                     key={rule.id}
                     rule={rule}
-                    host={hosts.find((h) => h.id === rule.hostId)}
+                    host={hostById.get(rule.hostId)}
                     viewMode={viewMode}
                     isSelected={selectedRuleId === rule.id}
                     isPending={pendingOperations.has(rule.id)}
+                    canStop={hasRuntimeTunnel(rule.id)}
+                    reorderProps={ruleReorder.getItemReorderProps(rule.id, `rule:${rule.id}`)}
                     onSelect={() => {
                       setSelectedRuleId(rule.id);
                       startEditRule(rule);
@@ -745,7 +946,7 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
       </div>
 
       {/* Edit Panel - shown when a rule is selected */}
-      {showEditPanel && editingRule && (
+      {showEditPanel && editingRule && !showHostSelector && (
         <EditPanel
           rule={editingRule}
           draft={editDraft}
@@ -761,11 +962,12 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
           }}
           onDelete={() => handleDeleteRule(editingRule)}
           onOpenHostSelector={() => setShowHostSelector(true)}
+          {...portForwardingPanelResizeProps}
         />
       )}
 
       {/* Wizard Panel */}
-      {showWizard && (
+      {showWizard && !showHostSelector && (
         <AsidePanel
           open={true}
           onClose={() => {
@@ -774,6 +976,8 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
           }}
           title={isEditing ? t("pf.wizard.editTitle") : t("pf.wizard.newTitle")}
           width="w-[360px]"
+          layout="inline"
+          {...portForwardingPanelResizeProps}
           showBackButton={!!getPrevStep()}
           onBack={
             getPrevStep()
@@ -874,11 +1078,14 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
           managedSources={managedSources}
           onSaveHost={onSaveHost}
           onCreateGroup={_onCreateGroup}
+          width="w-[360px]"
+          layout="inline"
+          {...portForwardingPanelResizeProps}
         />
       )}
 
       {/* New Form Panel (skip wizard mode) */}
-      {showNewForm && (
+      {showNewForm && !showHostSelector && (
         <NewFormPanel
           draft={newFormDraft}
           hosts={hosts}
@@ -890,47 +1097,30 @@ const PortForwarding: React.FC<PortForwardingProps> = ({
           onOpenHostSelector={() => setShowHostSelector(true)}
           onOpenWizard={openWizardFromForm}
           isValid={isNewFormValid()}
+          {...portForwardingPanelResizeProps}
         />
       )}
 
-      {/* Delete Active Tunnel Confirmation Dialog */}
-      <Dialog open={showDeleteConfirm} onOpenChange={(open) => {
-        if (!isDeleting) {
+      <VaultDeleteConfirmDialog
+        open={showDeleteConfirm}
+        title={t("vault.deleteConfirm.title", {
+          name: ruleToDelete?.label ?? "",
+        })}
+        description={
+          deleteTargetIsActive
+            ? t("pf.deleteActive.desc", { label: ruleToDelete?.label ?? "" })
+            : t("vault.deleteConfirm.portForwardingDesc")
+        }
+        confirmLabel={deleteTargetIsActive ? t("pf.deleteActive.confirm") : undefined}
+        disabled={isDeleting}
+        onOpenChange={(open) => {
           setShowDeleteConfirm(open);
           if (!open) setRuleToDelete(null);
-        }
-      }}>
-        <DialogContent className="sm:max-w-[400px]">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-destructive">
-              <AlertTriangle size={20} />
-              {t("pf.deleteActive.title")}
-            </DialogTitle>
-            <DialogDescription>
-              {t("pf.deleteActive.desc", { label: ruleToDelete?.label ?? "" })}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="gap-2 sm:gap-0">
-            <Button
-              variant="outline"
-              onClick={() => {
-                setShowDeleteConfirm(false);
-                setRuleToDelete(null);
-              }}
-              disabled={isDeleting}
-            >
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={confirmDeleteActiveRule}
-              disabled={isDeleting}
-            >
-              {t("pf.deleteActive.confirm")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }}
+        onConfirm={() => {
+          void confirmDeleteRule();
+        }}
+      />
     </div>
   );
 };

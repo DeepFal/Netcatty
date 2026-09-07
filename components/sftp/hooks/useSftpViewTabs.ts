@@ -6,17 +6,22 @@ import { editorTabStore } from "../../../application/state/editorTabStore";
 import type { EditorTab, EditorTabId } from "../../../application/state/editorTabStore";
 import { releaseEditorTabSaveCoordinator, saveEditorTab } from "../../../application/state/editorTabSave";
 import { promptUnsavedChanges } from "../../editor/UnsavedChangesDialog";
+import {
+  getSftpTabDuplicateRequest,
+  type SftpTabDuplicateMode,
+} from "../sftpTabDuplication";
 
 interface UseSftpViewTabsParams {
   sftp: SftpStateApi;
   sftpRef: MutableRefObject<SftpStateApi>;
+  hosts?: Host[];
 }
 
 interface UseSftpViewTabsResult {
   leftPanes: SftpStateApi["leftPane"][];
   rightPanes: SftpStateApi["rightPane"][];
-  leftTabsInfo: { id: string; label: string; isLocal: boolean; hostId: string | null }[];
-  rightTabsInfo: { id: string; label: string; isLocal: boolean; hostId: string | null }[];
+  leftTabsInfo: { id: string; label: string; isLocal: boolean; hostId: string | null; canDuplicate: boolean }[];
+  rightTabsInfo: { id: string; label: string; isLocal: boolean; hostId: string | null; canDuplicate: boolean }[];
   showHostPickerLeft: boolean;
   showHostPickerRight: boolean;
   hostSearchLeft: string;
@@ -35,15 +40,25 @@ interface UseSftpViewTabsResult {
   handleReorderTabsRight: (draggedId: string, targetId: string, position: "before" | "after") => void;
   handleMoveTabFromLeftToRight: (tabId: string) => void;
   handleMoveTabFromRightToLeft: (tabId: string) => void;
-  handleHostSelectLeft: (host: Host | "local") => void;
-  handleHostSelectRight: (host: Host | "local") => void;
+  handleDuplicateTabLeft: (tabId: string, mode: SftpTabDuplicateMode) => Promise<string | null>;
+  handleDuplicateTabRight: (tabId: string, mode: SftpTabDuplicateMode) => Promise<string | null>;
+  handleHostSelectLeft: (
+    host: Host | "local",
+    options?: Parameters<SftpStateApi["connect"]>[2],
+  ) => void;
+  handleHostSelectRight: (
+    host: Host | "local",
+    options?: Parameters<SftpStateApi["connect"]>[2],
+  ) => void;
 }
 
-export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSftpViewTabsResult => {
+export const useSftpViewTabs = ({ sftp, sftpRef, hosts = [] }: UseSftpViewTabsParams): UseSftpViewTabsResult => {
   const [showHostPickerLeft, setShowHostPickerLeft] = useState(false);
   const [showHostPickerRight, setShowHostPickerRight] = useState(false);
   const [hostSearchLeft, setHostSearchLeft] = useState("");
   const [hostSearchRight, setHostSearchRight] = useState("");
+  const hostsRef = React.useRef(hosts);
+  hostsRef.current = hosts;
 
   const handleAddTabLeft = useCallback(() => {
     const tabId = sftpRef.current.addTab("left");
@@ -57,7 +72,10 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
     return tabId;
   }, [sftpRef]);
 
-  const confirmCloseEditorTabsByConnection = useCallback(async (connectionId: string): Promise<boolean> => {
+  const confirmCloseEditorTabsByOwner = useCallback(async (owner: {
+    sessionId?: string;
+    sftpTabId?: string;
+  }): Promise<boolean> => {
     const choice = (tab: EditorTab) => promptUnsavedChanges(tab.fileName);
     const saveTab = async (id: EditorTabId) => {
       const ok = await saveEditorTab(id);
@@ -66,8 +84,8 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
         throw new Error(tab?.saveError ?? "Save failed");
       }
     };
-    return editorTabStore.confirmCloseBySession(
-      connectionId,
+    return editorTabStore.confirmCloseByOwner(
+      owner,
       choice,
       saveTab,
       releaseEditorTabSaveCoordinator,
@@ -77,13 +95,15 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
   const handleCloseSftpTab = useCallback(async (side: "left" | "right", tabId: string) => {
     const sideTabs = side === "left" ? sftpRef.current.leftTabs : sftpRef.current.rightTabs;
     const pane = sideTabs.tabs.find((tab) => tab.id === tabId);
-    const connectionId = pane?.connection?.id;
-    if (connectionId) {
-      const ok = await confirmCloseEditorTabsByConnection(connectionId);
+    if (pane?.connection?.id || pane) {
+      const ok = await confirmCloseEditorTabsByOwner({
+        sessionId: pane?.connection?.id,
+        sftpTabId: tabId,
+      });
       if (!ok) return;
     }
-    sftpRef.current.closeTab(side, tabId);
-  }, [confirmCloseEditorTabsByConnection, sftpRef]);
+    await sftpRef.current.closeTab(side, tabId);
+  }, [confirmCloseEditorTabsByOwner, sftpRef]);
 
   const handleCloseTabLeft = useCallback((tabId: string) => (
     handleCloseSftpTab("left", tabId)
@@ -132,13 +152,56 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
     sftpRef.current.moveTabToOtherSide("right", tabId);
   }, [sftpRef]);
 
-  const handleHostSelectLeft = useCallback((host: Host | "local") => {
-    sftpRef.current.connect("left", host);
+  const handleDuplicateTab = useCallback(
+    async (side: "left" | "right", tabId: string, mode: SftpTabDuplicateMode) => {
+      const sideTabs = side === "left" ? sftpRef.current.leftTabs : sftpRef.current.rightTabs;
+      const pane = sideTabs.tabs.find((tab) => tab.id === tabId);
+      const request = getSftpTabDuplicateRequest(pane, mode);
+      if (!request) return null;
+
+      const host = request.kind === "local"
+        ? "local"
+        : hostsRef.current.find((item) => item.id === request.hostId);
+      if (!host) return null;
+
+      let duplicatedTabId: string | null = null;
+      await sftpRef.current.connect(side, host, {
+        forceNewTab: true,
+        ignoreSharedCache: mode === "defaultPath",
+        initialPath: request.path,
+        onTabCreated: (createdTabId) => {
+          duplicatedTabId = createdTabId;
+        },
+      });
+
+      return duplicatedTabId;
+    },
+    [sftpRef],
+  );
+
+  const handleDuplicateTabLeft = useCallback(
+    (tabId: string, mode: SftpTabDuplicateMode) => handleDuplicateTab("left", tabId, mode),
+    [handleDuplicateTab],
+  );
+
+  const handleDuplicateTabRight = useCallback(
+    (tabId: string, mode: SftpTabDuplicateMode) => handleDuplicateTab("right", tabId, mode),
+    [handleDuplicateTab],
+  );
+
+  const handleHostSelectLeft = useCallback((
+    host: Host | "local",
+    options?: Parameters<SftpStateApi["connect"]>[2],
+  ) => {
+    sftpRef.current.connect("left", host, options);
     setShowHostPickerLeft(false);
   }, [sftpRef]);
 
-  const handleHostSelectRight = useCallback((host: Host | "local") => {
-    sftpRef.current.connect("right", host);
+  const handleHostSelectRight = useCallback((
+    host: Host | "local",
+    options?: Parameters<SftpStateApi["connect"]>[2],
+  ) => {
+    sftpRef.current.connect("right", host, options);
     setShowHostPickerRight(false);
   }, [sftpRef]);
 
@@ -149,6 +212,7 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
         label: pane.connection?.hostLabel || "New Tab",
         isLocal: pane.connection?.isLocal || false,
         hostId: pane.connection?.hostId || null,
+        canDuplicate: pane.connection?.status === "connected",
       })),
     [sftp.leftTabs.tabs],
   );
@@ -160,6 +224,7 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
         label: pane.connection?.hostLabel || "New Tab",
         isLocal: pane.connection?.isLocal || false,
         hostId: pane.connection?.hostId || null,
+        canDuplicate: pane.connection?.status === "connected",
       })),
     [sftp.rightTabs.tabs],
   );
@@ -187,6 +252,8 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
     handleReorderTabsRight,
     handleMoveTabFromLeftToRight,
     handleMoveTabFromRightToLeft,
+    handleDuplicateTabLeft,
+    handleDuplicateTabRight,
     handleHostSelectLeft,
     handleHostSelectRight,
   };

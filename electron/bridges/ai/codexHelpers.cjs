@@ -6,11 +6,11 @@
  */
 "use strict";
 
-const { execFileSync } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const { existsSync, readFileSync } = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { StringDecoder } = require("node:string_decoder");
 
 const { stripAnsi, extractFirstNonLocalhostUrl, toUnpackedAsarPath } = require("./shellUtils.cjs");
 
@@ -18,6 +18,10 @@ const { stripAnsi, extractFirstNonLocalhostUrl, toUnpackedAsarPath } = require("
 
 const codexLoginSessions = new Map();
 let codexValidationCache = null;
+const MAX_CODEX_LOGIN_OUTPUT_BYTES = 64 * 1024;
+const MAX_CODEX_LOGIN_OUTPUT_CHARS = MAX_CODEX_LOGIN_OUTPUT_BYTES;
+const MAX_CODEX_LOGIN_TERMINAL_SESSIONS = 8;
+const CODEX_LOGIN_KILL_GRACE_MS = 750;
 
 const CODEX_AUTH_HINTS = [
   "not logged in",
@@ -36,73 +40,84 @@ const CODEX_AUTH_HINTS = [
   "credentials",
 ];
 
-// ── Package / binary resolution ──
-
-function getCodexPackageName() {
-  const key = `${process.platform}-${process.arch}`;
-  switch (key) {
-    case "darwin-arm64":
-      return "@zed-industries/codex-acp-darwin-arm64";
-    case "darwin-x64":
-      return "@zed-industries/codex-acp-darwin-x64";
-    case "linux-arm64":
-      return "@zed-industries/codex-acp-linux-arm64";
-    case "linux-x64":
-      return "@zed-industries/codex-acp-linux-x64";
-    case "win32-arm64":
-      return "@zed-industries/codex-acp-win32-arm64";
-    case "win32-x64":
-      return "@zed-industries/codex-acp-win32-x64";
-    default:
-      return null;
-  }
-}
-
-function resolveCodexAcpBinaryPath(shellEnv, electronModule) {
-  const binaryName = process.platform === "win32" ? "codex-acp.exe" : "codex-acp";
-  const isPackaged = electronModule?.app?.isPackaged;
-
-  // Dev mode: prefer system PATH
-  if (!isPackaged && shellEnv) {
-    try {
-      const whichCmd = process.platform === "win32" ? "where" : "which";
-      const systemPath = execFileSync(whichCmd, [binaryName], {
-        encoding: "utf8",
-        timeout: 3000,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: shellEnv,
-      }).trim().split("\n")[0].trim();
-      if (systemPath && existsSync(systemPath)) {
-        return systemPath;
-      }
-    } catch {
-      // Not on PATH
-    }
-  }
-
-  // Packaged build (or dev fallback): use npm-bundled binary
-  try {
-    const pkgName = getCodexPackageName();
-    if (!pkgName) return null;
-
-    const pkgRoot = path.dirname(require.resolve("@zed-industries/codex-acp/package.json"));
-    const resolved = require.resolve(`${pkgName}/bin/${binaryName}`, { paths: [pkgRoot] });
-    return toUnpackedAsarPath(resolved);
-  } catch {
-    return null;
-  }
-}
-
 // ── Login session helpers ──
 
 function appendCodexLoginOutput(session, chunk) {
   const cleanChunk = stripAnsi(chunk);
   if (!cleanChunk) return;
 
-  session.output += cleanChunk;
+  const combined = `${session.output || ""}${cleanChunk}`;
   if (!session.url) {
-    session.url = extractFirstNonLocalhostUrl(session.output);
+    session.url = extractFirstNonLocalhostUrl(combined);
   }
+  session.output = retainUtf8Tail(combined, MAX_CODEX_LOGIN_OUTPUT_BYTES);
+}
+
+function retainUtf8Tail(value, maxBytes) {
+  const buffer = Buffer.from(String(value || ""), "utf8");
+  if (buffer.length <= maxBytes) return String(value || "");
+  let start = buffer.length - maxBytes;
+  // Never begin inside a UTF-8 continuation sequence.
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1;
+  return buffer.subarray(start).toString("utf8");
+}
+
+function createCodexLoginOutputDecoder(session) {
+  const decoder = new StringDecoder("utf8");
+  let ended = false;
+  return {
+    write(chunk) {
+      if (ended) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      appendCodexLoginOutput(session, decoder.write(buffer));
+    },
+    end() {
+      if (ended) return;
+      ended = true;
+      appendCodexLoginOutput(session, decoder.end());
+    },
+  };
+}
+
+function pruneCodexLoginSessions() {
+  const terminalSessionIds = [];
+  for (const [sessionId, session] of codexLoginSessions) {
+    if (session?.state !== "running" && !session?.process) terminalSessionIds.push(sessionId);
+  }
+  const excess = terminalSessionIds.length - MAX_CODEX_LOGIN_TERMINAL_SESSIONS;
+  for (let index = 0; index < excess; index += 1) {
+    codexLoginSessions.delete(terminalSessionIds[index]);
+  }
+}
+
+function clearCodexLoginKillTimer(session, clearTimeoutFn = clearTimeout) {
+  if (!session?.killTimer) return;
+  clearTimeoutFn(session.killTimer);
+  session.killTimer = null;
+}
+
+function stopCodexLoginProcess(session, {
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+} = {}) {
+  const child = session?.process;
+  if (!child) return false;
+  clearCodexLoginKillTimer(session, clearTimeoutFn);
+  session.killTimer = setTimeoutFn(() => {
+    session.killTimer = null;
+    if (session.process !== child) return;
+    try { child.kill("SIGKILL"); } catch {}
+  }, CODEX_LOGIN_KILL_GRACE_MS);
+  session.killTimer?.unref?.();
+  try { child.kill("SIGTERM"); } catch {}
+  return true;
+}
+
+function recordCodexLoginSession(session) {
+  if (!session?.id) return;
+  codexLoginSessions.delete(session.id);
+  codexLoginSessions.set(session.id, session);
+  pruneCodexLoginSessions();
 }
 
 function toCodexLoginSessionResponse(session) {
@@ -113,6 +128,7 @@ function toCodexLoginSessionResponse(session) {
     output: session.output,
     error: session.error,
     exitCode: session.exitCode,
+    codexPath: session.codexPath || null,
   };
 }
 
@@ -282,7 +298,7 @@ function readCodexCustomProviderConfig(shellEnv) {
   const activeModel = typeof parsed.model === "string" ? parsed.model.trim() : "";
 
   // Hash the actual auth material (either the hardcoded api_key or the
-  // resolved env_key value) so the ACP provider fingerprint changes when
+  // resolved env_key value) so the SDK backend fingerprint changes when
   // the user rotates their key — without ever returning the raw value
   // across the IPC boundary.
   const authMaterial = hardcodedApiKey || envKeyValue;
@@ -316,21 +332,6 @@ function getCodexCustomConfigPreflightError(customConfig) {
   return `Codex is configured to use the "${customConfig.displayName}" provider from ~/.codex/config.toml, but the environment variable ${customConfig.envKey} is not set. Export it in your shell (e.g. add to ~/.zshrc) and click "Refresh Status" in Settings.`;
 }
 
-/**
- * Compute the ACP auth override object for Codex spawn sites.
- *   - netcatty-managed API key present → "codex-api-key"
- *   - user's own ~/.codex/config.toml custom provider detected → no override
- *     (so codex-acp resolves auth from the shell env / config itself)
- *   - otherwise → "chatgpt" (triggers the browser OAuth login flow)
- *
- * Returned as an object designed to be spread into createACPProvider options.
- */
-function getCodexAuthOverride(apiKey, shellEnv) {
-  if (apiKey) return { authMethodId: "codex-api-key" };
-  if (readCodexCustomProviderConfig(shellEnv)) return {};
-  return { authMethodId: "chatgpt" };
-}
-
 // ── Integration state ──
 
 function normalizeCodexIntegrationState(rawOutput) {
@@ -349,6 +350,15 @@ function normalizeCodexIntegrationState(rawOutput) {
     return "not_logged_in";
   }
   return "unknown";
+}
+
+function appendCodexChatGptValidationFailure(rawOutput, validationError) {
+  return [
+    String(rawOutput || "").trim(),
+    "",
+    "ChatGPT auth validation failed:",
+    validationError || "Unknown validation error",
+  ].join("\n").trim();
 }
 
 // ── Error helpers ──
@@ -409,7 +419,7 @@ function extractCodexError(error) {
 }
 
 function isCodexAuthError(params) {
-  const searchableText = `${params?.code || ""} ${params?.message || ""}`.toLowerCase();
+  const searchableText = `${params?.code || ""} ${params?.message || ""} ${params?.error || ""}`.toLowerCase();
   return CODEX_AUTH_HINTS.some((hint) => searchableText.includes(hint));
 }
 
@@ -440,15 +450,22 @@ function setCodexValidationCache(value) {
 }
 
 module.exports = {
+  MAX_CODEX_LOGIN_OUTPUT_BYTES,
+  MAX_CODEX_LOGIN_OUTPUT_CHARS,
+  MAX_CODEX_LOGIN_TERMINAL_SESSIONS,
+  CODEX_LOGIN_KILL_GRACE_MS,
   codexLoginSessions,
-  getCodexPackageName,
-  resolveCodexAcpBinaryPath,
   appendCodexLoginOutput,
+  createCodexLoginOutputDecoder,
+  pruneCodexLoginSessions,
+  recordCodexLoginSession,
+  clearCodexLoginKillTimer,
+  stopCodexLoginProcess,
   toCodexLoginSessionResponse,
   getActiveCodexLoginSession,
   normalizeCodexIntegrationState,
+  appendCodexChatGptValidationFailure,
   readCodexCustomProviderConfig,
-  getCodexAuthOverride,
   getCodexCustomConfigPreflightError,
   extractCodexError,
   isCodexAuthError,

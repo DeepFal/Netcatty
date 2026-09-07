@@ -14,18 +14,29 @@
  * - components/sftp/SftpHostPicker.tsx - Host selection dialog
  */
 
-import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
-import { useIsSftpActive } from "../application/state/activeTabStore";
+import { activeTabStore as globalActiveTabStore, useIsSftpActive } from "../application/state/activeTabStore";
 import { useSftpState } from "../application/state/useSftpState";
 import { useSftpBackend } from "../application/state/useSftpBackend";
 import { getParentPath, isConcreteTransferTargetPath } from "../application/state/sftp/utils";
-import { HotkeyScheme, KeyBinding } from "../domain/models";
+import { buildCacheKey } from "../application/state/sftp/sharedRemoteHostCache";
+import { HotkeyScheme, KeyBinding, TerminalSession } from "../domain/models";
+import {
+  getPaneMagnificationShortcutLabel,
+  resolveTwoPaneMagnificationStyle,
+  type PaneMagnificationController,
+} from "../domain/paneMagnification";
+import { listSftpConnectedHosts, resolveSftpTransferSourceSessionId, sftpPickerSessionsEqual } from "../domain/sftpConnectedHosts";
+import { applyDualPaneSftpOpen, dualPaneTabFromPane } from "../domain/sftpDualPaneOpen";
+import {
+  consumePendingDualPaneSftpRequest,
+  subscribeDualPaneSftpOpen,
+} from "../application/state/sftp/sftpDualPaneOpenStore";
 import { logger } from "../lib/logger";
 import { useRenderTracker } from "../lib/useRenderTracker";
 import { cn } from "../lib/utils";
-import { useInstantThemeSwitch } from "../lib/useInstantThemeSwitch";
-import { Host, Identity, ProxyProfile, SSHKey, TransferTask } from "../types";
+import { Host, Identity, KnownHost, ProxyProfile, SSHKey, TransferTask } from "../types";
 import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig";
 import { materializeHostProxyProfile } from "../domain/proxyProfiles";
 import { useSftpFileAssociations } from "../application/state/useSftpFileAssociations";
@@ -43,7 +54,7 @@ import { SftpContextProvider, activeTabStore } from "./sftp";
 import { useSftpViewPaneCallbacks } from "./sftp/hooks/useSftpViewPaneCallbacks";
 import { useSftpViewTabs } from "./sftp/hooks/useSftpViewTabs";
 import { useSftpKeyboardShortcuts } from "./sftp/hooks/useSftpKeyboardShortcuts";
-import { sftpFocusStore, SftpFocusedSide, useSftpFocusedSide } from "./sftp/hooks/useSftpFocusedPane";
+import { sftpFocusStore, SftpFocusedSide, useSftpFocusedSide } from "../application/state/sftp/sftpFocusStore";
 import { keepOnlyActivePaneSelections, keepOnlyPaneSelections } from "./sftp/hooks/selectionScope";
 
 
@@ -53,11 +64,16 @@ import { keepOnlyActivePaneSelections, keepOnlyPaneSelections } from "./sftp/hoo
 // Main SftpView component
 interface SftpViewProps {
   hosts: Host[];
+  /** Vault-persisted hosts only; used for writes so ephemeral deep-link hosts stay out of vault. */
+  writableHosts?: Host[];
+  sessions?: TerminalSession[];
   keys: SSHKey[];
   identities: Identity[];
+  knownHosts?: KnownHost[];
   groupConfigs?: import('../domain/models').GroupConfig[];
   proxyProfiles?: ProxyProfile[];
   updateHosts: (hosts: Host[]) => void;
+  onAddKnownHost?: (knownHost: KnownHost) => void;
   sftpDefaultViewMode: "list" | "tree";
   sftpDoubleClickBehavior: "open" | "transfer";
   sftpAutoSync: boolean;
@@ -67,16 +83,21 @@ interface SftpViewProps {
   keyBindings: KeyBinding[];
   editorWordWrap: boolean;
   setEditorWordWrap: (enabled: boolean) => void;
-  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
+  terminalSettings?: { verifyHostKeys: boolean; keepaliveInterval: number; keepaliveCountMax: number };
+  paneMagnificationRef?: React.MutableRefObject<PaneMagnificationController | null>;
 }
 
 const SftpViewInner: React.FC<SftpViewProps> = ({
   hosts,
+  writableHosts,
+  sessions = [],
   keys,
   identities,
+  knownHosts = [],
   groupConfigs = [],
   proxyProfiles = [],
   updateHosts,
+  onAddKnownHost,
   sftpDefaultViewMode,
   sftpDoubleClickBehavior,
   sftpAutoSync,
@@ -87,13 +108,13 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
   editorWordWrap,
   setEditorWordWrap,
   terminalSettings,
+  paneMagnificationRef,
 }) => {
   const { t } = useI18n();
+  const paneMagnificationShortcutLabel = getPaneMagnificationShortcutLabel(keyBindings, hotkeyScheme);
   const isActive = useIsSftpActive();
   const rootRef = useRef<HTMLDivElement>(null);
   const dialogActionScopeIdRef = useRef("sftp-main-view");
-
-  useInstantThemeSwitch(rootRef);
 
   // File watch event handlers (stable refs to avoid re-creating the useSftpState options)
   const fileWatchHandlers = useMemo(() => ({
@@ -108,12 +129,37 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     },
   }), [t]);
 
+  const resolveTransferSourceSessionId = useCallback((hostId: string, host?: Host) => {
+    const hostsById = new Map<string, Host>(hosts.map((h) => [h.id, h]));
+    // Walk all sessions (not the picker one-per-hostId list) so multi-tab
+    // same hostId with different live endpoints can still match.
+    return resolveSftpTransferSourceSessionId(sessions, hostsById, hostId, host);
+  }, [hosts, sessions]);
+
   const sftpOptions = useMemo(() => ({
     ...fileWatchHandlers,
+    transferOwnerId: "main-sftp-view",
+    // Main SFTP page stays interactive while mounted so top-tab switches
+    // (e.g. Terminal ↔ SFTP) must not soft-close every tab's session.
+    // The terminal side panel parks only after the panel is closed (not when
+    // switching History/System while the chrome stays open).
+    // Bulk transfers use dedicated pool sessions regardless.
+    interactive: true,
     useCompressedUpload: sftpUseCompressedUpload,
     defaultShowHiddenFiles: sftpShowHiddenFiles,
     terminalSettings,
-  }), [fileWatchHandlers, sftpUseCompressedUpload, sftpShowHiddenFiles, terminalSettings]);
+    knownHosts,
+    onAddKnownHost,
+    resolveTransferSourceSessionId,
+  }), [
+    fileWatchHandlers,
+    sftpUseCompressedUpload,
+    sftpShowHiddenFiles,
+    terminalSettings,
+    knownHosts,
+    onAddKnownHost,
+    resolveTransferSourceSessionId,
+  ]);
 
   // Pre-resolve group defaults so SFTP connections inherit group config
   const effectiveHosts = useMemo(() => {
@@ -126,13 +172,21 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     });
   }, [hosts, groupConfigs, proxyProfiles]);
 
+  const hostWriteSource = writableHosts ?? hosts;
+
+  const connectedHosts = useMemo(() => {
+    const hostsById = new Map<string, Host>(
+      effectiveHosts.map((host) => [host.id, host]),
+    );
+    return listSftpConnectedHosts(sessions, hostsById);
+  }, [effectiveHosts, sessions]);
+
   const sftp = useSftpState(effectiveHosts, keys, identities, sftpOptions);
 
   // Get backend helpers for file downloads and local filesystem writes.
   const {
     showSaveDialog,
     selectDirectory,
-    startStreamTransfer,
     listSftp,
     mkdirLocal,
     deleteLocalFile,
@@ -145,6 +199,54 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
   // without needing to re-create when sftp changes
   const sftpRef = useRef(sftp);
   sftpRef.current = sftp;
+  const effectiveHostsRef = useRef(effectiveHosts);
+  effectiveHostsRef.current = effectiveHosts;
+
+  useEffect(() => {
+    const toTabs = (panes: Array<{
+      id: string;
+      connection: { id: string; isLocal?: boolean; hostId?: string | null; status?: string | null } | null;
+    }>, getEndpointKey: (connectionId: string) => string | null) => panes.map(
+      (pane) => dualPaneTabFromPane(
+        pane,
+        pane.connection ? getEndpointKey(pane.connection.id) : null,
+      ),
+    );
+
+    const applyRequest = (request: { hostId: string } | null) => {
+      if (!request) return;
+      const host = effectiveHostsRef.current.find((candidate) => candidate.id === request.hostId);
+      if (!host) return;
+      const current = sftpRef.current;
+      const hostEndpointKey = buildCacheKey(
+        host.id,
+        host.hostname,
+        host.port,
+        host.protocol,
+        host.sftpSudo,
+        host.username,
+        host.sftpFileProtocol,
+      );
+      // External "Open SFTP" promises a visible local-left / host-right pair.
+      // Clear a stale single-pane magnification before selecting or connecting.
+      setMagnifiedSide(null);
+      applyDualPaneSftpOpen(
+        {
+          leftTabs: toTabs(current.leftTabs.tabs, current.getConnectionCacheKey),
+          rightTabs: toTabs(current.rightTabs.tabs, current.getConnectionCacheKey),
+          selectTab: current.selectTab,
+          connect: (side, nextHost, options) => {
+            void current.connect(side, nextHost === "local" ? "local" : host, options);
+          },
+        },
+        host,
+        hostEndpointKey,
+      );
+    };
+
+    applyRequest(consumePendingDualPaneSftpRequest());
+    return subscribeDualPaneSftpOpen(applyRequest);
+  }, []);
 
   // Register this useSftpState's writeTextFileByConnection with the bridge so
   // the editor tab's save path can reach the active SFTP session. The bridge
@@ -158,8 +260,8 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
   // always reads the latest writeTextFileByConnection; that method is stable
   // across sftp re-renders (it's a methodsRef-backed dispatcher).
   useEffect(() => {
-    return registerEditorSftpWriterScoped((connectionId, expectedHostId, filePath, content, encoding) =>
-      sftpRef.current.writeTextFileByConnection(connectionId, expectedHostId, filePath, content, encoding),
+    return registerEditorSftpWriterScoped((connectionId, expectedHostId, filePath, content, encoding, sftpTabId) =>
+      sftpRef.current.writeTextFileByConnection(connectionId, expectedHostId, filePath, content, encoding, sftpTabId),
     );
   }, []);
 
@@ -182,12 +284,71 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
 
   // Subscribe to focused side for visual indicator
   const focusedSide = useSftpFocusedSide();
+  const [magnifiedSide, setMagnifiedSide] = useState<SftpFocusedSide | null>(null);
+  const focusedSideRef = useRef(focusedSide);
+  const magnifiedSideRef = useRef(magnifiedSide);
+  focusedSideRef.current = focusedSide;
+  magnifiedSideRef.current = magnifiedSide;
+  const [isWideSplit, setIsWideSplit] = useState(true);
+  const [showMagnificationHint, setShowMagnificationHint] = useState(false);
+  const splitSurfaceRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const surface = splitSurfaceRef.current;
+    if (!surface) return undefined;
+    const update = () => setIsWideSplit(surface.clientWidth >= 1024);
+    update();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(update);
+    observer.observe(surface);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!magnifiedSide) {
+      setShowMagnificationHint(false);
+      return undefined;
+    }
+    setShowMagnificationHint(true);
+    const timerId = window.setTimeout(() => setShowMagnificationHint(false), 1800);
+    return () => window.clearTimeout(timerId);
+  }, [magnifiedSide]);
+
+  useEffect(() => {
+    if (!paneMagnificationRef) return undefined;
+    const controller: PaneMagnificationController = {
+      getState: () => {
+        if (globalActiveTabStore.getActiveTabId() !== 'sftp') return 'unavailable';
+        return magnifiedSideRef.current ? 'focused' : 'focusable';
+      },
+      focus: () => {
+        if (globalActiveTabStore.getActiveTabId() !== 'sftp' || magnifiedSideRef.current) return false;
+        setMagnifiedSide(focusedSideRef.current);
+        return true;
+      },
+      restore: () => {
+        if (globalActiveTabStore.getActiveTabId() !== 'sftp' || !magnifiedSideRef.current) return false;
+        setMagnifiedSide(null);
+        return true;
+      },
+      toggle: () => {
+        if (globalActiveTabStore.getActiveTabId() !== 'sftp') return false;
+        setMagnifiedSide((current) => current ? null : focusedSideRef.current);
+        return true;
+      },
+    };
+    paneMagnificationRef.current = controller;
+    return () => {
+      if (paneMagnificationRef.current === controller) paneMagnificationRef.current = null;
+    };
+  }, [paneMagnificationRef]);
 
   // Handle pane focus when clicking on a pane container
   // Clear the opposite side's selection so file operations only affect the focused pane
   const handlePaneFocus = useCallback((side: SftpFocusedSide, targetTabId?: string) => {
     const prevSide = sftpFocusStore.getFocusedSide();
     sftpFocusStore.setFocusedSide(side);
+    setMagnifiedSide((current) => current ? side : null);
     if (prevSide !== side) {
       if (targetTabId) {
         keepOnlyPaneSelections(sftpRef.current, { side, tabId: targetTabId });
@@ -262,7 +423,6 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     deleteLocalFile,
     showSaveDialog,
     selectDirectory,
-    startStreamTransfer,
     getSftpIdForConnection: sftp.getSftpIdForConnection,
     listLocalFiles: listLocalDir,
     listDrives,
@@ -377,9 +537,11 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     handleReorderTabsRight,
     handleMoveTabFromLeftToRight,
     handleMoveTabFromRightToLeft,
+    handleDuplicateTabLeft,
+    handleDuplicateTabRight,
     handleHostSelectLeft,
     handleHostSelectRight,
-  } = useSftpViewTabs({ sftp, sftpRef });
+  } = useSftpViewTabs({ sftp, sftpRef, hosts: effectiveHosts });
 
   const handleAddTabLeftWithFocus = useCallback(() => {
     const tabId = handleAddTabLeft();
@@ -401,10 +563,31 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     handlePaneFocus("right", tabId);
   }, [handlePaneFocus, handleSelectTabRight]);
 
+  const handleDuplicateTabLeftWithFocus = useCallback(
+    async (...args: Parameters<typeof handleDuplicateTabLeft>) => {
+      const tabId = await handleDuplicateTabLeft(...args);
+      if (tabId) {
+        handlePaneFocus("left", tabId);
+      }
+    },
+    [handleDuplicateTabLeft, handlePaneFocus],
+  );
+
+  const handleDuplicateTabRightWithFocus = useCallback(
+    async (...args: Parameters<typeof handleDuplicateTabRight>) => {
+      const tabId = await handleDuplicateTabRight(...args);
+      if (tabId) {
+        handlePaneFocus("right", tabId);
+      }
+    },
+    [handleDuplicateTabRight, handlePaneFocus],
+  );
+
   return (
     <SftpContextProvider
       hosts={effectiveHosts}
-      writableHosts={hosts}
+      connectedHosts={connectedHosts}
+      writableHosts={hostWriteSource}
       updateHosts={updateHosts}
       draggedFiles={draggedFiles}
       dragCallbacks={dragCallbacks}
@@ -414,15 +597,31 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
       <div
         ref={rootRef}
         className={cn(
-          "absolute inset-0 min-h-0 flex flex-col",
+          "absolute inset-0 min-h-0 flex flex-col bg-background",
           isActive ? "z-20" : "",
         )}
         style={containerStyle}
       >
-        <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 min-h-0 border-t border-border/70">
+        <div
+          ref={splitSurfaceRef}
+          className="relative flex-1 min-h-0 border-t border-border/70 overflow-hidden"
+          data-section="sftp-main-split"
+          data-magnified-side={magnifiedSide ?? undefined}
+        >
+          {magnifiedSide && (
+            <div
+              className="absolute inset-0 z-40 bg-background/55 backdrop-blur-[1px]"
+              aria-hidden="true"
+              data-section="pane-magnification-backdrop"
+            />
+          )}
           <div
-            className="relative border-r border-border/70 flex flex-col"
+            className="absolute min-w-0 border-r border-border/70 bg-background flex flex-col transition-[left,top,width,height] duration-150 ease-out"
+            style={resolveTwoPaneMagnificationStyle('left', isWideSplit, magnifiedSide === 'left')}
+            data-sftp-pane-side="left"
+            inert={magnifiedSide === 'right' ? true : undefined}
             onClick={() => handlePaneFocus("left")}
+            onFocusCapture={() => handlePaneFocus("left")}
           >
             {/* Focus indicator triangle */}
             {focusedSide === "left" && (
@@ -447,6 +646,7 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
                 onAddTab={handleAddTabLeftWithFocus}
                 onReorderTabs={handleReorderTabsLeft}
                 onMoveTabToOtherSide={handleMoveTabFromRightToLeft}
+                onDuplicateTab={handleDuplicateTabLeftWithFocus}
               />
             )}
             <div className="relative flex-1 min-h-0">
@@ -481,8 +681,12 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
             </div>
           </div>
           <div
-            className="relative flex flex-col"
+            className="absolute min-w-0 bg-background flex flex-col transition-[left,top,width,height] duration-150 ease-out"
+            style={resolveTwoPaneMagnificationStyle('right', isWideSplit, magnifiedSide === 'right')}
+            data-sftp-pane-side="right"
+            inert={magnifiedSide === 'left' ? true : undefined}
             onClick={() => handlePaneFocus("right")}
+            onFocusCapture={() => handlePaneFocus("right")}
           >
             {/* Focus indicator triangle */}
             {focusedSide === "right" && (
@@ -507,6 +711,7 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
                 onAddTab={handleAddTabRightWithFocus}
                 onReorderTabs={handleReorderTabsRight}
                 onMoveTabToOtherSide={handleMoveTabFromLeftToRight}
+                onDuplicateTab={handleDuplicateTabRightWithFocus}
               />
             )}
             <div className="relative flex-1 min-h-0">
@@ -540,10 +745,20 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
               )}
             </div>
           </div>
+          {magnifiedSide && showMagnificationHint && (
+            <div
+              className="pointer-events-none absolute bottom-4 right-4 z-[60] rounded border border-border/70 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground shadow-sm animate-in fade-in duration-150"
+              data-section="pane-magnification-hint"
+            >
+              {t('terminal.paneMagnification.hint')}: {t('terminal.layer.sftp')}
+              {paneMagnificationShortcutLabel ? ` · ${paneMagnificationShortcutLabel} / Esc` : ' · Esc'}
+            </div>
+          )}
         </div>
 
         <SftpOverlays
           hosts={effectiveHosts}
+          connectedHosts={connectedHosts}
           sftp={sftp}
           visibleTransfers={visibleTransfers}
           canRevealTransferTarget={canRevealTransferTarget}
@@ -587,24 +802,30 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
   );
 };
 
-const sftpViewAreEqual = (prev: SftpViewProps, next: SftpViewProps): boolean =>
+export const sftpViewAreEqual = (prev: SftpViewProps, next: SftpViewProps): boolean =>
   prev.hosts === next.hosts &&
+  prev.writableHosts === next.writableHosts &&
+  sftpPickerSessionsEqual(prev.sessions, next.sessions) &&
   prev.keys === next.keys &&
   prev.identities === next.identities &&
+  prev.knownHosts === next.knownHosts &&
   prev.groupConfigs === next.groupConfigs &&
   prev.proxyProfiles === next.proxyProfiles &&
   prev.sftpDefaultViewMode === next.sftpDefaultViewMode &&
+  prev.onAddKnownHost === next.onAddKnownHost &&
   prev.sftpDoubleClickBehavior === next.sftpDoubleClickBehavior &&
   prev.sftpAutoSync === next.sftpAutoSync &&
   prev.sftpShowHiddenFiles === next.sftpShowHiddenFiles &&
   prev.sftpUseCompressedUpload === next.sftpUseCompressedUpload &&
   prev.hotkeyScheme === next.hotkeyScheme &&
   prev.keyBindings === next.keyBindings &&
+  prev.paneMagnificationRef === next.paneMagnificationRef &&
   prev.editorWordWrap === next.editorWordWrap &&
   prev.setEditorWordWrap === next.setEditorWordWrap &&
-  // Only the keepalive fields of terminalSettings affect SFTP connection
+  // Only these terminal connection settings affect SFTP connection
   // resolution today; compare them directly rather than the whole object
   // so unrelated terminal-setting changes don't tear the panel down.
+  prev.terminalSettings?.verifyHostKeys === next.terminalSettings?.verifyHostKeys &&
   prev.terminalSettings?.keepaliveInterval === next.terminalSettings?.keepaliveInterval &&
   prev.terminalSettings?.keepaliveCountMax === next.terminalSettings?.keepaliveCountMax;
 
