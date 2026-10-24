@@ -32,9 +32,10 @@ import { useI18n } from '../../application/i18n/I18nProvider';
 import { useCloudSync } from '../../application/state/useCloudSync';
 
 
-import { type CloudProvider, type ConflictInfo, type SyncChangeEntityKey, type SyncEntityChangeCounts } from '../../domain/sync';
+import { type CloudProvider, type ConflictInfo, type SyncChangeEntityKey, type SyncEntityChangeCounts, formatLastSync } from '../../domain/sync';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
+import { ConfirmDialog } from '../ui/confirm-dialog';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { toast } from '../ui/toast';
@@ -278,7 +279,7 @@ interface ProviderCardProps {
     onEdit?: () => void;
     onConnect: () => void;
     onCancelConnect?: () => void;
-    onDisconnect: () => void;
+    onDisconnect: () => void | Promise<void>;
     onSync: () => void;
     extraActions?: React.ReactNode;
 }
@@ -302,16 +303,17 @@ export const ProviderCard: React.FC<ProviderCardProps> = ({
     extraActions,
 }) => {
     const { t } = useI18n();
-    const formatLastSync = (timestamp?: number): string => {
+    const [disconnectConfirmOpen, setDisconnectConfirmOpen] = useState(false);
+    const [disconnecting, setDisconnecting] = useState(false);
+    const formatLastSyncLabel = (timestamp?: number): string => {
         if (!timestamp) return t('cloudSync.lastSync.never');
-        const date = new Date(timestamp);
-        const now = new Date();
-        const diff = now.getTime() - date.getTime();
+        const now = Date.now();
+        const diff = now - timestamp;
 
         if (diff < 60000) return t('cloudSync.lastSync.justNow');
         if (diff < 3600000) return t('cloudSync.lastSync.minutesAgo', { minutes: Math.floor(diff / 60000) });
 
-        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return formatLastSync(timestamp);
     };
 
     const status = error
@@ -358,7 +360,7 @@ export const ProviderCard: React.FC<ProviderCardProps> = ({
                             {account.name || account.email}
                         </span>
                         <span className="text-xs text-muted-foreground">
-                            · {formatLastSync(lastSync)}
+                            · {formatLastSyncLabel(lastSync)}
                         </span>
                     </div>
                 ) : error ? (
@@ -409,10 +411,13 @@ export const ProviderCard: React.FC<ProviderCardProps> = ({
                         <Button
                             size="sm"
                             variant="ghost"
-                            onClick={onDisconnect}
-                            className="text-muted-foreground hover:text-red-500"
+                            onClick={() => setDisconnectConfirmOpen(true)}
+                            disabled={disconnecting}
+                            className="gap-1 text-muted-foreground hover:text-red-500"
+                            aria-label={t('cloudSync.provider.disconnect')}
                         >
                             <CloudOff size={14} />
+                            {t('cloudSync.provider.disconnect')}
                         </Button>
                     </>
                 ) : isConnecting && onCancelConnect ? (
@@ -437,6 +442,33 @@ export const ProviderCard: React.FC<ProviderCardProps> = ({
                     </Button>
                 )}
             </div>
+            <ConfirmDialog
+                open={disconnectConfirmOpen}
+                title={t('cloudSync.provider.disconnect.confirmTitle', { name })}
+                message={t('cloudSync.provider.disconnect.confirmMessage', { name })}
+                confirmLabel={t('cloudSync.provider.disconnect.confirmAction')}
+                destructive
+                busy={disconnecting}
+                onOpenChange={(open) => {
+                    if (!disconnecting) setDisconnectConfirmOpen(open);
+                }}
+                onConfirm={() => {
+                    setDisconnecting(true);
+                    void Promise.resolve()
+                        .then(() => onDisconnect())
+                        .then(() => {
+                            setDisconnectConfirmOpen(false);
+                            toast.info(t('cloudSync.provider.disconnect.cloudRemains', { name }), {
+                                title: t('cloudSync.provider.disconnect.toastTitle'),
+                                duration: 8000,
+                            });
+                        })
+                        .catch(() => {
+                            toast.error(t('cloudSync.provider.disconnect.failed', { name }));
+                        })
+                        .finally(() => setDisconnecting(false));
+                }}
+            />
         </div>
     );
 };
@@ -538,10 +570,15 @@ const CONFLICT_ENTITY_LABEL_KEYS: Record<SyncChangeEntityKey, string> = {
     identities: 'cloudSync.conflict.entity.identities',
     proxyProfiles: 'cloudSync.conflict.entity.proxyProfiles',
     snippets: 'cloudSync.conflict.entity.snippets',
+    notes: 'cloudSync.conflict.entity.notes',
+    noteGroups: 'cloudSync.conflict.entity.noteGroups',
     customGroups: 'cloudSync.conflict.entity.customGroups',
     snippetPackages: 'cloudSync.conflict.entity.snippetPackages',
     portForwardingRules: 'cloudSync.conflict.entity.portForwardingRules',
+    browserBookmarks: 'cloudSync.conflict.entity.browserBookmarks',
     groupConfigs: 'cloudSync.conflict.entity.groupConfigs',
+    monitorPanels: 'monitor.title',
+    aiSessions: 'cloudSync.aiSessions.title',
     settings: 'cloudSync.conflict.entity.settings',
 };
 

@@ -151,3 +151,231 @@ test("standalone ED3 preserves current visible screen", () => {
     "before\n\nscreen\nafter",
   );
 });
+
+test("alternate screen body is omitted from plain text session logs", () => {
+  assert.equal(
+    terminalDataToPlainText(
+      "$ vim file\n\x1b[?1049h\x1b[H~\n~\n\"file\" 0L, 0B\x1b[?1049l$ ls\n",
+    ),
+    "$ vim file\n$ ls",
+  );
+});
+
+test("alternate screen omit tracks enter/leave split across chunks", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("$ vim\n\x1b[?1049");
+  renderer.feed("h\x1b[H~\nstatus line");
+  renderer.feed("\x1b[?1049l$ done\n");
+  assert.equal(renderer.finish(), "$ vim\n$ done");
+});
+
+test("seeded alternate screen omits TUI paint until leave", () => {
+  const renderer = createTerminalTextRenderer({ alternateScreenActive: true });
+  renderer.feed("~\nstatus line\n");
+  renderer.feed("\x1b[?1049l$ done\n");
+  assert.equal(renderer.finish(), "$ done");
+});
+
+test("legacy smcup/rmcup alternate screen modes are omitted", () => {
+  assert.equal(
+    terminalDataToPlainText("shell\n\x1b[?47hTUI\n\x1b[?47lafter\n"),
+    "shell\nafter",
+  );
+  assert.equal(
+    terminalDataToPlainText("shell\n\x1b[?1047hTUI\n\x1b[?1047lafter\n"),
+    "shell\nafter",
+  );
+});
+
+test("RIS during alternate screen restores logging of later shell output", () => {
+  assert.equal(
+    terminalDataToPlainText("before\n\x1b[?1049hTUI\x1bcshell-after\n"),
+    "before\nshell-after",
+  );
+});
+
+test("split RIS during alternate screen restores logging of later shell output", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("before\n\x1b[?1049hTUI\x1b");
+  renderer.feed("cshell-after\n");
+  assert.equal(renderer.finish(), "before\nshell-after");
+});
+
+test("RIS after mid-line TUI does not glue post-reset shell text", () => {
+  assert.equal(
+    terminalDataToPlainText("before\x1b[?1049hTUI\x1bcshell-after\n"),
+    "before\nshell-after",
+  );
+});
+
+test("RIS resets SGR so post-reset text is not colored from pre-entry style", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[31mbefore\x1b[?1049hTUI\x1bcshell-after\n");
+  const html = renderer.toHtmlContent();
+  assert.match(html, /shell-after/);
+  // Pre-entry red SGR must not wrap post-RIS shell text.
+  assert.equal(/color:\s*var\(--ansi-1[^)]*\)[^"]*"[^>]*>shell-after/.test(html), false);
+  assert.match(html, /color:\s*var\(--ansi-1[^)]*\)[^"]*"[^>]*>before/);
+});
+
+test("RIS rebases screen so later cursor-home does not overwrite history", () => {
+  // Post-reset "shell" can be partially overwritten by home+write on the new
+  // screen ("newll"), but pre-RIS history ("before") must remain intact.
+  // Without rebasing, CSI H would rewrite history into something like "newore".
+  const log = terminalDataToPlainText("before\x1bcshell\x1b[Hnew");
+  assert.equal(log.startsWith("before\n"), true);
+  assert.equal(log.includes("new"), true);
+  assert.equal(log.startsWith("newore"), false);
+  assert.equal(log, "before\nnewll");
+});
+
+
+test("C1 CSI alternate-screen modes are omitted like ESC [ forms", () => {
+  assert.equal(
+    terminalDataToPlainText("before\n\x9b?1049hTUI\n\x9b?1049lafter\n"),
+    "before\nafter",
+  );
+  assert.equal(
+    terminalDataToPlainText("before\n\x9b?47hTUI\n\x9b?47lafter\n"),
+    "before\nafter",
+  );
+});
+
+test("split C1 CSI alternate-screen enter still omits TUI paint", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("before\n\x9b?1049");
+  renderer.feed("h~\nstatus\n");
+  renderer.feed("\x9b?1049l$ done\n");
+  assert.equal(renderer.finish(), "before\n$ done");
+});
+
+test("SGR colors are emitted as themeable CSS variables with hex fallbacks", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[31mred \x1b[91mbright-red \x1b[44mbg-blue \x1b[0mplain\n");
+  const html = renderer.toHtmlContent();
+  // Basic / bright / background colors map to --ansi-N variables so the
+  // wrapping HTML page can swap palettes for light and dark themes.
+  assert.match(html, /color:\s*var\(--ansi-1, #cd3131\)[^"]*"[^>]*>red/);
+  assert.match(html, /color:\s*var\(--ansi-9, #f14c4c\)[^"]*"[^>]*>bright-red/);
+  assert.match(html, /color:\s*#f14c4c; background-color:\s*#2472c8/);
+});
+
+test("256-color base and cube foregrounds use themeable variables", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[38;5;1mbase\x1b[0m \x1b[38;5;208mcube\n");
+  const html = renderer.toHtmlContent();
+  assert.match(html, /color:\s*var\(--ansi-1, #cd3131\)[^"]*"[^>]*>base/);
+  assert.match(html, /color:\s*var\(--term-custom-ff8700, #ff8700\)[^"]*"[^>]*>cube/);
+});
+
+test("inverse text falls back to themeable default background/foreground", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[7minversed\x1b[0m\n");
+  const html = renderer.toHtmlContent();
+  assert.match(
+    html,
+    /color:\s*var\(--term-default-bg, #1e1e1e\); background-color:\s*var\(--term-default-fg, #d4d4d4\)/,
+  );
+});
+
+test("explicit backgrounds preserve original foreground/background pairs across themes", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[37;41mERROR\x1b[0m \x1b[40mTEXT\x1b[0m \x1b[38;5;15;48;5;1mindexed\x1b[0m \x1b[31;7minverse\x1b[0m \x1b[48;2;0;0;0mRGB background\x1b[0m");
+  const html = renderer.toHtmlContent();
+  assert.match(html, /color: #e5e5e5; background-color: #cd3131[^>]*>ERROR/);
+  assert.match(html, /color: #d4d4d4; background-color: #000000[^>]*>TEXT/);
+  assert.match(html, /color: #ffffff; background-color: #cd3131[^>]*>indexed/);
+  assert.match(html, /color: #1e1e1e; background-color: #cd3131[^>]*>inverse/);
+  assert.match(html, /color: #d4d4d4; background-color: #000000[^>]*>RGB background/);
+});
+
+test("line timestamps follow writes, erasure and preserved cleared screens", () => {
+  const renderer = createTerminalTextRenderer();
+  const formatLine = (line, timestamp) => line ? `[${timestamp}] ${line}` : line;
+  renderer.feed("before tui\n", 89);
+  renderer.feed("\x1b[H\x1b[2Jframe one\n", 389);
+  renderer.feed("\x1b[H\x1b[2Jframe two\n", 489);
+  const expected = "[89] before tui\n\n[389] frame one\n\n[489] frame two";
+  assert.equal(renderer.toString({ includePendingClearedScreen: true, formatLine }), expected);
+  renderer.finish();
+  assert.equal(renderer.toString({ formatLine }), expected);
+  assert.equal(renderer.toHtmlContent({ formatLine }), expected);
+});
+
+test("line timestamps track split ANSI writes and partial line erasure", () => {
+  const renderer = createTerminalTextRenderer();
+  const formatLine = (line, timestamp) => line ? `[${timestamp}] ${line}` : line;
+  renderer.feed("unchanged\r\nlong tail", 89);
+  renderer.feed("\r\x1b[", 389);
+  renderer.feed("31mshort\x1b[K", 489);
+  assert.equal(renderer.toString({ formatLine }), "[89] unchanged\n[489] short");
+  assert.match(renderer.toHtmlContent({ formatLine }), /\[489\] <span[^>]*>short<\/span>/);
+});
+
+test("no-op line erasure preserves the output timestamp", () => {
+  const renderer = createTerminalTextRenderer();
+  const formatLine = (line, timestamp) => line ? `[${timestamp}] ${line}` : line;
+  renderer.feed("completed", 1000);
+  renderer.feed("\x1b[K", 9000);
+  assert.equal(renderer.toString({ formatLine }), "[1000] completed");
+  renderer.feed("\r\x1b[4C\x1b[K", 10000);
+  assert.equal(renderer.toString({ formatLine }), "[10000] comp");
+});
+
+test("erasing styled spaces updates the visible line timestamp", () => {
+  const renderer = createTerminalTextRenderer();
+  const formatLine = (line, timestamp) => line ? `[${timestamp}] ${line}` : line;
+  renderer.feed("\x1b[41m   \x1b[0mtext", 1000);
+  assert.match(renderer.toHtmlContent({ formatLine }), /background-color/);
+  renderer.feed("\r\x1b[2C\x1b[1K", 9000);
+  assert.equal(renderer.toHtmlContent({ formatLine }), "[9000]    text");
+});
+
+test("cells share style snapshots without recoloring earlier output on SGR changes", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("ab\x1b[31mcd\x1b[1mef\x1b[0mgh");
+  const cells = renderer.lines[0];
+  assert.equal(cells[0].style, cells[1].style);
+  assert.equal(cells[2].style, cells[3].style);
+  assert.notEqual(cells[1].style, cells[2].style);
+  assert.notEqual(cells[3].style, cells[4].style);
+  assert.equal(renderer.toString(), "abcdefgh");
+  assert.equal(renderer.toHtmlContent(), 'ab<span style="color: var(--ansi-1, #cd3131)">cd</span><span style="color: var(--ansi-1, #cd3131); font-weight: 700">ef</span>gh');
+});
+
+test("SGR attribute and color resets leave previous snapshots unchanged", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[1;3;4;7;38;5;196;48;2;1;2;3mA");
+  const snapshot = renderer.lines[0][0].style;
+  const original = { ...snapshot };
+  renderer.feed("\x1b[22;23;24;27;39;49mB\x1b[0;32;1mC\x1b[mD");
+  assert.deepEqual(snapshot, original);
+  assert.deepEqual(original, { fg: "#ff0000", bg: "#010203", bold: true, italic: true, underline: true, inverse: true });
+  assert.deepEqual(renderer.lines[0][1].style, { fg: null, bg: null, bold: false, italic: false, underline: false, inverse: false });
+  assert.equal(renderer.toString(), "ABCD");
+  assert.equal(renderer.toHtmlContent(), '<span style="color: #010203; background-color: #ff0000; font-weight: 700; font-style: italic; text-decoration: underline">A</span>B<span style="color: var(--ansi-2, #0dbc79); font-weight: 700">C</span>D');
+});
+
+test("cursor overwrites and erasure do not mutate adjacent shared styles", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("\x1b[31mabcd\r\x1b[32mX\x1b[3G\x1b[0mY");
+  assert.equal(renderer.toString(), "XbYd");
+  assert.equal(renderer.toHtmlContent(), '<span style="color: var(--ansi-2, #0dbc79)">X</span><span style="color: var(--ansi-1, #cd3131)">b</span>Y<span style="color: var(--ansi-1, #cd3131)">d</span>');
+  renderer.feed("\x1b[1K");
+  assert.equal(renderer.toHtmlContent(), "");
+});
+
+test("pending cleared-screen clones share immutable styles but retain independent cells", () => {
+  const renderer = createTerminalTextRenderer();
+  renderer.feed("first\x1b[H\x1b[2J\x1b[31mold", 10);
+  const activeLine = renderer.lines.at(-1);
+  renderer.feed("\x1b[H\x1b[2J");
+  const savedLine = renderer.pendingClearedScreen.lines[0];
+  assert.notEqual(savedLine[0], activeLine[0]);
+  assert.equal(savedLine[0].style, activeLine[0].style);
+  assert.equal(savedLine.timestamp, 10);
+  renderer.feed("\x1b[32mnew", 20);
+  assert.equal(savedLine[0].style.fg, "var(--ansi-1, #cd3131)");
+  assert.equal(renderer.toString({ includePendingClearedScreen: true }), "first\nold\n\nnew");
+  assert.equal(renderer.toHtmlContent({ includePendingClearedScreen: true }), 'first\n<span style="color: var(--ansi-1, #cd3131)">old</span>\n\n<span style="color: var(--ansi-2, #0dbc79)">new</span>');
+});

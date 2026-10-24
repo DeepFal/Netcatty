@@ -1,8 +1,9 @@
 import React from "react";
-import type { LinkModifier, RightClickBehavior, TerminalSettings } from "../../../domain/models";
+import { DEFAULT_TERMINAL_WORD_SEPARATORS } from "../../../domain/models";
+import type { DisconnectedNoticeMode, DynamicTabTitleMode, LinkModifier, MiddleClickBehavior, OscNotificationMode, RightClickBehavior, TerminalSettings, TerminalTabDoubleClickBehavior } from "../../../domain/models";
 import { Input } from "../../ui/input";
 import { Label } from "../../ui/label";
-import { SectionHeader, Select, SettingRow, Toggle } from "../settings-ui";
+import { SectionHeader, Select, SettingsAnchor, SettingRow, Toggle } from "../settings-ui";
 
 type Translate = (key: string) => string;
 
@@ -11,6 +12,33 @@ interface TerminalBehaviorSettingsProps {
   terminalSettings: TerminalSettings;
   updateTerminalSetting: <K extends keyof TerminalSettings>(key: K, value: TerminalSettings[K]) => void;
 }
+
+export const MIDDLE_CLICK_BEHAVIOR_OPTIONS: Array<{
+  value: MiddleClickBehavior;
+  labelKey: string;
+}> = [
+  { value: "context-menu", labelKey: "settings.terminal.behavior.middleClick.menu" },
+  { value: "paste", labelKey: "settings.terminal.behavior.middleClick.paste" },
+  { value: "disabled", labelKey: "settings.terminal.behavior.middleClick.disabled" },
+];
+
+export const DYNAMIC_TAB_TITLE_MODE_OPTIONS: Array<{
+  value: DynamicTabTitleMode;
+  labelKey: string;
+}> = [
+  { value: "off", labelKey: "settings.terminal.behavior.dynamicTabTitle.off" },
+  { value: "agent", labelKey: "settings.terminal.behavior.dynamicTabTitle.agent" },
+  { value: "all", labelKey: "settings.terminal.behavior.dynamicTabTitle.all" },
+];
+
+export const TAB_DOUBLE_CLICK_BEHAVIOR_OPTIONS: Array<{
+  value: TerminalTabDoubleClickBehavior;
+  labelKey: string;
+}> = [
+  { value: "duplicate", labelKey: "settings.terminal.behavior.tabDoubleClick.duplicate" },
+  { value: "copy", labelKey: "settings.terminal.behavior.tabDoubleClick.copy" },
+  { value: "disabled", labelKey: "settings.terminal.behavior.tabDoubleClick.disabled" },
+];
 
 export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> = ({
   t,
@@ -21,6 +49,34 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
       <SectionHeader title={t("settings.terminal.section.behavior")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
+          anchorId="terminal-auto-close-on-exit"
+          label={t("settings.terminal.behavior.autoCloseOnExit")}
+          description={t("settings.terminal.behavior.autoCloseOnExit.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.autoCloseOnExit}
+            onChange={(v) => updateTerminalSetting("autoCloseOnExit", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-disconnected-notice"
+          label={t("settings.terminal.behavior.disconnectedNotice")}
+          description={t("settings.terminal.behavior.disconnectedNotice.desc")}
+        >
+          <Select
+            value={terminalSettings.disconnectedNoticeMode}
+            options={[
+              { value: "terminal", label: t("settings.terminal.behavior.disconnectedNotice.terminal") },
+              { value: "dialog", label: t("settings.terminal.behavior.disconnectedNotice.dialog") },
+            ]}
+            onChange={(v) => updateTerminalSetting("disconnectedNoticeMode", v as DisconnectedNoticeMode)}
+            className="w-40"
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-right-click"
           label={t("settings.terminal.behavior.rightClick")}
           description={t("settings.terminal.behavior.rightClick.desc")}
         >
@@ -37,6 +93,27 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
         </SettingRow>
 
         <SettingRow
+          label={t("settings.terminal.behavior.rightClick.longPressMenu")}
+          description={t("settings.terminal.behavior.rightClick.longPressMenu.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.rightClickLongPressMenu ?? false}
+            onChange={(v) => updateTerminalSetting("rightClickLongPressMenu", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          label={t("settings.terminal.behavior.rightClick.fullscreenMenu")}
+          description={t("settings.terminal.behavior.rightClick.fullscreenMenu.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.showContextMenuOverFullscreenApps}
+            onChange={(v) => updateTerminalSetting("showContextMenuOverFullscreenApps", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-copy-on-select"
           label={t("settings.terminal.behavior.copyOnSelect")}
           description={t("settings.terminal.behavior.copyOnSelect.desc")}
         >
@@ -44,13 +121,48 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
         </SettingRow>
 
         <SettingRow
-          label={t("settings.terminal.behavior.middleClickPaste")}
-          description={t("settings.terminal.behavior.middleClickPaste.desc")}
+          anchorId="terminal-normalize-text-on-copy"
+          label={t("settings.terminal.behavior.normalizeTextOnCopy")}
+          description={t("settings.terminal.behavior.normalizeTextOnCopy.desc")}
         >
-          <Toggle checked={terminalSettings.middleClickPaste} onChange={(v) => updateTerminalSetting("middleClickPaste", v)} />
+          <Toggle
+            checked={terminalSettings.normalizeTextOnCopy ?? true}
+            onChange={(v) => updateTerminalSetting("normalizeTextOnCopy", v)}
+          />
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-middle-click"
+          label={t("settings.terminal.behavior.middleClick")}
+          description={t("settings.terminal.behavior.middleClick.desc")}
+        >
+          <Select
+            value={terminalSettings.middleClickBehavior}
+            options={MIDDLE_CLICK_BEHAVIOR_OPTIONS.map((option) => ({
+              value: option.value,
+              label: t(option.labelKey),
+            }))}
+            onChange={(v) => updateTerminalSetting("middleClickBehavior", v as MiddleClickBehavior)}
+            className="w-36"
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-word-separators"
+          label={t("settings.terminal.behavior.wordSeparators")}
+          description={t("settings.terminal.behavior.wordSeparators.desc")}
+        >
+          <Input
+            value={terminalSettings.wordSeparators}
+            onChange={(e) => updateTerminalSetting("wordSeparators", e.target.value)}
+            placeholder={`${DEFAULT_TERMINAL_WORD_SEPARATORS}=,:`}
+            className="w-56 font-mono"
+            spellCheck={false}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-bracketed-paste"
           label={t("settings.terminal.behavior.bracketedPaste")}
           description={t("settings.terminal.behavior.bracketedPaste.desc")}
         >
@@ -58,6 +170,81 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-auto-upload-clipboard-image"
+          label={t("settings.terminal.behavior.autoUploadClipboardImage")}
+          description={t("settings.terminal.behavior.autoUploadClipboardImage.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.autoUploadClipboardImageOnPaste ?? false}
+            onChange={(v) => updateTerminalSetting("autoUploadClipboardImageOnPaste", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-confirm-multiline-paste"
+          label={t("settings.terminal.behavior.confirmMultilinePaste")}
+          description={t("settings.terminal.behavior.confirmMultilinePaste.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.confirmBeforeMultilinePaste ?? false}
+            onChange={(v) => updateTerminalSetting("confirmBeforeMultilinePaste", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-confirm-multiline-paste-min-lines"
+          label={t("settings.terminal.behavior.confirmMultilinePasteMinLines")}
+          description={t("settings.terminal.behavior.confirmMultilinePasteMinLines.desc")}
+        >
+          <Input
+            type="number"
+            min={1}
+            max={1000}
+            value={terminalSettings.multilinePasteConfirmMinLines ?? 2}
+            onChange={(e) => {
+              const val = parseInt(e.target.value);
+              if (!isNaN(val) && val >= 1 && val <= 1000) {
+                updateTerminalSetting("multilinePasteConfirmMinLines", val);
+              }
+            }}
+            className="w-24"
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-shift-enter-newline"
+          label={t("settings.terminal.behavior.shiftEnterNewline")}
+          description={t("settings.terminal.behavior.shiftEnterNewline.desc")}
+        >
+          <Toggle checked={terminalSettings.shiftEnterNewlineEnabled ?? true} onChange={(v) => updateTerminalSetting("shiftEnterNewlineEnabled", v)} />
+        </SettingRow>
+
+        <SettingRow
+          label={t("settings.terminal.behavior.shiftEnterNewlineText")}
+          description={t("settings.terminal.behavior.shiftEnterNewlineText.desc")}
+        >
+          <Input
+            value={terminalSettings.shiftEnterNewlineText ?? "\\e\\r"}
+            onChange={(e) => updateTerminalSetting("shiftEnterNewlineText", e.target.value)}
+            placeholder="\\e\\r"
+            className="w-56 font-mono"
+            spellCheck={false}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-shift-enter-force-text"
+          label={t("settings.terminal.behavior.shiftEnterForceText")}
+          description={t("settings.terminal.behavior.shiftEnterForceText.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.shiftEnterForceText ?? false}
+            onChange={(v) => updateTerminalSetting("shiftEnterForceText", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-clear-wipes-scrollback"
           label={t("settings.terminal.behavior.clearWipesScrollback")}
           description={t("settings.terminal.behavior.clearWipesScrollback.desc")}
         >
@@ -79,6 +266,56 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-tab-double-click"
+          label={t("settings.terminal.behavior.tabDoubleClick")}
+          description={t("settings.terminal.behavior.tabDoubleClick.desc")}
+        >
+          <Select
+            value={terminalSettings.tabDoubleClickBehavior}
+            options={TAB_DOUBLE_CLICK_BEHAVIOR_OPTIONS.map((option) => ({
+              value: option.value,
+              label: t(option.labelKey),
+            }))}
+            onChange={(v) => updateTerminalSetting("tabDoubleClickBehavior", v as TerminalTabDoubleClickBehavior)}
+            className="w-44"
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-dynamic-tab-title"
+          label={t("settings.terminal.behavior.dynamicTabTitle")}
+          description={t("settings.terminal.behavior.dynamicTabTitle.desc")}
+        >
+          <Select
+            value={terminalSettings.dynamicTabTitleMode ?? "agent"}
+            options={DYNAMIC_TAB_TITLE_MODE_OPTIONS.map((option) => ({
+              value: option.value,
+              label: t(option.labelKey),
+            }))}
+            onChange={(v) => updateTerminalSetting("dynamicTabTitleMode", v as DynamicTabTitleMode)}
+            className="w-44"
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-osc-notifications"
+          label={t("settings.terminal.behavior.oscNotifications")}
+          description={t("settings.terminal.behavior.oscNotifications.desc")}
+        >
+          <Select
+            value={terminalSettings.oscNotifications ?? "always"}
+            options={[
+              { value: "always", label: t("settings.terminal.behavior.oscNotifications.always") },
+              { value: "unfocused", label: t("settings.terminal.behavior.oscNotifications.unfocused") },
+              { value: "off", label: t("settings.terminal.behavior.oscNotifications.off") },
+            ]}
+            onChange={(v) => updateTerminalSetting("oscNotifications", v as OscNotificationMode)}
+            className="w-40"
+          />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-osc52-clipboard"
           label={t("settings.terminal.behavior.osc52Clipboard")}
           description={t("settings.terminal.behavior.osc52Clipboard.desc")}
         >
@@ -131,6 +368,22 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-link-browser"
+          label={t("settings.terminal.behavior.linkBrowser")}
+          description={t("settings.terminal.behavior.linkBrowser.desc")}
+        >
+          <Select
+            value={terminalSettings.linkBrowser ?? 'netcatty'}
+            options={[
+              { value: 'netcatty', label: t('settings.terminal.behavior.linkBrowser.netcatty') },
+              { value: 'system', label: t('settings.terminal.behavior.linkBrowser.system') },
+            ]}
+            onChange={(v) => updateTerminalSetting('linkBrowser', v as 'netcatty' | 'system')}
+            className="w-48"
+          />
+        </SettingRow>
+
+        <SettingRow
           label={t("settings.terminal.behavior.linkModifier")}
           description={t("settings.terminal.behavior.linkModifier.desc")}
         >
@@ -149,7 +402,7 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
       </div>
 
       <SectionHeader title={t("settings.terminal.section.scrollback")} />
-      <div className="rounded-lg border bg-card p-4">
+      <SettingsAnchor anchorId="terminal-scrollback-rows" className="rounded-lg border bg-card p-4">
         <p className="text-sm text-muted-foreground mb-3">
           {t("settings.terminal.scrollback.desc")}
         </p>
@@ -169,10 +422,10 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
             className="w-full"
           />
         </div>
-      </div>
+      </SettingsAnchor>
 
       <SectionHeader title={t("settings.terminal.section.startupCommand")} />
-      <div className="rounded-lg border bg-card p-4">
+      <SettingsAnchor anchorId="terminal-startup-command-delay" className="rounded-lg border bg-card p-4">
         <p className="text-sm text-muted-foreground mb-3">
           {t("settings.terminal.startupCommandDelay.desc")}
         </p>
@@ -192,6 +445,6 @@ export const TerminalBehaviorSettings: React.FC<TerminalBehaviorSettingsProps> =
             className="w-full"
           />
         </div>
-      </div>
+      </SettingsAnchor>
   </>
 );

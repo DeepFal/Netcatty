@@ -8,6 +8,14 @@
  * - Memory pressure handling
  */
 
+export const XTERM_UNLIMITED_SCROLLBACK_CAP = 50000;
+
+export function resolveXTermScrollback(scrollback: number): number {
+  // xterm.js treats 0 as "no scrollback". Keep the app's 0 sentinel useful
+  // without asking xterm to resize/reflow nearly one million buffer rows.
+  return scrollback === 0 ? XTERM_UNLIMITED_SCROLLBACK_CAP : scrollback;
+}
+
 export const XTERM_PERFORMANCE_CONFIG = {
   // Memory and Scrollback Settings
   scrollback: {
@@ -92,16 +100,10 @@ export const XTERM_PERFORMANCE_CONFIG = {
     largeBufferThreshold: 1024 * 1024, // 1MB
   },
 
-  // Keyword highlighting optimizations
+  // Output-pressure quiet window shared by optional terminal side work.
   highlighting: {
-    // Debounce time for viewport scanning (ms)
-    // Higher values = better scrolling performance, but slower highlight "catch up"
-    debounceMs: 200,
-    // Minimum interval between immediate (rAF) refreshes in ms.
-    // Prevents heavy output (e.g. tail -f) from refreshing every frame.
-    immediateMinIntervalMs: 50,
-    // Number of unique line scan results to keep cached.
-    cacheEntries: 1200,
+    // Let large output settle before deferred work catches up.
+    largeOutputQuietMs: 480,
   },
 };
 

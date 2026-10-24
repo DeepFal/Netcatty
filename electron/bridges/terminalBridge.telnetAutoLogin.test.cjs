@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const net = require("node:net");
+const iconv = require("iconv-lite");
 
 const terminalBridge = require("./terminalBridge.cjs");
 
@@ -54,10 +55,10 @@ test("startTelnetSession answers login prompts with saved credentials", async ()
         promptedForUsername = true;
         socket.write("Username: ");
       }
-      if (joined.includes("admin\r") && !joined.includes("secret\r")) {
+      if (joined.includes("admin\r\n") && !joined.includes("secret\r\n")) {
         socket.write("\r\nPassword: ");
       }
-      if (joined.includes("secret\r")) {
+      if (joined.includes("secret\r\n")) {
         socket.end("\r\nWelcome\r\nrouter# ");
       }
     });
@@ -92,13 +93,75 @@ test("startTelnetSession answers login prompts with saved credentials", async ()
     );
 
     assert.equal(result.sessionId, "telnet-auto-login-test");
-    await waitFor(() => received.join("").includes("\radmin\rsecret\r"));
-    assert.equal(received.join(""), "\radmin\rsecret\r");
+    await waitFor(() => (
+      received.join("").includes("\r\nadmin\r\nsecret\r\n")
+      && sentEvents.some((evt) =>
+        evt.channel === "netcatty:telnet:auto-login-complete" &&
+        evt.payload?.sessionId === "telnet-auto-login-test",
+      )
+    ));
+    assert.equal(received.join(""), "\r\nadmin\r\nsecret\r\n");
     assert.ok(sentEvents.some((evt) =>
       evt.channel === "netcatty:telnet:auto-login-complete" &&
       evt.payload?.sessionId === "telnet-auto-login-test",
     ));
     assert.deepEqual(serverErrors, []);
+  } finally {
+    terminalBridge.cleanupAllSessions();
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("startTelnetSession encodes saved Telnet credentials with the session charset", async () => {
+  const chunks = [];
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      sockets.delete(socket);
+    });
+    socket.write("Username: ");
+    socket.on("data", (chunk) => {
+      chunks.push(chunk);
+      if (Buffer.concat(chunks).includes(iconv.encode("管理员\r\n", "gb18030"))) {
+        socket.write("\r\nPassword: ");
+      }
+    });
+  });
+
+  const port = await listen(server);
+  const sessions = new Map();
+  terminalBridge.init({
+    sessions,
+    electronModule: {
+      webContents: {
+        fromId: () => ({
+          send() {},
+        }),
+      },
+    },
+  });
+
+  try {
+    await terminalBridge.startTelnetSession(
+      { sender: { id: 1 } },
+      {
+        sessionId: "telnet-auto-login-gb18030",
+        hostname: "127.0.0.1",
+        port,
+        username: "管理员",
+        password: "秘密",
+        charset: "GB18030",
+      },
+    );
+
+    await waitFor(() => Buffer.concat(chunks).length >= iconv.encode("管理员\r\n秘密\r\n", "gb18030").length);
+    assert.deepEqual(
+      [...Buffer.concat(chunks)],
+      [...iconv.encode("管理员\r\n秘密\r\n", "gb18030")],
+    );
   } finally {
     terminalBridge.cleanupAllSessions();
     for (const socket of sockets) socket.destroy();
@@ -121,10 +184,10 @@ test("automated Telnet writes do not cancel auto-login", async () => {
     socket.on("data", (chunk) => {
       received.push(chunk);
       const joined = received.join("");
-      if (joined.includes("admin\r") && !joined.includes("secret\r")) {
+      if (joined.includes("admin\r\n") && !joined.includes("secret\r\n")) {
         socket.write("\r\nPassword: ");
       }
-      if (joined.includes("secret\r")) {
+      if (joined.includes("secret\r\n")) {
         socket.end("\r\nWelcome\r\n");
       }
     });
@@ -167,8 +230,8 @@ test("automated Telnet writes do not cancel auto-login", async () => {
 
     clientSocket.write("Username: ");
 
-    await waitFor(() => received.join("").includes("admin\rsecret\r"));
-    assert.equal(received.join(""), "show version\radmin\rsecret\r");
+    await waitFor(() => received.join("").includes("admin\r\nsecret\r\n"));
+    assert.equal(received.join(""), "show version\r\nadmin\r\nsecret\r\n");
   } finally {
     terminalBridge.cleanupAllSessions();
     for (const socket of sockets) socket.destroy();
@@ -236,3 +299,50 @@ test("manual Telnet writes cancel auto-login", async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+for (const source of ["confirmed", "broadcast"]) {
+  test(`paced ${source} user paste cancels saved login without losing line spacing`, async () => {
+    const sockets = new Set();
+    const received = [];
+    let prompted = false;
+    const server = net.createServer(socket => {
+      sockets.add(socket);
+      socket.setEncoding("utf8");
+      socket.on("error", () => {});
+      socket.on("close", () => sockets.delete(socket));
+      socket.on("data", chunk => {
+        received.push(chunk);
+        if (!prompted && received.join("").includes("first\r\n")) {
+          prompted = true;
+          // The saved login is still awaiting its first challenge when the
+          // user's first paced line arrives. Never inject saved credentials.
+          socket.write("\r\nUsername: \r\nPassword: ");
+        }
+      });
+    });
+    const port = await listen(server);
+    const events = [];
+    terminalBridge.init({ sessions: new Map(), electronModule: {
+      webContents: { fromId: () => ({ send: (channel, payload) => events.push({ channel, payload }) }) },
+    } });
+    const sessionId = `telnet-paced-${source}`;
+    try {
+      await terminalBridge.startTelnetSession({ sender: { id: 1 } }, {
+        sessionId, hostname: "127.0.0.1", port, username: "saved-user", password: "saved-secret",
+      });
+      terminalBridge.writeToSession({}, {
+        sessionId, data: "first\nsecond\r", automated: false, lineDelayMs: 150,
+        ...(source === "confirmed" ? { pasteRequestId: "user-paste" } : {}),
+      });
+      await waitFor(() => received.join("").includes("first\r\n"));
+      assert.equal(received.join(""), "first\r\n", "second line must remain paced");
+      await waitFor(() => received.join("").includes("second\r\n"));
+      assert.equal(received.join(""), "first\r\nsecond\r\n");
+      assert.ok(events.some(event => event.channel === "netcatty:telnet:auto-login-cancelled"));
+    } finally {
+      terminalBridge.cleanupAllSessions();
+      for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+}

@@ -14,7 +14,7 @@ import {
   queryRecentHistoryByCommand,
   fuzzyQueryHistory,
   type HistoryQueryOptions,
-} from "./commandHistoryStore";
+} from "../../../application/state/commandHistoryStore";
 import {
   loadSpec,
   hasSpec,
@@ -31,10 +31,12 @@ import {
   resolvePathComponents,
 } from "./remotePathCompleter";
 import { getSnippetSuggestions } from "./snippetCompleter";
-import type { Snippet } from "../../../domain/models";
+import { localizeSpecSuggestionDescriptions } from "./autocompleteDescriptionI18n";
+import type { AutocompleteHistoryScope, Snippet } from "../../../domain/models";
+import type { AutocompleteCwdSource } from "./terminalAutocompleteLayout";
 
 /** Source indicator for where a suggestion came from */
-export type SuggestionSource = "history" | "command" | "subcommand" | "option" | "arg" | "path" | "snippet";
+export type SuggestionSource = "history" | "command" | "subcommand" | "option" | "arg" | "path" | "snippet" | "plugin";
 
 export interface CompletionSuggestion {
   /** The text to insert */
@@ -49,10 +51,14 @@ export interface CompletionSuggestion {
   score: number;
   /** For history entries: execution frequency */
   frequency?: number;
+  /** Matching rule used by recent history surfaced during path completion. */
+  historyMatch?: "path-argument";
   /** For path suggestions: file type */
   fileType?: "file" | "directory" | "symlink";
   /** For snippet suggestions: the source snippet (used by the accept path). */
   snippet?: Snippet;
+  /** For plugin suggestions: the owning Provider contribution. */
+  providerId?: string;
 }
 
 export interface CompletionContext {
@@ -68,6 +74,81 @@ export interface CompletionContext {
   commandName: string;
   /** Whether the current position is after a recognized option that expects an argument */
   isOptionArg: boolean;
+}
+
+/**
+ * Soft wait for remote/local path listings. History, fig specs, and snippets are
+ * local and should paint without waiting on high-latency SSH exec (#2830).
+ * Timed-out listings still finish in the background: cacheable paths warm the
+ * shared cache, and cache-bypassed relative SSH paths notify via onLateResult
+ * so the UI can merge path suggestions when the listing finally resolves.
+ */
+export const PATH_COMPLETION_BUDGET_MS = 150;
+
+type PathSuggestionEntry = { name: string; type: "file" | "directory" | "symlink" };
+
+/** @internal Exported for unit tests covering the soft path-listing budget. */
+export async function getPathSuggestionsWithinBudget(
+  pathPromise: Promise<PathSuggestionEntry[]>,
+  budgetMs: number,
+  onLateResult?: (entries: PathSuggestionEntry[]) => void,
+): Promise<PathSuggestionEntry[]> {
+  if (!Number.isFinite(budgetMs) || budgetMs < 0) {
+    return pathPromise;
+  }
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const raced = await Promise.race([
+      // Settle rejections here so a late failure after timeout cannot surface
+      // as an unhandled rejection from the losing Promise.race branch.
+      pathPromise.then(
+        (entries) => ({ kind: "entries" as const, entries }),
+        () => ({ kind: "entries" as const, entries: [] as PathSuggestionEntry[] }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timeoutId = setTimeout(() => resolve({ kind: "timeout" }), budgetMs);
+      }),
+    ]);
+    if (raced.kind === "entries") return raced.entries;
+    // Keep the listing in flight. Cacheable paths warm the shared cache for a
+    // later keystroke; bypassed relative SSH paths have no cache, so surface
+    // the late result to the caller instead of discarding it.
+    void pathPromise.then(
+      (entries) => {
+        if (entries.length > 0) onLateResult?.(entries);
+      },
+      () => {},
+    );
+    return [];
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+function buildPathCompletionSuggestions(
+  ctx: CompletionContext,
+  pathEntries: PathSuggestionEntry[],
+  cwd: string | undefined,
+): CompletionSuggestion[] {
+  if (pathEntries.length === 0) return [];
+  const { pathPrefix, quoteSuffix } = resolvePathComponents(ctx.currentWord, cwd);
+  const isQuotedPath = ctx.currentWord.startsWith('"') || ctx.currentWord.startsWith("'");
+  const suggestions: CompletionSuggestion[] = [];
+  for (const entry of pathEntries) {
+    const insertName = isQuotedPath || !/[\\$'"|!<>;#~` ]/.test(entry.name)
+      ? entry.name
+      : shellEscape(entry.name);
+    const suffix = entry.type === "directory" ? "/" : "";
+    const fullPath = pathPrefix + insertName + suffix + quoteSuffix;
+    suggestions.push({
+      text: rebuildCommand(ctx.tokens, ctx.wordIndex, fullPath),
+      displayText: entry.name + suffix,
+      source: "path",
+      score: 750,
+      fileType: entry.type,
+    });
+  }
+  return suggestions;
 }
 
 interface SpecSuggestionResult {
@@ -164,19 +245,44 @@ export async function getCompletions(
   input: string,
   options: {
     hostId?: string;
+    hostGroup?: string;
     os?: "linux" | "windows" | "macos";
     maxResults?: number;
     /** Session ID for remote path completion */
     sessionId?: string;
     /** Connection protocol (ssh, local, telnet, serial) */
     protocol?: string;
+    /** Skip remote/local path listings that need extra SSH exec (single-channel bastions). */
+    skipPathCompletion?: boolean;
     /** Current working directory (from OSC 7) */
     cwd?: string;
+    cwdSource?: AutocompleteCwdSource;
     /** Custom snippets to surface at the command position */
     snippets?: Snippet[];
+    /** Which history pool to query (default: current host only). */
+    historyScope?: AutocompleteHistoryScope;
+    /**
+     * Soft budget for path listings (ms). Local suggestions return when this
+     * elapses even if remote `find` is still running. Use `Infinity` in tests
+     * that need the full remote listing.
+     */
+    pathBudgetMs?: number;
+    /**
+     * Invoked when a path listing finishes after the soft budget elapsed.
+     * Needed for cache-bypassed relative SSH cwd lookups, which cannot warm
+     * the shared directory cache for a later keystroke.
+     */
+    onLatePathSuggestions?: (suggestions: CompletionSuggestion[]) => void;
+    /**
+     * UI locale. zh-CN and zh-TW overlay bundled spec descriptions from their
+     * own dictionaries; any other locale keeps the original English text.
+     * Cached specs are not rewritten.
+     */
+    locale?: string;
   } = {},
 ): Promise<CompletionSuggestion[]> {
-  const { hostId, maxResults = 15 } = options;
+  const { hostId, maxResults = 15, historyScope = "host" } = options;
+  const pathBudgetMs = options.pathBudgetMs ?? PATH_COMPLETION_BUDGET_MS;
 
   if (!input || input.trim().length === 0) return [];
 
@@ -192,10 +298,13 @@ export async function getCompletions(
   const preferPathSuggestions = pathCheck.shouldComplete;
   const resultLimit = preferPathSuggestions ? Math.max(maxResults, 24) : maxResults;
 
+  // History queries honor historyScope; snippets still stay host-scoped.
+  const historyHostId = historyScope === "global" ? undefined : hostId;
+
   // 1. History suggestions (full command line prefix match)
   // Cap history to leave room for spec suggestions in the popup
   const historyOpts: HistoryQueryOptions = {
-    hostId,
+    hostId: historyHostId,
     limit: preferPathSuggestions ? 0 : 5,
   };
 
@@ -220,7 +329,7 @@ export async function getCompletions(
       commandName: ctx.commandName,
       excludeCommand: input,
       argumentPrefix: normalizeHistoryPathPrefix(ctx.currentWord),
-      hostId,
+      hostId: historyHostId,
       limit: 5,
     });
     for (let index = 0; index < recentHistory.length; index++) {
@@ -232,52 +341,64 @@ export async function getCompletions(
         source: "history",
         score: 720 - index,
         frequency: entry.frequency,
+        historyMatch: "path-argument",
       } satisfies CompletionSuggestion;
       suggestions.push(suggestion);
       seenSuggestionTexts.add(suggestion.text);
     }
   }
 
-  const canQueryPaths = options.protocol === "local" || options.sessionId !== undefined;
+  const canQueryPaths = !options.skipPathCompletion && (options.protocol === "local" || options.sessionId !== undefined);
 
   const pathEntries = canQueryPaths && pathCheck.shouldComplete
-    ? await getPathSuggestions(ctx, {
-      sessionId: options.sessionId,
-      protocol: options.protocol,
-      os: options.os,
-      cwd: options.cwd,
-      foldersOnly: pathCheck.foldersOnly,
-    })
+    ? await getPathSuggestionsWithinBudget(
+      getPathSuggestions(ctx, {
+        sessionId: options.sessionId,
+        protocol: options.protocol,
+        os: options.os,
+        cwd: options.cwd,
+        cwdSource: options.cwdSource,
+        foldersOnly: pathCheck.foldersOnly,
+      }),
+      pathBudgetMs,
+      (lateEntries) => {
+        if (!options.onLatePathSuggestions) return;
+        const latePathSuggestions = buildPathCompletionSuggestions(
+          ctx,
+          lateEntries,
+          options.cwd,
+        );
+        if (latePathSuggestions.length > 0) {
+          options.onLatePathSuggestions(latePathSuggestions);
+        }
+      },
+    )
     : [];
 
-  for (const suggestion of specResult.suggestions) {
+  const specSuggestions = await localizeSpecSuggestionDescriptions(
+    specResult.suggestions,
+    options.locale,
+  );
+  for (const suggestion of specSuggestions) {
     suggestions.push(suggestion);
     seenSuggestionTexts.add(suggestion.text);
   }
 
-  if (pathEntries.length > 0) {
-    const { pathPrefix, quoteSuffix } = resolvePathComponents(ctx.currentWord, options.cwd);
-    const isQuotedPath = ctx.currentWord.startsWith('"') || ctx.currentWord.startsWith("'");
-    for (const entry of pathEntries) {
-      const insertName = isQuotedPath || !/[\\$'"|!<>;#~` ]/.test(entry.name)
-        ? entry.name
-        : shellEscape(entry.name);
-      const suffix = entry.type === "directory" ? "/" : "";
-      const fullPath = pathPrefix + insertName + suffix + quoteSuffix;
-      const suggestion = {
-        text: rebuildCommand(ctx.tokens, ctx.wordIndex, fullPath),
-        displayText: entry.name + suffix,
-        source: "path",
-        score: 750,
-        fileType: entry.type,
-      } satisfies CompletionSuggestion;
-      suggestions.push(suggestion);
-      seenSuggestionTexts.add(suggestion.text);
-    }
+  for (const suggestion of buildPathCompletionSuggestions(ctx, pathEntries, options.cwd)) {
+    suggestions.push(suggestion);
+    seenSuggestionTexts.add(suggestion.text);
   }
 
-  // 3. Fuzzy history fallback (if prefix match yields few results)
-  if (!preferPathSuggestions && suggestions.length < 3 && input.length >= 2) {
+  // 3. Fuzzy history fallback while typing the command name. Once arguments
+  // are present, history completion is prefix-only: fuzzy matching the whole
+  // line can borrow characters from later paths and keep an incompatible
+  // middle argument visible (issue #3088).
+  if (
+    ctx.wordIndex === 0 &&
+    !preferPathSuggestions &&
+    suggestions.length < 3 &&
+    input.length >= 2
+  ) {
     const fuzzyMatches = fuzzyQueryHistory(input, {
       ...historyOpts,
       limit: 5,
@@ -296,13 +417,32 @@ export async function getCompletions(
     }
   }
 
-  // Snippets: only at the command position (typing the command name).
+  // Snippets: at the command position the whole typed line is the needle. Once
+  // arguments are present, match against the word being typed so a snippet
+  // (e.g. an email shortcut) stays reachable after a command like `git pull `
+  // (#3622). Argument-position matching is prefix-only, needs at least two
+  // typed characters, and yields when path completion owns the slot.
   // Push without the early seen-text skip: snippets score above history, so if
   // a snippet's label collides with an existing history entry's text, the
   // score-sort + final dedup below keeps the snippet (the higher-scored one).
-  if (options.snippets && options.snippets.length > 0 && ctx.wordIndex === 0) {
-    for (const snippetSuggestion of getSnippetSuggestions(input, options.snippets, { hostId })) {
-      suggestions.push(snippetSuggestion);
+  if (options.snippets && options.snippets.length > 0) {
+    const atCommandPosition = ctx.wordIndex === 0;
+    const argumentNeedle = normalizeHistoryPathPrefix(ctx.currentWord);
+    const snippetArgumentMatch = !atCommandPosition
+      && !preferPathSuggestions
+      && argumentNeedle.trim().length >= 2;
+    if (atCommandPosition || snippetArgumentMatch) {
+      for (const snippetSuggestion of getSnippetSuggestions(
+        atCommandPosition ? input : argumentNeedle,
+        options.snippets,
+        {
+          hostId,
+          hostGroup: options.hostGroup,
+          prefixOnly: !atCommandPosition,
+        },
+      )) {
+        suggestions.push(snippetSuggestion);
+      }
     }
   }
 

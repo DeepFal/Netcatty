@@ -1,5 +1,47 @@
-import { Host, TerminalSettings } from './models';
+import { detectVendorFromSshVersion } from './sshServerVendor.mjs';
+export { detectVendorFromSshVersion } from './sshServerVendor.mjs';
+import { remoteSoftwareRequiresSingleChannel } from './singleChannelSshBanner.shared.mjs';
+import { Host, Snippet, TerminalSettings } from './models';
+import type { HostOperatingSystem, HostOsSelection } from './models/connection';
+import { sanitizeHostIconFields } from './hostIcon';
+import { migrateHostConnectScriptIds } from './hostConnectScripts.ts';
 import { migrateDeprecatedFontOverride } from '../infrastructure/config/fonts';
+import { sanitizeOptionalSshTimeoutSeconds } from './sshConnectionTimeouts.ts';
+import {
+  isPluginHostProtocol,
+  sanitizePluginConnection,
+  stripBuiltInConnectionFieldsForPluginHost,
+} from './pluginConnection.ts';
+
+export type HostLabelRenameResult =
+  | { ok: true; changed: true; hosts: Host[] }
+  | { ok: true; changed: false; reason: 'unchanged' | 'missing'; hosts: Host[] }
+  | { ok: false; changed: false; reason: 'required'; hosts: Host[] };
+
+export function applyHostLabelRename(
+  hosts: Host[],
+  hostId: string,
+  rawLabel: string,
+): HostLabelRenameResult {
+  const nextLabel = rawLabel.trim();
+  if (!nextLabel) {
+    return { ok: false, changed: false, reason: 'required', hosts };
+  }
+
+  let found = false;
+  let changed = false;
+  const nextHosts = hosts.map((host) => {
+    if (host.id !== hostId) return host;
+    found = true;
+    if (host.label === nextLabel) return host;
+    changed = true;
+    return { ...host, label: nextLabel };
+  });
+
+  if (!found) return { ok: true, changed: false, reason: 'missing', hosts };
+  if (!changed) return { ok: true, changed: false, reason: 'unchanged', hosts };
+  return { ok: true, changed: true, hosts: nextHosts };
+}
 
 export const LINUX_DISTRO_OPTIONS = [
   'linux',
@@ -17,6 +59,18 @@ export const LINUX_DISTRO_OPTIONS = [
   'oracle',
   'kali',
   'alinux',
+  'openeuler',
+] as const;
+
+export const POSIX_PLATFORM_OPTIONS = [
+  'macos',
+  'freebsd',
+] as const;
+
+// Only platforms backed by the current stats and system-management commands
+// belong here. Other POSIX platforms may still be valid icon choices.
+const LINUX_LIKE_RUNTIME_PLATFORM_OPTIONS = [
+  'macos',
 ] as const;
 
 /**
@@ -30,6 +84,7 @@ export const NETWORK_DEVICE_OPTIONS = [
   'cisco',
   'juniper',
   'huawei',
+  'h3c',
   'hpe',
   'mikrotik',
   'fortinet',
@@ -43,6 +98,19 @@ export type NetworkDeviceVendor = typeof NETWORK_DEVICE_OPTIONS[number];
 export const normalizeDistroId = (value?: string) => {
   const v = (value || '').toLowerCase().trim();
   if (!v) return '';
+  if (
+    v === 'darwin' ||
+    v === 'macos' ||
+    v === 'mac os' ||
+    v === 'mac os x' ||
+    v.includes('darwin kernel') ||
+    v.includes('macos') ||
+    v.includes('mac os')
+  ) {
+    return 'macos';
+  }
+  if (v === 'windows' || v === 'win32' || /^openssh_for_windows(?:_|$)/.test(v)) return 'windows';
+  if (v.includes('freebsd')) return 'freebsd';
   if (v.includes('ubuntu')) return 'ubuntu';
   if (v.includes('debian')) return 'debian';
   if (v.includes('centos')) return 'centos';
@@ -56,6 +124,7 @@ export const normalizeDistroId = (value?: string) => {
   if (v.includes('almalinux')) return 'almalinux';
   if (v.includes('oracle')) return 'oracle';
   if (v.includes('kali')) return 'kali';
+  if (v.includes('openeuler') || v.includes('open euler')) return 'openeuler';
   // Alibaba Cloud Linux: os-release ID is `alinux` (older branding: Aliyun
   // Linux / `aliyun`). Must come before the generic `linux` fallback because
   // 'alinux'.includes('linux') is true and would otherwise resolve to 'linux'.
@@ -85,52 +154,7 @@ export const normalizeDistroId = (value?: string) => {
  * Arista EOS, all of which either are POSIX systems or present as
  * plain `OpenSSH_*` with no distinct vendor marker.
  */
-export const detectVendorFromSshVersion = (softwareVersion?: string): '' | NetworkDeviceVendor => {
-  const s = (softwareVersion || '').trim().replace(/^SSH-(?:2\.0|1\.99)-/i, '');
-  if (!s) return '';
 
-  // Cisco family — IOS, IOS XA, Wireless LAN Controller
-  if (/^Cisco[-_]/i.test(s)) return 'cisco';
-  if (/^CiscoIOS_/i.test(s)) return 'cisco';
-  if (/^CISCO_WLC\b/.test(s)) return 'cisco';
-  // Note: `IPSSH-*` is used by both Cisco and 3Com devices (per Nmap
-  // `match ssh m|^SSH-([\d.]+)-IPSSH-([\d.]+)\|`), so we cannot map it
-  // to a specific vendor icon from the banner alone. Users who want a
-  // custom icon for such devices can set one via the Host Details
-  // manual distro override. The stats-polling gate is still handled
-  // correctly via `host.deviceType === 'network'`.
-
-  // Juniper NetScreen firewall (JUNOS itself uses OpenSSH and is caught
-  // by the fallback failure-counter path in useServerStats).
-  if (/^NetScreen\b/.test(s)) return 'juniper';
-
-  // Huawei VRP and related products
-  if (s === '-') return 'huawei';
-  if (/^HUAWEI[-_]/i.test(s)) return 'huawei';
-  if (/^VRP-/i.test(s)) return 'huawei';
-
-  // HPE / H3C — Comware switches, Integrated Lights-Out (iLO), legacy 3Com
-  if (/^Comware-/i.test(s)) return 'hpe';
-  if (/^3Com\s*OS/i.test(s)) return 'hpe';
-  if (/^mpSSH_/i.test(s)) return 'hpe';
-
-  // MikroTik RouterOS
-  if (/^ROSSSH\b/.test(s)) return 'mikrotik';
-
-  // Fortinet FortiOS / FortiGate
-  if (/^FortiSSH_/i.test(s)) return 'fortinet';
-
-  // Palo Alto Networks PAN-OS
-  if (/^PaloAltoNetworks[_-]/i.test(s)) return 'paloalto';
-
-  // ZyXEL ZyWALL
-  if (/^Zyxel\s*SSH/i.test(s)) return 'zyxel';
-
-  // Ruijie RGOS
-  if (/^RGOS_SSH\b/i.test(s)) return 'ruijie';
-
-  return '';
-};
 
 /**
  * Classify a distro/vendor ID into a high-level device class. Features that
@@ -140,19 +164,83 @@ export const detectVendorFromSshVersion = (softwareVersion?: string): '' | Netwo
 export type DeviceClass = 'linux-like' | 'network-device' | 'other';
 
 export const classifyDistroId = (distroId?: string): DeviceClass => {
-  const v = (distroId || '').toLowerCase().trim();
+  const v = normalizeDistroId(distroId) || (distroId || '').toLowerCase().trim();
   if (!v) return 'other';
   if ((NETWORK_DEVICE_OPTIONS as readonly string[]).includes(v)) return 'network-device';
   if ((LINUX_DISTRO_OPTIONS as readonly string[]).includes(v)) return 'linux-like';
+  if ((LINUX_LIKE_RUNTIME_PLATFORM_OPTIONS as readonly string[]).includes(v)) return 'linux-like';
   return 'other';
 };
+
+export const HOST_OS_SELECTIONS = ['auto', 'linux', 'windows', 'macos', 'freebsd', 'unknown'] as const;
+
+export function getHostOsSelection(host?: Pick<Host, 'os' | 'osOverride'> | null): HostOsSelection {
+  if (host?.osOverride && (HOST_OS_SELECTIONS as readonly string[]).includes(host.osOverride)) {
+    return host.osOverride;
+  }
+  return host?.os === 'windows' || host?.os === 'macos' ? host.os : 'auto';
+}
+
+/** Resolve system facts separately from cosmetic manualDistro/icon choices. */
+export function resolveHostOs(
+  host?: Pick<Host, 'os' | 'osOverride' | 'distro' | 'deviceType' | 'protocol'> | null,
+): HostOperatingSystem {
+  if (host?.protocol === 'local') return host.os;
+  const selection = getHostOsSelection(host);
+  if (selection !== 'auto') return selection;
+  if (host?.deviceType === 'network' || classifyDistroId(host?.distro) === 'network-device') return 'unknown';
+  const distro = normalizeDistroId(host?.distro);
+  if (distro === 'windows' || distro === 'macos' || distro === 'freebsd') return distro;
+  if ((LINUX_DISTRO_OPTIONS as readonly string[]).includes(distro)) return 'linux';
+  return 'unknown';
+}
+
+/**
+ * Decide whether to offer the "enable Network Device Mode" suggestion after
+ * distro/vendor detection. We only nag once per host, and never when the user
+ * has already turned the mode on. The detected value must classify as a
+ * network-device vendor (exact match — see `classifyDistroId`), so a normal
+ * Linux distro whose name merely embeds a vendor keyword never triggers it.
+ */
+export const shouldSuggestNetworkDeviceMode = (opts: {
+  host?: Pick<Host, 'deviceType'> | null;
+  detectedDistro?: string;
+  alreadyHandled?: boolean;
+  /**
+   * Effective session protocol (mosh/et folded in). The suggestion — and its
+   * host-level `deviceType: 'network'` write — must match the Host Details
+   * "Network Device Mode" toggle, which is only exposed for plain SSH sessions
+   * (not Mosh/ET/serial/telnet/local). Offering it elsewhere would let the user
+   * persist a hidden host-level mode that surprises later SSH reconnects (#2367).
+   */
+  effectiveProtocol?: string;
+}): boolean => {
+  if (!opts.host) return false;
+  if (opts.host.deviceType === 'network') return false;
+  if (opts.alreadyHandled) return false;
+  if (opts.effectiveProtocol !== undefined && opts.effectiveProtocol !== 'ssh') {
+    return false;
+  }
+  return classifyDistroId(opts.detectedDistro) === 'network-device';
+};
+
+/**
+ * True when an extra exec channel on the terminal transport is unsafe because
+ * the host is a network device. Use this to skip probes. Do not store it as
+ * session.singleChannelSsh: that runtime flag is stamped only after a
+ * recognized one-channel bastion banner.
+ */
+export const hostRestrictsExtraSshChannels = (
+  host?: Pick<Host, 'deviceType'> | null,
+): boolean => host?.deviceType === 'network';
 
 /**
  * Decide whether it is safe to run the post-connect `pwd` probe that
  * discovers the session's working directory. The probe opens an extra exec
  * channel running a POSIX-shell script; strict network-device CLIs such as
  * Huawei VRP respond by closing the whole SSH session (#1043), so it must be
- * skipped for them.
+ * skipped for them. Software banners that allow only one session channel per
+ * TCP connection have the same constraint.
  *
  * `isNetworkDevice` covers hosts we already classified (a reconnect, or an
  * explicit `deviceType: 'network'`). On a brand-new host that field is not
@@ -162,8 +250,12 @@ export const classifyDistroId = (distroId?: string): DeviceClass => {
 export const shouldProbeSessionCwd = (opts: {
   isNetworkDevice: boolean;
   remoteSshVersion?: string;
+  restrictExtraSshChannels?: boolean;
 }): boolean =>
-  !opts.isNetworkDevice && !detectVendorFromSshVersion(opts.remoteSshVersion);
+  !opts.isNetworkDevice
+  && !opts.restrictExtraSshChannels
+  && !remoteSoftwareRequiresSingleChannel(opts.remoteSshVersion)
+  && !detectVendorFromSshVersion(opts.remoteSshVersion);
 
 export const getEffectiveHostDistro = (
   host?: Pick<Host, 'distro' | 'manualDistro' | 'distroMode'> | null,
@@ -182,6 +274,15 @@ export const formatHostPort = (hostname: string, port?: number | null): string =
   const isIPv6 = hostname.includes(':') && !hostname.startsWith('[');
   const display = isIPv6 ? `[${hostname}]` : hostname;
   return `${display}:${port}`;
+};
+
+/** Hostname/IP text for one-click clipboard copy from the vault host list. */
+export const getHostAddressForClipboard = (
+  host: Pick<Host, 'hostname' | 'protocol'>,
+): string => {
+  // Plugin endpoints live in pluginConnection.configuration; hostname may be a label/provider id.
+  if (isPluginHostProtocol(host.protocol)) return '';
+  return String(host.hostname ?? '').trim();
 };
 
 export const resolveTelnetUsername = (
@@ -212,6 +313,47 @@ export const normalizePrimaryTelnetState = (host: Host): Host =>
   host.protocol === 'telnet' && !host.telnetEnabled
     ? { ...host, telnetEnabled: true }
     : host;
+
+export const migrateHostsFromLegacyLineTimestamps = (
+  hosts: Host[],
+  legacyEnabled: boolean,
+): Host[] => {
+  if (!legacyEnabled) return hosts;
+  let changed = false;
+  const migrated = hosts.map((host) => {
+    if (host.showLineTimestamps !== undefined) return host;
+    changed = true;
+    return { ...host, showLineTimestamps: true };
+  });
+  return changed ? migrated : hosts;
+};
+
+export const preserveConcurrentHostLineTimestampUpdate = ({
+  draft,
+  openedHost,
+  latestHost,
+}: {
+  draft: Host;
+  openedHost?: Host | null;
+  latestHost?: Host | null;
+}): Host => {
+  if (!openedHost || !latestHost) return draft;
+  if (draft.id !== openedHost.id || draft.id !== latestHost.id) return draft;
+  let next = draft;
+  if (
+    draft.showLineTimestamps === openedHost.showLineTimestamps &&
+    latestHost.showLineTimestamps !== openedHost.showLineTimestamps
+  ) {
+    next = { ...next, showLineTimestamps: latestHost.showLineTimestamps };
+  }
+  if (
+    draft.sftpFollowTerminalCwd === openedHost.sftpFollowTerminalCwd &&
+    latestHost.sftpFollowTerminalCwd !== openedHost.sftpFollowTerminalCwd
+  ) {
+    next = { ...next, sftpFollowTerminalCwd: latestHost.sftpFollowTerminalCwd };
+  }
+  return next;
+};
 
 export const upsertHostById = (hosts: Host[], host: Host): Host[] => {
   const hostExists = hosts.some((entry) => entry.id === host.id);
@@ -254,8 +396,29 @@ export const resolveHostKeepalive = (
   };
 };
 
-export const sanitizeHost = (host: Host): Host => {
-  const cleanHostname = (host.hostname || '').split(/\s+/)[0];
+/**
+ * True when two host records are interchangeable for React identity reuse.
+ * Uses shallow key comparison (nested objects compared by reference).
+ */
+export const hostsEqualForIdentityReuse = (a: Host, b: Host): boolean => {
+  if (a === b) return true;
+  const aKeys = Object.keys(a) as (keyof Host)[];
+  const bKeys = Object.keys(b) as (keyof Host)[];
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (a[key] !== b[key]) return false;
+  }
+  for (const key of bKeys) {
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+};
+
+export const sanitizeHost = (host: Host, snippets: Snippet[] = []): Host => {
+  // Serial endpoints are paths, not network hostnames; pipe names may contain spaces.
+  const cleanHostname = host.protocol === 'serial'
+    ? (host.serialConfig?.path || host.hostname || '').trim()
+    : (host.hostname || '').trim().split(/\s+/)[0];
   const cleanDistro = normalizeDistroId(host.distro);
   const cleanManualDistro = normalizeDistroId(host.manualDistro);
   const cleanDistroMode =
@@ -264,14 +427,68 @@ export const sanitizeHost = (host: Host): Host => {
       : host.distroMode === 'auto'
         ? 'auto'
         : undefined;
+  const cleanHostIcon = sanitizeHostIconFields(host);
+  const osSelection = getHostOsSelection(host);
   const migrated = migrateDeprecatedFontOverride(host);
+  // Before explicit per-host authentication modes existed, new hosts were
+  // persisted with authMethod="password" even though an empty password still
+  // allowed the ambient agent and local keys. Preserve that behavior once on
+  // load; versioned records represent a deliberate Password-only selection.
+  const isLegacyPasswordDefault = migrated.authPolicyVersion !== 1
+    && migrated.authMethod === 'password'
+    && (
+      migrated.useSshAgent === true
+      || Boolean(migrated.identityFileId)
+      || Boolean(migrated.identityFilePaths?.length)
+      || (migrated.savePassword !== false && !migrated.password?.length)
+    );
+  const inferredLegacyAuthMethod = migrated.authPolicyVersion !== 1
+    && migrated.authMethod === undefined
+    && migrated.useSshAgent !== true
+    ? migrated.identityFilePaths?.length
+      ? 'key'
+      : !migrated.identityFileId && migrated.password?.length
+        ? 'password'
+        : undefined
+    : undefined;
   const cleanNotes = host.notes?.trim() || undefined;
-  return {
+  const connectScriptIds = host.connectScriptIds ?? (
+    snippets.length > 0
+      ? migrateHostConnectScriptIds(host, snippets)
+      : host.loginScriptId
+        ? [host.loginScriptId]
+        : undefined
+  );
+  const pluginConnection = sanitizePluginConnection(host.pluginConnection, host.protocol);
+  const sanitized: Host = {
     ...migrated,
+    authMethod: isLegacyPasswordDefault
+      ? undefined
+      : migrated.authMethod ?? inferredLegacyAuthMethod,
+    authPolicyVersion: 1,
     hostname: cleanHostname,
+    osOverride: osSelection,
+    os: osSelection === 'linux' || osSelection === 'windows' || osSelection === 'macos' ? osSelection : host.os,
     distro: cleanDistro,
     distroMode: cleanDistroMode,
     manualDistro: cleanManualDistro || undefined,
+    iconMode: undefined,
+    iconId: undefined,
+    iconColorMode: undefined,
+    iconColor: undefined,
+    iconColorCustom: undefined,
+    ...cleanHostIcon,
     notes: cleanNotes,
+    sshTcpConnectTimeoutSeconds: sanitizeOptionalSshTimeoutSeconds(
+      host.sshTcpConnectTimeoutSeconds,
+    ),
+    sshAuthReadyTimeoutSeconds: sanitizeOptionalSshTimeoutSeconds(
+      host.sshAuthReadyTimeoutSeconds,
+    ),
+    connectScriptIds: connectScriptIds && connectScriptIds.length > 0 ? connectScriptIds : undefined,
+    pluginConnection,
   };
+  delete (sanitized as { singleChannelSsh?: unknown }).singleChannelSsh;
+  delete (sanitized as { backedBySavedHost?: boolean }).backedBySavedHost;
+  return stripBuiltInConnectionFieldsForPluginHost(sanitized);
 };

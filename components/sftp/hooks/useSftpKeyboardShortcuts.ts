@@ -5,20 +5,46 @@
  * Supports copy, cut, paste, select all, rename, delete, refresh, and new folder.
  */
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import type { MutableRefObject } from "react";
 import { KeyBinding, matchesKeyBinding } from "../../../domain/models";
-import { getParentPath, joinPath } from "../../../application/state/sftp/utils";
-import { sftpClipboardStore, SftpClipboardFile } from "./useSftpClipboard";
-import { sftpFocusStore } from "./useSftpFocusedPane";
-import { sftpDialogActionStore } from "./useSftpDialogAction";
-import { sftpTreeSelectionStore } from "./useSftpTreeSelectionStore";
+import { getParentPath, joinPath, resolveSftpWindowsPathOptions } from "../../../application/state/sftp/utils";
+import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
+import { sftpClipboardStore, SftpClipboardFile } from "../../../application/state/sftp/sftpClipboardStore";
+import { sftpFocusStore } from "../../../application/state/sftp/sftpFocusStore";
+import { sftpDialogActionStore } from "../../../application/state/sftp/sftpDialogActionStore";
+import { sftpTreeSelectionStore } from "../../../application/state/sftp/sftpTreeSelectionStore";
 import { sftpListOrderStore } from "./useSftpListOrderStore";
+import { sftpPaneViewModeStore } from "../../../application/state/sftp/sftpPaneViewModeStore";
+import { sftpFilterFocusStore } from "../../../application/state/sftp/sftpFilterFocusStore";
 import { keepOnlyPaneSelections } from "./selectionScope";
 import type { SftpStateApi } from "../../../application/state/useSftpState";
+import type { UploadEndpointPin } from "../../../application/state/sftp/uploadTargetPin";
 import { filterHiddenFiles, isNavigableDirectory } from "../utils";
+import { resolveSameConnectionPasteAction } from "../../../application/state/sftp/samePanePaste";
 import type { SftpFileEntry } from "../../../types";
+import { extractDropEntries, type DropEntry } from "../../../lib/sftpFileUtils";
 import { toast } from "../../ui/toast";
+import { isAppLockOverlayActive } from '../../../infrastructure/appLockOverlayDom';
+import {
+  createDropEntriesFromClipboardFiles,
+  getSftpClipboardSystemTextPaths,
+  getSupportedClipboardUploadFiles,
+  isSftpNativeClipboardPasteEnabled,
+  resolveSftpClipboardUploadTarget,
+  shouldLetNativePasteEventHandleSftpPaste,
+  sftpClipboardUploadStore,
+  type ClipboardLocalFile,
+} from "../clipboardUpload";
+import {
+  advanceSftpTypeahead,
+  resolveSftpTypeaheadSource,
+  type SftpTypeaheadState,
+} from "../../../domain/sftpTypeahead";
+import {
+  resolveSftpActiveSelection,
+  resolveSftpSelectAllTarget,
+} from "../../../domain/sftpSelection";
 
 // SFTP action names that we handle
 const SFTP_ACTIONS = new Set([
@@ -34,6 +60,32 @@ const SFTP_ACTIONS = new Set([
   "sftpGoParent",
   "sftpNavigateTo",
 ]);
+
+let pendingSftpSystemClipboardWrite: Promise<void> | null = null;
+
+const replaceSystemClipboardWithSftpPaths = async (paths: string[]) => {
+  const text = paths.join("\n");
+  if (!text) return;
+  const writeTask = (async () => {
+    const bridge = netcattyBridge.get();
+    try {
+      if (bridge?.writeClipboardText && await bridge.writeClipboardText(text)) return;
+    } catch {
+      // Fall back to the browser clipboard API.
+    }
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+    await navigator.clipboard.writeText(text).catch(() => {});
+  })();
+
+  pendingSftpSystemClipboardWrite = writeTask;
+  try {
+    await writeTask;
+  } finally {
+    if (pendingSftpSystemClipboardWrite === writeTask) {
+      pendingSftpSystemClipboardWrite = null;
+    }
+  }
+};
 
 // ── Tree Enter key action store ──────────────────────────────────────
 // Allows the keyboard shortcut hook to signal tree views to handle Enter.
@@ -89,6 +141,15 @@ const BASIC_NAV_KEYS: Record<string, string> = {
   'Backspace': 'sftpGoParent',
 };
 
+const isEditableShortcutTarget = (target: HTMLElement): boolean =>
+  target.tagName === "INPUT" ||
+  target.tagName === "TEXTAREA" ||
+  target.isContentEditable ||
+  !!target.closest?.(".monaco-editor, .monaco-diff-editor, .monaco-inputbox");
+
+const hasOpenDialog = (): boolean =>
+  !!document.querySelector('[role="dialog"][data-state="open"]');
+
 interface UseSftpKeyboardShortcutsParams {
   keyBindings: KeyBinding[];
   hotkeyScheme: "disabled" | "mac" | "pc";
@@ -122,26 +183,495 @@ export const useSftpKeyboardShortcuts = ({
   dialogActionScopeId,
   isActive,
 }: UseSftpKeyboardShortcutsParams) => {
+  const typeaheadRef = useRef<{ paneId: string; state: SftpTypeaheadState } | null>(null);
+
+  const getFocusedPane = useCallback(() => {
+    const sftp = sftpRef.current;
+    const focusedSide = sftpFocusStore.getFocusedSide();
+    const pane = focusedSide === "left"
+      ? sftp.leftTabs.tabs.find(p => p.id === sftp.leftTabs.activeTabId)
+      : sftp.rightTabs.tabs.find(p => p.id === sftp.rightTabs.activeTabId);
+    return { sftp, focusedSide, pane };
+  }, [sftpRef]);
+
+  const getClipboardUploadTarget = useCallback((pane: NonNullable<ReturnType<typeof getFocusedPane>["pane"]>) => {
+    const { selectedFileNames, treeSelection } = resolveSftpActiveSelection(
+      sftpPaneViewModeStore.get(pane.id),
+      Array.from(pane.selectedFiles) as string[],
+      sftpTreeSelectionStore.getSelectedItems(pane.id),
+    );
+    const treeActionSelection = treeSelection.filter((entry) => entry.name !== '..');
+
+    return resolveSftpClipboardUploadTarget({
+      currentPath: pane.connection!.currentPath,
+      selectedFileNames,
+      files: pane.files as SftpFileEntry[],
+      treeSelection: treeActionSelection,
+    });
+  }, []);
+
+  const showUploadResults = useCallback((results: Awaited<ReturnType<SftpStateApi["uploadExternalEntries"]>>) => {
+    if (results.some((result) => result.cancelled)) {
+      toast.info("Upload cancelled.", "SFTP");
+      return;
+    }
+
+    const successCount = results.filter((result) => result.success).length;
+    const failedFiles = results.filter((result) => !result.success && !result.cancelled);
+    if (successCount > 0) {
+      toast.success(`Uploaded ${successCount} item${successCount === 1 ? "" : "s"}.`, "SFTP");
+    }
+    failedFiles.forEach((failed) => {
+      const errorMsg = failed.error ? ` - ${failed.error}` : "";
+      toast.error(`Upload failed: ${failed.fileName}${errorMsg}`, "SFTP");
+    });
+  }, []);
+
+  const triggerPathBackedClipboardUpload = useCallback((
+    files: ClipboardLocalFile[],
+    focusedSide: "left" | "right",
+    targetPath: string,
+    connectionId: string,
+    tabId: string,
+    endpointPin: UploadEndpointPin,
+  ) => {
+    const sftp = sftpRef.current;
+    const uploadFiles = getSupportedClipboardUploadFiles(files);
+    if (uploadFiles.length === 0) return;
+
+    const entries = createDropEntriesFromClipboardFiles(uploadFiles);
+    const pin = { connectionId, tabId, endpointPin };
+
+    sftpClipboardUploadStore.trigger({
+      scopeId: dialogActionScopeId,
+      side: focusedSide,
+      targetPath,
+      files: uploadFiles,
+      onConfirm: async () => {
+        try {
+          const results: Awaited<ReturnType<SftpStateApi["uploadExternalEntries"]>> = [];
+          const fileEntries: DropEntry[] = [];
+
+          for (const file of uploadFiles) {
+            if (file.isDirectory) {
+              try {
+                const folderResults = await sftp.uploadExternalFolderPath(
+                  focusedSide,
+                  file.path,
+                  targetPath,
+                  pin,
+                );
+                results.push(...folderResults);
+              } catch (error) {
+                results.push({
+                  fileName: file.name,
+                  success: false,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            } else {
+              fileEntries.push(
+                entries.find((entry) => entry.localPath === file.path) ?? {
+                  file: null,
+                  localPath: file.path,
+                  relativePath: file.name,
+                  isDirectory: false,
+                  size: file.size,
+                },
+              );
+            }
+          }
+
+          if (fileEntries.length > 0) {
+            const fileResults = await sftp.uploadExternalEntries(focusedSide, fileEntries, {
+              targetPath,
+              ...pin,
+            });
+            results.push(...fileResults);
+          }
+
+          showUploadResults(results);
+        } catch (error) {
+          toast.error(error instanceof Error ? error.message : "Upload failed.", "SFTP");
+        }
+      },
+    });
+  }, [dialogActionScopeId, showUploadResults, sftpRef]);
+
+  const triggerDropEntriesClipboardUpload = useCallback((
+    entries: DropEntry[],
+    focusedSide: "left" | "right",
+    targetPath: string,
+    connectionId: string,
+    tabId: string,
+    endpointPin: UploadEndpointPin,
+  ) => {
+    const sftp = sftpRef.current;
+    if (entries.length === 0) return;
+
+    const rootNames = new Set<string>();
+    const previewFiles: ClipboardLocalFile[] = [];
+    for (const entry of entries) {
+      const rootName = entry.relativePath.split("/")[0];
+      if (rootNames.has(rootName)) continue;
+      rootNames.add(rootName);
+      previewFiles.push({
+        path: entry.localPath ?? entry.relativePath,
+        name: rootName,
+        isDirectory: entry.isDirectory,
+        size: entry.size,
+      });
+    }
+
+    const pin = { connectionId, tabId, endpointPin };
+
+    sftpClipboardUploadStore.trigger({
+      scopeId: dialogActionScopeId,
+      side: focusedSide,
+      targetPath,
+      files: previewFiles,
+      onConfirm: async () => {
+        try {
+          const results = await sftp.uploadExternalEntries(focusedSide, entries, {
+            targetPath,
+            ...pin,
+          });
+          showUploadResults(results);
+        } catch (error) {
+          toast.error(error instanceof Error ? error.message : "Upload failed.", "SFTP");
+        }
+      },
+    });
+  }, [dialogActionScopeId, showUploadResults, sftpRef]);
+
+  const pasteInternalSftpClipboard = useCallback(async (
+    focusedSide: "left" | "right",
+    pane: NonNullable<ReturnType<typeof getFocusedPane>["pane"]>,
+  ) => {
+    const sftp = sftpRef.current;
+    const clipboard = sftpClipboardStore.get();
+    if (!clipboard || clipboard.files.length === 0) return;
+
+    // Pin the destination this paste was validated against. Native pastes may
+    // await clipboard reads before reaching here, and the user can navigate or
+    // switch tabs meanwhile — startTransfer would otherwise resolve the
+    // then-active pane and could land inside a directory this guard approved
+    // as safe.
+    const targetConnectionId = pane.connection!.id;
+    const targetPath = pane.connection!.currentPath;
+
+    const isSameConnection = clipboard.sourceSide === focusedSide
+      && clipboard.sourceConnectionId === pane.connection!.id;
+    if (isSameConnection) {
+      const connection = pane.connection!;
+      const pasteAction = await resolveSameConnectionPasteAction({
+        operation: clipboard.operation,
+        sourcePath: clipboard.sourcePath,
+        targetPath,
+        files: clipboard.files,
+        isLocal: connection.isLocal,
+        sftpId: connection.isLocal ? null : (sftp.getSftpIdForConnection(connection.id) ?? null),
+      });
+      if (pasteAction === "block-same-folder") {
+        toast.info("The cut items are already in this folder.", "SFTP");
+        return;
+      }
+      if (pasteAction === "block-into-source") {
+        toast.info(
+          clipboard.operation === "cut"
+            ? "A folder can't be moved into itself. Choose a different folder."
+            : "A folder can't be copied into itself or one of its subfolders. Choose a different folder.",
+          "SFTP",
+        );
+        return;
+      }
+      // Same-pane copy (and cut into a different folder) falls through to the
+      // shared transfer path below.
+    }
+
+    // Re-read live state, not the pre-await snapshot: the same-connection
+    // guard above can await realpath while the user switches tabs, and
+    // startTransfer resolves the currently active pane. Comparing against the
+    // stale snapshot would let the pinned targetPath land on a different
+    // connection (and a cut would then delete the original after the wrong
+    // host received the data).
+    const liveSftp = sftpRef.current;
+    const sourceTabs = clipboard.sourceSide === "left" ? liveSftp.leftTabs.tabs : liveSftp.rightTabs.tabs;
+    const sourcePane = sourceTabs.find((tab) => tab.connection?.id === clipboard.sourceConnectionId);
+
+    if (!sourcePane?.connection) {
+      toast.info("Paste source is no longer available.", "SFTP");
+      return;
+    }
+
+    try {
+      const isCut = clipboard.operation === "cut";
+      const pendingNames = new Set(clipboard.files.map((file) => file.name));
+      const completedNames = new Set<string>();
+      const failedNames = new Set<string>();
+
+      const updateClipboardAfterCompletion = (showToast: boolean) => {
+        if (!isCut) return;
+        const current = sftpClipboardStore.get();
+        if (
+          !current ||
+          current.operation !== "cut" ||
+          current.sourceConnectionId !== clipboard.sourceConnectionId ||
+          current.sourcePath !== clipboard.sourcePath ||
+          current.sourceSide !== clipboard.sourceSide
+        ) {
+          return;
+        }
+
+        const remainingFiles = current.files.filter((file) => !completedNames.has(file.name));
+        if (remainingFiles.length === 0) {
+          sftpClipboardStore.clear();
+        } else {
+          sftpClipboardStore.updateFiles(remainingFiles);
+        }
+
+        if (showToast && failedNames.size > 0) {
+          toast.info("Some items could not be transferred and were kept in the clipboard.", "SFTP");
+        }
+      };
+
+      const handleTransferComplete = async (result: {
+        fileName: string;
+        originalFileName?: string;
+        status: string;
+      }) => {
+        if (!isCut) return;
+        const sourceFileName = result.originalFileName ?? result.fileName;
+        if (!pendingNames.has(sourceFileName)) return;
+        pendingNames.delete(sourceFileName);
+
+        if (result.status === "completed") {
+          try {
+            await sftp.deleteFilesAtPath(
+              clipboard.sourceSide,
+              clipboard.sourceConnectionId,
+              clipboard.sourcePath,
+              [sourceFileName],
+            );
+            completedNames.add(sourceFileName);
+          } catch {
+            failedNames.add(sourceFileName);
+          }
+        } else {
+          failedNames.add(sourceFileName);
+        }
+
+        updateClipboardAfterCompletion(pendingNames.size === 0);
+      };
+
+      // Abandon the paste when the destination pane changed while the paste
+      // was pending: startTransfer resolves the currently active pane, and a
+      // different connection would receive a path pinned from another host.
+      // Read the live tabs (see the liveSftp note above), not the snapshot
+      // captured before the await.
+      const activeTargetPane = focusedSide === "left"
+        ? liveSftp.leftTabs.tabs.find((tab) => tab.id === liveSftp.leftTabs.activeTabId)
+        : liveSftp.rightTabs.tabs.find((tab) => tab.id === liveSftp.rightTabs.activeTabId);
+      if (!activeTargetPane?.connection || activeTargetPane.connection.id !== targetConnectionId) {
+        toast.info("Paste cancelled: the destination connection changed.", "SFTP");
+        return;
+      }
+
+      await sftp.startTransfer(clipboard.files, clipboard.sourceSide, focusedSide, {
+        sourcePane,
+        sourcePath: clipboard.sourcePath,
+        sourceConnectionId: clipboard.sourceConnectionId,
+        targetPath,
+        onTransferComplete: handleTransferComplete,
+      });
+    } catch {
+      toast.error("Paste failed. Please try again.", "SFTP");
+    }
+  }, [sftpRef]);
+
+  const handlePaste = useCallback(
+    (e: ClipboardEvent) => {
+      if (!isActive) return;
+      if (!isSftpNativeClipboardPasteEnabled(hotkeyScheme, keyBindings)) return;
+
+      const target = e.target as HTMLElement;
+      if (isEditableShortcutTarget(target) || hasOpenDialog()) return;
+
+      const hasInternalClipboardFiles = sftpClipboardStore.hasFiles();
+      const { focusedSide, pane } = getFocusedPane();
+      if (!pane?.connection) return;
+
+      const targetPath = getClipboardUploadTarget(pane);
+      const connectionId = pane.connection.id;
+      const tabId = pane.id;
+      const endpointPin: UploadEndpointPin = {
+        isLocal: pane.connection.isLocal,
+        hostId: pane.connection.isLocal ? null : (pane.connection.hostId ?? null),
+        cacheKey: pane.connection.isLocal
+          ? "local"
+          : (sftpRef.current.getConnectionCacheKey?.(connectionId) ?? null),
+      };
+      const pendingClipboardWrite = pendingSftpSystemClipboardWrite;
+      const bridge = netcattyBridge.get();
+      const dataTransfer = e.clipboardData;
+      const hasClipboardItems = (dataTransfer?.items?.length ?? 0) > 0;
+      // webkitGetAsEntry must be invoked synchronously during the paste event.
+      const dropEntriesPromise = dataTransfer?.items?.length
+        ? extractDropEntries(dataTransfer).catch(() => [])
+        : null;
+      const pastedFileSnapshot = dataTransfer?.files?.length
+        ? Array.from(dataTransfer.files).filter((file) => file.name)
+        : [];
+
+      if (!hasInternalClipboardFiles && !hasClipboardItems && !bridge?.readClipboardFiles) {
+        return;
+      }
+
+      const runPaste = async () => {
+        if (pendingClipboardWrite && hasInternalClipboardFiles) {
+          await pendingClipboardWrite;
+          await pasteInternalSftpClipboard(focusedSide, pane);
+          return;
+        }
+
+        if (bridge?.readClipboardFiles) {
+          const clipboardFiles = await bridge.readClipboardFiles();
+          if (clipboardFiles.length > 0) {
+            triggerPathBackedClipboardUpload(
+              clipboardFiles, focusedSide, targetPath, connectionId, tabId, endpointPin,
+            );
+            return;
+          }
+        }
+
+        if (dropEntriesPromise) {
+          const entries = await dropEntriesPromise;
+          if (entries.length > 0) {
+            triggerDropEntriesClipboardUpload(
+              entries, focusedSide, targetPath, connectionId, tabId, endpointPin,
+            );
+            return;
+          }
+        }
+
+        if (pastedFileSnapshot.length > 0) {
+          const pathBackedFiles: ClipboardLocalFile[] = pastedFileSnapshot
+            .map((file) => ({
+              path: bridge?.getPathForFile?.(file) || file.name,
+              name: file.name,
+              isDirectory: false,
+              size: file.size,
+            }))
+            .filter((file) => file.path.includes("/") || file.path.includes("\\"));
+          if (pathBackedFiles.length > 0) {
+            triggerPathBackedClipboardUpload(
+              pathBackedFiles, focusedSide, targetPath, connectionId, tabId, endpointPin,
+            );
+            return;
+          }
+        }
+
+        if (hasInternalClipboardFiles) {
+          await pasteInternalSftpClipboard(focusedSide, pane);
+        }
+      };
+
+      e.preventDefault();
+      e.stopPropagation();
+      void runPaste();
+    },
+    [
+      getClipboardUploadTarget,
+      getFocusedPane,
+      hotkeyScheme,
+      isActive,
+      keyBindings,
+      pasteInternalSftpClipboard,
+      sftpRef,
+      triggerDropEntriesClipboardUpload,
+      triggerPathBackedClipboardUpload,
+    ],
+  );
+
   const handleKeyDown = useCallback(
     async (e: KeyboardEvent) => {
       // Basic SFTP keyboard navigation should work whenever the SFTP tab is active,
       // even if the user has disabled global/custom hotkeys.
       if (!isActive) return;
 
-      // Skip if focus is on an input element
       const target = e.target as HTMLElement;
-      const isEditableTarget =
-        target.tagName === "INPUT" ||
-        target.tagName === "TEXTAREA" ||
-        target.isContentEditable ||
-        !!target.closest?.(".monaco-editor, .monaco-diff-editor, .monaco-inputbox");
+
+      // Skip when a dialog or overlay is open to prevent SFTP shortcuts from
+      // firing while interacting with unrelated dialogs (e.g. settings, confirm).
+      if (hasOpenDialog()) {
+        return;
+      }
+
+      const isEditableTarget = isEditableShortcutTarget(target);
+      const isSftpSearchTarget = Boolean(target.closest?.(
+        '[data-section="terminal-sftp-path"], [data-section="terminal-sftp-filter-bar"]',
+      ));
+      if (isEditableTarget && !isSftpSearchTarget) {
+        return;
+      }
+
+      if (hotkeyScheme !== "disabled") {
+        const isMac = hotkeyScheme === "mac";
+        const searchBinding = keyBindings.find((binding) => binding.action === "searchTerminal");
+        const searchKey = searchBinding ? (isMac ? searchBinding.mac : searchBinding.pc) : null;
+        if (searchKey && matchesKeyBinding(e, searchKey, isMac)) {
+          const { pane } = getFocusedPane();
+          if (!pane?.connection) return;
+
+          e.preventDefault();
+          e.stopPropagation();
+          sftpFilterFocusStore.request(pane.id);
+          return;
+        }
+      }
+
+      // Path/filter inputs may handle search above, but no other SFTP shortcut.
       if (isEditableTarget) {
         return;
       }
 
-      // Skip when a dialog or overlay is open to prevent SFTP shortcuts from
-      // firing while interacting with unrelated dialogs (e.g. settings, confirm).
-      if (document.querySelector('[role="dialog"][data-state="open"]')) {
+      // ── Printable keys: select the first visible name with this prefix ──
+      if (
+        e.key.length === 1
+        && !e.ctrlKey
+        && !e.metaKey
+        && !e.altKey
+        && !e.isComposing
+        && !/^\s$/u.test(e.key)
+        && !target.closest?.('[role="menu"], [role="listbox"]')
+      ) {
+        const { sftp, focusedSide, pane } = getFocusedPane();
+        if (!pane?.connection) return;
+
+        const source = resolveSftpTypeaheadSource(
+          sftpPaneViewModeStore.get(pane.id),
+          sftpListOrderStore.getItems(pane.id),
+          sftpTreeSelectionStore.getPaneState(pane.id).visibleItems,
+        );
+        if (source.names.length === 0) return;
+
+        const previous = typeaheadRef.current?.paneId === pane.id
+          ? typeaheadRef.current.state
+          : null;
+        const result = advanceSftpTypeahead(source.names, previous, e.key, Date.now());
+        typeaheadRef.current = { paneId: pane.id, state: result.state };
+
+        e.preventDefault();
+        e.stopPropagation();
+        if (result.matchIndex < 0) return;
+
+        keepOnlyPaneSelections(sftp, { side: focusedSide, tabId: pane.id });
+        if (source.kind === 'list') {
+          sftp.rangeSelect(focusedSide, [source.names[result.matchIndex]]);
+        } else {
+          sftpTreeSelectionStore.setSelection(pane.id, [source.items[result.matchIndex].path]);
+        }
+        sftpKeyboardSelectionStore.set(pane.id, result.matchIndex, result.matchIndex);
         return;
       }
 
@@ -155,12 +685,13 @@ export const useSftpKeyboardShortcuts = ({
         if (!pane || !pane.connection) return;
 
         const delta = e.key === 'ArrowDown' ? 1 : -1;
+        const viewMode = sftpPaneViewModeStore.get(pane.id);
 
-        // List view: navigate sorted display files.
-        // Prefer the list store when it exists so stale tree selection state
-        // cannot swallow keyboard navigation after switching views.
+        // List view: navigate sorted display files. The explicit view mode is
+        // authoritative even when the active list has no visible items.
         const listItems = sftpListOrderStore.getItems(pane.id);
-        if (listItems.length > 0) {
+        if (viewMode === 'list') {
+          if (listItems.length === 0) return;
           e.preventDefault();
           e.stopPropagation();
 
@@ -260,6 +791,11 @@ export const useSftpKeyboardShortcuts = ({
       const action = basicNavAction ?? matched?.action;
       if (!action || !SFTP_ACTIONS.has(action)) return;
 
+      const matchedKey = isMac ? matched?.binding.mac : matched?.binding.pc;
+      if (shouldLetNativePasteEventHandleSftpPaste(action, matchedKey)) {
+        return;
+      }
+
       // Prevent default behavior
       e.preventDefault();
       e.stopPropagation();
@@ -273,8 +809,14 @@ export const useSftpKeyboardShortcuts = ({
         : sftp.rightTabs.tabs.find(p => p.id === sftp.rightTabs.activeTabId);
 
       if (!pane || !pane.connection) return;
+      const viewMode = sftpPaneViewModeStore.get(pane.id);
+      const isTreeView = viewMode === 'tree';
       const treeSelectionState = sftpTreeSelectionStore.getPaneState(pane.id);
-      const treeSelection = sftpTreeSelectionStore.getSelectedItems(pane.id);
+      const { selectedFileNames, treeSelection } = resolveSftpActiveSelection(
+        viewMode,
+        Array.from(pane.selectedFiles) as string[],
+        sftpTreeSelectionStore.getSelectedItems(pane.id),
+      );
       const treeActionSelection = treeSelection.filter((entry) => entry.name !== '..');
 
       switch (action) {
@@ -297,16 +839,20 @@ export const useSftpKeyboardShortcuts = ({
               pane.connection.id,
               focusedSide,
             );
+            await replaceSystemClipboardWithSftpPaths(getSftpClipboardSystemTextPaths({
+              currentPath: pane.connection.currentPath,
+              selectedFileNames: [],
+              treeSelection: treeActionSelection,
+            }));
             break;
           }
 
           // Copy selected files to clipboard
-          const selectedFiles = Array.from(pane.selectedFiles) as string[];
-          if (selectedFiles.length === 0) return;
+          if (selectedFileNames.length === 0) return;
 
           {
             const filesByName = new Map((pane.files as SftpFileEntry[]).map(f => [f.name, f]));
-            const clipboardFiles: SftpClipboardFile[] = selectedFiles.map((name: string) => {
+            const clipboardFiles: SftpClipboardFile[] = selectedFileNames.map((name: string) => {
               const file = filesByName.get(name);
               return {
                 name,
@@ -320,6 +866,11 @@ export const useSftpKeyboardShortcuts = ({
               pane.connection.id,
               focusedSide
             );
+            await replaceSystemClipboardWithSftpPaths(getSftpClipboardSystemTextPaths({
+              currentPath: pane.connection.currentPath,
+              selectedFileNames,
+              treeSelection: [],
+            }));
           }
           break;
         }
@@ -343,16 +894,20 @@ export const useSftpKeyboardShortcuts = ({
               pane.connection.id,
               focusedSide,
             );
+            await replaceSystemClipboardWithSftpPaths(getSftpClipboardSystemTextPaths({
+              currentPath: pane.connection.currentPath,
+              selectedFileNames: [],
+              treeSelection: treeActionSelection,
+            }));
             break;
           }
 
           // Cut selected files to clipboard
-          const selectedFiles = Array.from(pane.selectedFiles) as string[];
-          if (selectedFiles.length === 0) return;
+          if (selectedFileNames.length === 0) return;
 
           {
             const filesByName = new Map((pane.files as SftpFileEntry[]).map(f => [f.name, f]));
-            const clipboardFiles: SftpClipboardFile[] = selectedFiles.map((name: string) => {
+            const clipboardFiles: SftpClipboardFile[] = selectedFileNames.map((name: string) => {
               const file = filesByName.get(name);
               return {
                 name,
@@ -366,107 +921,27 @@ export const useSftpKeyboardShortcuts = ({
               pane.connection.id,
               focusedSide
             );
+            await replaceSystemClipboardWithSftpPaths(getSftpClipboardSystemTextPaths({
+              currentPath: pane.connection.currentPath,
+              selectedFileNames,
+              treeSelection: [],
+            }));
           }
           break;
         }
 
         case "sftpPaste": {
-          // Paste files from clipboard
-          const clipboard = sftpClipboardStore.get();
-          if (!clipboard || clipboard.files.length === 0) return;
-
-          // Use startTransfer to paste files from source to current pane
-          // Allow paste when source and target are different connections, even on the same side
-          const isSameConnection = clipboard.sourceSide === focusedSide
-            && clipboard.sourceConnectionId === pane.connection.id;
-          if (!isSameConnection) {
-            const sourceTabs = clipboard.sourceSide === "left" ? sftp.leftTabs.tabs : sftp.rightTabs.tabs;
-            const sourcePane = sourceTabs.find((tab) => tab.connection?.id === clipboard.sourceConnectionId);
-
-            if (!sourcePane?.connection) {
-              toast.info("Paste source is no longer available.", "SFTP");
-              return;
-            }
-
-            // Cross-pane paste - use startTransfer
-            try {
-              const isCut = clipboard.operation === "cut";
-              const pendingNames = new Set(clipboard.files.map((file) => file.name));
-              const completedNames = new Set<string>();
-              const failedNames = new Set<string>();
-
-              const updateClipboardAfterCompletion = (showToast: boolean) => {
-                if (!isCut) return;
-                const current = sftpClipboardStore.get();
-                if (
-                  !current ||
-                  current.operation !== "cut" ||
-                  current.sourceConnectionId !== clipboard.sourceConnectionId ||
-                  current.sourcePath !== clipboard.sourcePath ||
-                  current.sourceSide !== clipboard.sourceSide
-                ) {
-                  return;
-                }
-
-                const remainingFiles = current.files.filter((file) => !completedNames.has(file.name));
-                if (remainingFiles.length === 0) {
-                  sftpClipboardStore.clear();
-                } else {
-                  sftpClipboardStore.updateFiles(remainingFiles);
-                }
-
-                if (showToast && failedNames.size > 0) {
-                  toast.info("Some items could not be transferred and were kept in the clipboard.", "SFTP");
-                }
-              };
-
-              const handleTransferComplete = async (result: {
-                fileName: string;
-                originalFileName?: string;
-                status: string;
-              }) => {
-                if (!isCut) return;
-                const sourceFileName = result.originalFileName ?? result.fileName;
-                if (!pendingNames.has(sourceFileName)) return;
-                pendingNames.delete(sourceFileName);
-
-                if (result.status === "completed") {
-                  try {
-                    await sftp.deleteFilesAtPath(
-                      clipboard.sourceSide,
-                      clipboard.sourceConnectionId,
-                      clipboard.sourcePath,
-                      [sourceFileName],
-                    );
-                    completedNames.add(sourceFileName);
-                  } catch {
-                    failedNames.add(sourceFileName);
-                  }
-                } else {
-                  failedNames.add(sourceFileName);
-                }
-
-                updateClipboardAfterCompletion(pendingNames.size === 0);
-              };
-
-              await sftp.startTransfer(clipboard.files, clipboard.sourceSide, focusedSide, {
-                sourcePane,
-                sourcePath: clipboard.sourcePath,
-                sourceConnectionId: clipboard.sourceConnectionId,
-                onTransferComplete: handleTransferComplete,
-              });
-            } catch {
-              toast.error("Paste failed. Please try again.", "SFTP");
-            }
-          } else {
-            // Same-pane paste is not supported - show info toast
-            toast.info("Paste within the same pane is not supported. Use copy to other pane instead.", "SFTP");
-          }
+          await pasteInternalSftpClipboard(focusedSide, pane);
           break;
         }
 
         case "sftpSelectAll": {
-          if (treeSelectionState.visibleItems.length > 0) {
+          const selectAllTarget = resolveSftpSelectAllTarget(
+            viewMode,
+            treeSelectionState.visibleItems.length,
+          );
+          if (selectAllTarget === 'none') break;
+          if (selectAllTarget === 'tree') {
             keepOnlyPaneSelections(sftp, { side: focusedSide, tabId: pane.id });
             sftpTreeSelectionStore.selectAllVisible(pane.id);
             break;
@@ -499,9 +974,8 @@ export const useSftpKeyboardShortcuts = ({
           }
 
           // Trigger rename for the first selected file
-          const selectedFiles = Array.from(pane.selectedFiles) as string[];
-          if (selectedFiles.length !== 1) return;
-          sftpDialogActionStore.trigger("rename", dialogActionScopeId, selectedFiles);
+          if (selectedFileNames.length !== 1) return;
+          sftpDialogActionStore.trigger("rename", dialogActionScopeId, selectedFileNames);
           break;
         }
 
@@ -516,9 +990,8 @@ export const useSftpKeyboardShortcuts = ({
           }
 
           // Delete selected files
-          const selectedFiles = Array.from(pane.selectedFiles) as string[];
-          if (selectedFiles.length === 0) return;
-          sftpDialogActionStore.trigger("delete", dialogActionScopeId, selectedFiles);
+          if (selectedFileNames.length === 0) return;
+          sftpDialogActionStore.trigger("delete", dialogActionScopeId, selectedFileNames);
           break;
         }
 
@@ -535,11 +1008,8 @@ export const useSftpKeyboardShortcuts = ({
         }
 
         case "sftpOpen": {
-          // Prefer list selection when the list store is active
-          const listItems = sftpListOrderStore.getItems(pane.id);
-          const selectedFiles = Array.from(pane.selectedFiles) as string[];
-          if (listItems.length > 0 && selectedFiles.length === 1) {
-            const fileName = selectedFiles[0];
+          if (!isTreeView && selectedFileNames.length === 1) {
+            const fileName = selectedFileNames[0];
             const entry = (pane.files as SftpFileEntry[]).find(f => f.name === fileName);
             if (entry) {
               if (isNavigableDirectory(entry)) {
@@ -552,11 +1022,9 @@ export const useSftpKeyboardShortcuts = ({
             break;
           }
 
-          // Only fall through to tree view if list store is empty (tree view mode)
-          if (listItems.length > 0) break;
-          const treeOpenSelection = sftpTreeSelectionStore.getSelectedItems(pane.id);
-          if (treeOpenSelection.length === 1) {
-            const item = treeOpenSelection[0];
+          if (!isTreeView) break;
+          if (treeActionSelection.length === 1) {
+            const item = treeActionSelection[0];
             if (item.isDirectory) _kbSelectionState.delete(pane.id);
             sftpTreeEnterStore.trigger(pane.id, item.path, item.isDirectory);
           }
@@ -564,7 +1032,11 @@ export const useSftpKeyboardShortcuts = ({
         }
 
         case "sftpGoParent": {
-          const parentPath = getParentPath(pane.connection.currentPath);
+          const windowsOpts = resolveSftpWindowsPathOptions(
+            pane.connection.currentPath,
+            pane.connection.homeDir,
+          );
+          const parentPath = getParentPath(pane.connection.currentPath, windowsOpts);
           if (parentPath !== pane.connection.currentPath) {
             _kbSelectionState.delete(pane.id);
             sftp.navigateTo(focusedSide, parentPath);
@@ -581,9 +1053,8 @@ export const useSftpKeyboardShortcuts = ({
             break;
           }
           // In list view, navigate to selected directory
-          const selectedFiles = Array.from(pane.selectedFiles) as string[];
-          if (selectedFiles.length === 1) {
-            const entry = (pane.files as SftpFileEntry[]).find(f => f.name === selectedFiles[0]);
+          if (selectedFileNames.length === 1) {
+            const entry = (pane.files as SftpFileEntry[]).find(f => f.name === selectedFileNames[0]);
             if (entry && isNavigableDirectory(entry)) {
               _kbSelectionState.delete(pane.id);
               sftp.navigateTo(focusedSide, joinPath(pane.connection.currentPath, entry.name));
@@ -593,12 +1064,23 @@ export const useSftpKeyboardShortcuts = ({
         }
       }
     },
-    [dialogActionScopeId, hotkeyScheme, isActive, keyBindings, sftpRef]
+    [dialogActionScopeId, getFocusedPane, hotkeyScheme, isActive, keyBindings, pasteInternalSftpClipboard, sftpRef]
   );
 
   useEffect(() => {
+    if (!isActive) return;
     // Use capture phase to intercept before other handlers
-    window.addEventListener("keydown", handleKeyDown, true);
-    return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [handleKeyDown]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isAppLockOverlayActive()) return;
+      handleKeyDown(event);
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [handleKeyDown, isActive]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    window.addEventListener("paste", handlePaste, true);
+    return () => window.removeEventListener("paste", handlePaste, true);
+  }, [handlePaste, isActive]);
 };

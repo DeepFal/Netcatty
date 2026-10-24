@@ -1,6 +1,16 @@
 import { useCallback } from "react";
 import { netcattyBridge } from "../../infrastructure/services/netcattyBridge";
 
+export function subscribeWindowFullscreenChanged(
+  cb: (isFullscreen: boolean) => void,
+): () => void {
+  try {
+    return netcattyBridge.get()?.onWindowFullScreenChanged?.(cb) ?? (() => {});
+  } catch {
+    return () => {};
+  }
+}
+
 export const useWindowControls = () => {
   const notifyRendererReady = useCallback(() => {
     try {
@@ -45,9 +55,11 @@ export const useWindowControls = () => {
     return bridge?.windowIsFullscreen?.() ?? false;
   }, []);
 
-  const onFullscreenChanged = useCallback((cb: (isFullscreen: boolean) => void) => {
+  const onFullscreenChanged = useCallback(subscribeWindowFullscreenChanged, []);
+
+  const onWindowCommandCloseRequested = useCallback((cb: () => void) => {
     const bridge = netcattyBridge.get();
-    return bridge?.onWindowFullScreenChanged?.(cb) ?? (() => {});
+    return bridge?.onWindowCommandCloseRequested?.(cb) ?? (() => {});
   }, []);
 
   return {
@@ -60,5 +72,6 @@ export const useWindowControls = () => {
     isMaximized,
     isFullscreen,
     onFullscreenChanged,
+    onWindowCommandCloseRequested,
   };
 };

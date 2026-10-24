@@ -56,6 +56,7 @@ function makeApi(overrides = {}) {
     NetcattyAgent: overrides.NetcattyAgent || class {},
     buildAlgorithms: overrides.buildAlgorithms || (() => ({ algos: true })),
     getSshAgentSocket: overrides.getSshAgentSocket || (() => null),
+    prepareSystemSshAgentForAuth: overrides.prepareSystemSshAgentForAuth,
     readFileNoFollow: overrides.readFileNoFollow || (async () => null),
     expandIdentityFilePath: overrides.expandIdentityFilePath || ((p) => p),
     isAutoFillablePasswordChallenge:
@@ -147,6 +148,47 @@ test("connects with a stored password and adopts the connection on ready", async
   assert.equal(session.conn, undefined);
 });
 
+test("ET stats companion uses ET-specific session fields", async () => {
+  const { api, sessions } = makeApi();
+  const session = { etStatsAuth: { hostname: "example.com", port: 2222, username: "alice", password: "secret" } };
+  sessions.set("sid", session);
+
+  const pending = api.ensureEtStatsConnection(session, "sid");
+  await tick();
+  assert.equal(FakeSSHClient.instances.length, 1);
+  const client = FakeSSHClient.instances[0];
+  assert.equal(client.connectOpts.host, "example.com");
+  assert.equal(client.connectOpts.port, 2222);
+  assert.equal(client.connectOpts.username, "alice");
+  assert.equal(client.connectOpts.password, "secret");
+
+  client.emitReady();
+  const result = await pending;
+
+  assert.equal(result, client);
+  assert.equal(session.etStatsConn, client);
+  assert.equal(session.moshStatsConn, undefined);
+  assert.equal(session.conn, undefined);
+});
+
+test("ET stats companion caches permanent failures on ET-specific fields", async () => {
+  const { api, sessions } = makeApi();
+  const session = { etStatsAuth: { hostname: "h", username: "u", password: "p" } };
+  sessions.set("sid", session);
+
+  const p1 = api.ensureEtStatsConnection(session, "sid");
+  await tick();
+  const authErr = new Error("All configured authentication methods failed");
+  authErr.level = "client-authentication";
+  FakeSSHClient.instances[0].emitError(authErr);
+  assert.equal(await p1, null);
+  assert.equal(session.etStatsConnFailed, true);
+
+  const r2 = await api.ensureEtStatsConnection(session, "sid");
+  assert.equal(r2, null);
+  assert.equal(FakeSSHClient.instances.length, 1);
+});
+
 test("uses a parseable private key and passphrase, not password fallback only", async () => {
   const { api, sessions } = makeApi();
   const session = {
@@ -204,6 +246,161 @@ test("reads identity files non-interactively when no inline key is present", asy
   assert.deepEqual(reads, ["~/.ssh/id_ed25519"]);
   const client = FakeSSHClient.instances[0];
   assert.equal(client.connectOpts.privateKey, "FILEKEY");
+});
+
+test("tries every discovered identity file for automatic stats auth", async () => {
+  const { api, sessions } = makeApi({
+    readFileNoFollow: async (p) => p.endsWith("id_first") ? "FIRSTKEY" : "SECONDKEY",
+    getSshAgentSocket: () => "/tmp/agent.sock",
+  });
+  const session = {
+    moshStatsAuth: {
+      hostname: "h",
+      username: "u",
+      identityFilePaths: ["~/.ssh/id_first", "~/.ssh/id_second"],
+    },
+  };
+  sessions.set("sid", session);
+
+  api.ensureMoshStatsConnection(session, "sid");
+  await tick();
+  await tick();
+
+  const handler = FakeSSHClient.instances[0].connectOpts.authHandler;
+  const nextMethod = () => {
+    let method;
+    handler(null, false, (value) => { method = value; });
+    return method;
+  };
+
+  assert.equal(nextMethod(), "none");
+  assert.equal(nextMethod(), "agent");
+  assert.deepEqual(nextMethod(), {
+    type: "publickey",
+    username: "u",
+    key: "FIRSTKEY",
+    passphrase: undefined,
+  });
+  assert.deepEqual(nextMethod(), {
+    type: "publickey",
+    username: "u",
+    key: "SECONDKEY",
+    passphrase: undefined,
+  });
+});
+
+test("automatic stats auth keeps local-key fallback with an explicit agent", async () => {
+  const { api, sessions } = makeApi({
+    readFileNoFollow: async (p) => p.endsWith("id_first") ? "FIRSTKEY" : "SECONDKEY",
+    prepareSystemSshAgentForAuth: async () => "/tmp/selected-agent.sock",
+  });
+  const session = {
+    moshStatsAuth: {
+      hostname: "h",
+      username: "u",
+      authMethod: "auto",
+      useSshAgent: true,
+      identityFilePaths: ["~/.ssh/id_first", "~/.ssh/id_second"],
+    },
+  };
+  sessions.set("sid", session);
+
+  api.ensureMoshStatsConnection(session, "sid");
+  await tick();
+  await tick();
+
+  const connectOpts = FakeSSHClient.instances[0].connectOpts;
+  assert.equal(connectOpts.agent, "/tmp/selected-agent.sock");
+  const offered = drainAuthHandler(connectOpts.authHandler);
+  assert.equal(offered[0], "none");
+  assert.equal(offered[1], "agent");
+  assert.deepEqual(offered.slice(2), [
+    { type: "publickey", username: "u", key: "FIRSTKEY", passphrase: undefined },
+    { type: "publickey", username: "u", key: "SECONDKEY", passphrase: undefined },
+  ]);
+});
+
+test("sk-* key handle + certificate routes to the prepared hardware-backed agent, not a software cert agent", async () => {
+  let agentConstructions = 0;
+  const { api, sessions } = makeApi({
+    NetcattyAgent: class {
+      constructor() {
+        agentConstructions += 1;
+      }
+    },
+    prepareSystemSshAgentForAuth: async () => "/tmp/prepared-fido-agent.sock",
+  });
+  const session = {
+    moshStatsAuth: {
+      hostname: "h",
+      username: "u",
+      authMethod: "auto",
+      useSshAgent: true,
+      // SK private material parses non-interactively but can never sign
+      // locally — building a software certificate agent around it fails auth
+      // and blocks prepareSystemSshAgentForAuth below.
+      privateKey: "sk-ssh-ed25519@openssh.com AAAA handle test",
+      certificate: "sk-ssh-ed25519-cert-v01@openssh.com AAAA cert test",
+      identityFilePaths: [],
+    },
+  };
+  sessions.set("sid", session);
+
+  api.ensureMoshStatsConnection(session, "sid");
+  await tick();
+  await tick();
+
+  assert.equal(agentConstructions, 0, "software certificate agent must not be built from an SK handle");
+  assert.equal(FakeSSHClient.instances[0].connectOpts.agent, "/tmp/prepared-fido-agent.sock");
+});
+
+test("path-backed sk-* key handles are filtered out of the companion's identity files too", async () => {
+  let agentConstructions = 0;
+  const { api, sessions } = makeApi({
+    NetcattyAgent: class {
+      constructor() {
+        agentConstructions += 1;
+      }
+    },
+    readFileNoFollow: async () => "sk-ecdsa-sha2-nistp256@openssh.com AAAA handle test",
+    prepareSystemSshAgentForAuth: async () => "/tmp/prepared-fido-agent.sock",
+  });
+  const session = {
+    moshStatsAuth: {
+      hostname: "h",
+      username: "u",
+      authMethod: "auto",
+      useSshAgent: true,
+      certificate: "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com AAAA cert test",
+      identityFilePaths: ["~/.ssh/id_sk"],
+    },
+  };
+  sessions.set("sid", session);
+
+  api.ensureMoshStatsConnection(session, "sid");
+  await tick();
+  await tick();
+
+  assert.equal(agentConstructions, 0, "software certificate agent must not be built from a path-backed SK handle");
+  assert.equal(FakeSSHClient.instances[0].connectOpts.agent, "/tmp/prepared-fido-agent.sock");
+});
+
+test("FIDO stats preparation resolves only its requesting live window", async () => {
+  let prepared;
+  let destroyed = false;
+  const sender = { id: 2823, isDestroyed: () => destroyed };
+  const { api, sessions } = makeApi({ prepareSystemSshAgentForAuth: async auth => {
+    prepared = auth;
+    return "/tmp/fido-stats.sock";
+  } });
+  const session = { moshStatsAuth: { hostname: "h", username: "u", useSshAgent: true } };
+  sessions.set("sid", session);
+  api.ensureMoshStatsConnection(session, "sid", sender);
+  await tick();
+  assert.equal(prepared.resolveWebContents(), sender);
+  destroyed = true;
+  assert.equal(prepared.resolveWebContents(), null);
+  FakeSSHClient.instances[0].emit("close");
 });
 
 test("falls back to ssh-agent when a socket is available and no inline creds", async () => {
@@ -570,6 +767,70 @@ test("a connection that becomes ready after the session closed is discarded", as
   assert.equal(FakeSSHClient.instances[0].ended, true);
   assert.equal(session.conn, undefined);
   assert.equal(session.moshStatsConn, undefined);
+});
+
+test("releases FIDO agent resources when the stats companion closes", async () => {
+  let releaseCount = 0;
+  const { api, sessions } = makeApi({
+    prepareSystemSshAgentForAuth: async () => ({
+      _releaseNetcattyFidoAgent: () => { releaseCount += 1; },
+    }),
+  });
+  const session = {
+    moshStatsAuth: {
+      hostname: "h",
+      username: "u",
+      useSshAgent: true,
+    },
+  };
+  sessions.set("sid", session);
+
+  const pending = api.ensureMoshStatsConnection(session, "sid");
+  await tick();
+  await tick();
+  const client = FakeSSHClient.instances[0];
+  assert.ok(client.connectOpts.agent);
+  assert.equal(typeof client.connectOpts._releaseNetcattyFidoAgent, "undefined");
+  client.emitReady();
+  assert.equal(await pending, client);
+  assert.equal(releaseCount, 0);
+
+  client.emit("close");
+  assert.equal(releaseCount, 1);
+  // close/end fan-out must stay one-shot
+  client.emit("close");
+  assert.equal(releaseCount, 1);
+});
+
+test("releases FIDO agent resources when stats connect is abandoned via sessionGone", async () => {
+  let releaseCount = 0;
+  let resolvePrepare;
+  const prepareGate = new Promise((resolve) => { resolvePrepare = resolve; });
+  const { api, sessions } = makeApi({
+    prepareSystemSshAgentForAuth: async () => {
+      await prepareGate;
+      return {
+        _releaseNetcattyFidoAgent: () => { releaseCount += 1; },
+      };
+    },
+  });
+  const session = {
+    moshStatsAuth: {
+      hostname: "h",
+      username: "u",
+      useSshAgent: true,
+    },
+  };
+  sessions.set("sid", session);
+
+  const pending = api.ensureMoshStatsConnection(session, "sid");
+  await tick();
+  session.closed = true;
+  sessions.delete("sid");
+  resolvePrepare();
+  assert.equal(await pending, null);
+  assert.equal(releaseCount, 1);
+  assert.equal(FakeSSHClient.instances.length, 0);
 });
 
 test("honors host algorithm settings via buildAlgorithms", async () => {

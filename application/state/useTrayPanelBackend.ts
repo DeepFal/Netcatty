@@ -22,9 +22,19 @@ export const useTrayPanelBackend = () => {
     await bridge?.jumpToSessionFromTrayPanel?.(sessionId);
   }, []);
 
+  const closeSessionFromTrayPanel = useCallback(async (sessionId: string) => {
+    const bridge = netcattyBridge.get();
+    await bridge?.closeSessionFromTrayPanel?.(sessionId);
+  }, []);
+
   const connectToHostFromTrayPanel = useCallback(async (hostId: string) => {
     const bridge = netcattyBridge.get();
     await bridge?.connectToHostFromTrayPanel?.(hostId);
+  }, []);
+
+  const startPortForwardFromTrayPanel = useCallback(async (ruleId: string) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.startPortForwardFromTrayPanel?.(ruleId);
   }, []);
 
   const onTrayPanelCloseRequest = useCallback((callback: () => void) => {
@@ -50,6 +60,7 @@ export const useTrayPanelBackend = () => {
           remotePort?: number;
           status: "inactive" | "connecting" | "active" | "error";
           hostId?: string;
+          canStop?: boolean;
         }>;
       }) => void,
     ) => {
@@ -64,6 +75,8 @@ export const useTrayPanelBackend = () => {
     openMainWindow,
     quitApp,
     jumpToSession,
+    closeSessionFromTrayPanel,
+    startPortForwardFromTrayPanel,
     connectToHostFromTrayPanel,
     onTrayPanelCloseRequest,
     onTrayPanelRefresh,

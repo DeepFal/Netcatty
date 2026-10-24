@@ -10,6 +10,12 @@
 </p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/18391?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-18391" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/18391/daily?language=TypeScript" alt="binaricat/Netcatty | Trendshift" width="250" height="55"/>
+  </a>
+</p>
+
+<p align="center">
   A beautiful, feature-rich SSH workspace built with Electron, React, and xterm.js.<br/>
   🔥 Built-in AI Agent · Split terminals · Vault views · SFTP workflows · Custom themes — all in one.
 </p>
@@ -29,18 +35,18 @@
 </p>
 
 <p align="center">
-  <a href="https://ko-fi.com/binaricat">
-    <img src="https://cdn.ko-fi.com/cdn/kofi3.png?v=2" width="150" alt="Support on Ko-fi">
-  </a>
+  <a href="https://github.com/sponsors/binaricat"><img src="https://img.shields.io/badge/GitHub-Sponsors-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" height="28" alt="Sponsor on GitHub"></a>
+  &nbsp;
+  <a href="https://ko-fi.com/binaricat"><img src="https://img.shields.io/badge/Ko--fi-Support-29abe0?style=for-the-badge&logo=kofi&logoColor=white" height="28" alt="Support on Ko-fi"></a>
 </p>
 
 <p align="center">
-  <a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.ja-JP.md">日本語</a>
+  <a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.zh-TW.md">繁體中文</a> · <a href="./README.ja-JP.md">日本語</a>
 </p>
 
 ---
 
-<img width="2868" height="1784" alt="netcatty SSH (Window) 2026-04-23 11:19 PM" src="https://github.com/user-attachments/assets/d6df734f-9ebc-452a-8b7d-e8a0fdc9463a" />
+<img width="3358" height="1984" alt="image" src="docs/assets/readme/overview.webp" />
 
 
 ---
@@ -63,24 +69,14 @@
 
 Ask Catty Agent to check a server's health, and it runs the right commands, analyzes the output, and gives you a clear summary — all in seconds.
 
-
-
-https://github.com/user-attachments/assets/f819a1b6-8cba-4910-8017-97dfc080b477
-
-
-
-
+<img width="3302" height="1978" alt="image" src="docs/assets/readme/catty-single-host.webp" />
 
 
 #### 🚀 Multi-Host — Docker Swarm Cluster Setup
 
 Watch Catty Agent orchestrate a Docker Swarm cluster across two servers in one conversation. It handles the init, token exchange, and node joining — you just tell it what you want.
 
-
-https://github.com/user-attachments/assets/52fd30b8-9f02-43d4-a3b2-142691e8e3ec
-
-
-
+<img width="3294" height="1974" alt="image" src="docs/assets/readme/catty-multi-host.webp" />
 
 
 ---
@@ -91,13 +87,13 @@ https://github.com/user-attachments/assets/52fd30b8-9f02-43d4-a3b2-142691e8e3ec
 - [What is Netcatty](#what-is-netcatty)
 - [Why Netcatty](#why-netcatty)
 - [Features](#features)
-- [Demos](#demos)
 - [Screenshots](#screenshots)
   - [Main Window](#main-window)
   - [Vault Views](#vault-views)
   - [Split Terminals](#split-terminals)
 - [Supported Distros](#supported-distros)
 - [Getting Started](#getting-started)
+  - [Open a local terminal from the command line](#open-a-local-terminal-from-the-command-line)
 - [Build & Package](#build--package)
 - [Tech Stack](#tech-stack)
 - [Contributing](#contributing)
@@ -141,6 +137,9 @@ If you regularly work with a fleet of servers, Netcatty is built for speed and f
 ### 🖥️ Terminal Workspaces
 - **Split panes** — horizontal and vertical splits for multi-tasking
 - **Session management** — run multiple connections side-by-side
+- **Save current screen** — right-click a terminal to save the visible final text, without replaying keystrokes or overwritten output; scroll first to save an earlier screen.
+- **Inline images** — render Kitty graphics, SIXEL and iTerm inline images from remote programs
+- **Archive shortcuts** — on Linux sessions, Ctrl/Cmd+click a printed `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz` or `.zip` name to fill an extraction command with the archive's absolute path into the prompt (kept next to any typed text); press Enter to run it. Names relative to the current directory need directory tracking (OSC 7, see the toolbar's Configure directory tracking); absolute paths always work. Windows, WSL, and macOS sessions are excluded.
 
 ### 📁 SFTP + Built-in Editor
 - **File workflows** — drag & drop uploads/downloads
@@ -152,76 +151,6 @@ If you regularly work with a fleet of servers, Netcatty is built for speed and f
 
 ---
 
-<a name="demos"></a>
-# Demos
-
-Video previews (stored in `screenshots/gifs/`), rendered inline on GitHub:
-
-### Vault views: grid / list / tree
-Switch between different Vault views to match your workflow: overview in grid, dense scanning in list, and hierarchical navigation in tree.
-
-
-https://github.com/user-attachments/assets/1ff1f3f1-e5ae-40ea-b35a-0e5148c3afeb
-
-
-
-### Split terminals + session management
-Work in multiple sessions at once with split panes. Keep related tasks side-by-side and reduce context switching.
-
-
-
-https://github.com/user-attachments/assets/9c24b519-4b4b-4910-a22a-590d04c9af31
-
-
-
-
-
-### SFTP: drag & drop + built-in editor
-Move files with drag & drop, then edit quickly using the built-in editor without leaving the app.
-
-
-https://github.com/user-attachments/assets/f3afdb36-399d-4330-b9f3-4678f178f6db
-
-
-
-
-### Drag file upload
-Drop files into the app to kick off uploads without hunting through dialogs.
-
-
-
-https://github.com/user-attachments/assets/e1e26f7a-3489-41cc-975e-8dccba56ea85
-
-
-
-
-
-
-### Custom themes
-Make Netcatty yours: customize themes and UI appearance.
-
-
-
-https://github.com/user-attachments/assets/1a6049aa-9a4c-4d52-a13d-0b007a791b00
-
-
-
-
-
-### Keyword highlighting
-Highlight important terminal output so errors, warnings, and key events stand out at a glance.
-
-
-
-https://github.com/user-attachments/assets/1a1db7bd-948b-4f3c-97cd-8fd0cbe7cce7
-
-
-
-
-
-
----
-
 <a name="screenshots"></a>
 # Screenshots
 
@@ -230,29 +159,45 @@ https://github.com/user-attachments/assets/1a1db7bd-948b-4f3c-97cd-8fd0cbe7cce7
 
 The main window is designed for long-running SSH workflows: quick access to sessions, navigation, and core tools in one place.
 
-![Main Window (Dark)](screenshots/main-window-dark.png)
+<img width="3290" height="1988" alt="image" src="docs/assets/readme/main-window.webp" />
 
-![Main Window (Light)](screenshots/main-window-light.png)
+
+<img width="3324" height="1992" alt="image" src="docs/assets/readme/main-window-terminal.webp" />
+
+
 
 <a name="vault-views"></a>
 ## Vault Views
 
 Organize and navigate your hosts using the view that best fits the moment: grid for overview, list for scanning, tree for structure.
 
-![Vault Grid View](screenshots/vault_grid_view.png)
+<img width="3292" height="1984" alt="image" src="docs/assets/readme/vault-grid.webp" />
 
-![Vault List View](screenshots/vault_list_view.png)
 
-![Vault Tree View (Dark)](screenshots/treeview-dark.png)
+<img width="3322" height="1998" alt="image" src="docs/assets/readme/vault-list.webp" />
 
-![Vault Tree View (Light)](screenshots/treeview-light.png)
+
+
+
+## Monitoring View
+
+Inspect CPU, memory, disk, network, and latency readings, with GPU details where available. Choose visible columns, resize them, select refresh intervals down to 1 second, and open a terminal directly from a monitored host.
+
+Disk I/O shows aggregate read/write throughput for Linux hardware-backed block devices, without counting partitions or stacked virtual devices twice. Rates use two consecutive samples; `--` means unavailable or warming up, not zero activity. Disk I/O is currently unavailable on macOS; existing macOS monitoring is unchanged. The terminal system overview uses the same shared measurements.
+
+<img width="3364" height="1982" alt="image" src="docs/assets/readme/monitoring.webp" />
+
+<img width="3362" height="1980" alt="image" src="docs/assets/readme/monitoring-columns.webp" />
+
+
+
 
 <a name="split-terminals"></a>
 ## Split Terminals
 
 Split panes help you monitor multiple servers/services at the same time (deploy + logs + metrics) without juggling windows.
 
-![Split Windows](screenshots/split-window.png)
+<img width="1560" height="871" alt="split" src="docs/assets/readme/split-terminals.webp" />
 
 ---
 
@@ -292,7 +237,71 @@ Download the latest release for your platform from [GitHub Releases](https://git
 
 Or browse all releases at [GitHub Releases](https://github.com/binaricat/Netcatty/releases).
 
+### Code signing and privacy
+
+Netcatty is applying to the SignPath Foundation open-source program. Once
+approved, covered Windows release artifacts will use **Free code signing provided by SignPath.io, certificate by SignPath Foundation**.
+See the [code signing policy](CODE_SIGNING_POLICY.md) and
+[privacy policy](PRIVACY.md). Windows releases may remain unsigned until the
+application and integration are complete.
+
+> **Windows portable data:** Exit Netcatty, then create a folder named `data` beside `Netcatty.exe` (zip build) or beside the portable launcher. Netcatty will store its profile there on the next launch. Saved passwords and private keys remain protected by the Windows user account that created them, so they must be re-entered after moving the folder to another computer or Windows account.
+
+> **Open folders in Netcatty on Windows:** The installed version adds **Open in Netcatty** to Explorer's folder context menu and folder-background context menu. It opens a local terminal in that folder. On Windows 11, choose **Show more options** first. Turn the menu off or on in **Settings → System → Windows Explorer**. ZIP and portable versions do not add this menu by default.
+
 > **macOS Users:** Current releases are expected to be code-signed and notarized. If Gatekeeper still warns, make sure you downloaded the latest official build from GitHub Releases.
+
+<a name="open-a-local-terminal-from-the-command-line"></a>
+### Open a local terminal from the command line
+
+`--open-terminal-path <dir>` opens a local terminal in that folder. `--open-terminal-shell <id-or-path>` selects the shell: a discovered id such as `pwsh`, `cmd`, or `wsl-ubuntu`, or a path to a shell executable. Either flag is enough. A shell alone opens a local tab in the default directory. A path alone uses the configured local shell. If Netcatty is already running, the tab opens in that window.
+
+Windows needs an extra `--` so Electron forwards the flags:
+
+```bat
+Netcatty.exe -- --open-terminal-shell=pwsh --open-terminal-path="D:\\proj"
+```
+
+On macOS, start a new instance with `open`, or run the binary directly:
+
+```bash
+open -n -a Netcatty --args --open-terminal-shell=zsh --open-terminal-path="$HOME/proj"
+/Applications/Netcatty.app/Contents/MacOS/Netcatty --open-terminal-shell=zsh --open-terminal-path="$HOME/proj"
+```
+
+### Scoop (Windows x64, community-maintained)
+
+With [Scoop](https://scoop.sh/) installed, you can install Netcatty from the community-maintained [lemon bucket](https://github.com/hoilc/scoop-lemon/blob/master/bucket/netcatty.json), which downloads the installer from Netcatty's official GitHub Releases:
+
+```powershell
+scoop bucket add lemon https://github.com/hoilc/scoop-lemon
+scoop install lemon/netcatty
+```
+
+Exit Netcatty before updating or uninstalling:
+
+```powershell
+scoop update
+scoop update netcatty
+```
+
+To uninstall:
+
+```powershell
+scoop uninstall netcatty
+```
+
+This is a third-party package, not an official Netcatty bucket, and updates may lag behind GitHub Releases. It currently supports x64 only. Settings remain in `%APPDATA%\netcatty` across updates and normal uninstalls; `scoop uninstall netcatty --purge` also deletes those settings. Use Scoop to manage updates for this installation.
+
+### Nix / NixOS
+
+Netcatty provides a flake that wraps the official Linux AppImage release for Nix and NixOS users:
+
+```bash
+nix run github:binaricat/Netcatty
+```
+
+For declarative installs, add the Netcatty flake as an input and use `inputs.netcatty.packages.${pkgs.system}.default` in your NixOS or Home Manager package list.
 
 ### Prerequisites
 - Node.js 18+ and npm
@@ -310,25 +319,6 @@ npm install
 
 # Start development mode (Vite + Electron)
 npm run dev
-```
-
-### Project Structure
-
-```
-├── App.tsx                 # Main React application
-├── components/             # React components
-│   ├── Terminal.tsx        # Terminal component
-│   ├── SftpView.tsx        # SFTP browser
-│   ├── VaultView.tsx       # Host management
-│   ├── KeyManager.tsx      # SSH key management
-│   └── ...
-├── application/            # State management & i18n
-├── domain/                 # Domain models & logic
-├── infrastructure/         # Services & adapters
-├── electron/               # Electron main process
-│   ├── main.cjs            # Main entry
-│   └── bridges/            # IPC bridges
-└── public/                 # Static assets & icons
 ```
 
 ---
@@ -378,7 +368,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-See [agents.md](agents.md) for architecture overview and coding conventions.
+See [AGENTS.md](AGENTS.md) for architecture overview and coding conventions.
 
 ---
 
@@ -403,11 +393,11 @@ This project is licensed under the **GPL-3.0 License** - see the [LICENSE](LICEN
 <a name="star-history"></a>
 # Star History
 
-<a href="https://star-history.com/#binaricat/Netcatty&Date">
+<a href="https://www.star-history.com/#binaricat/Netcatty&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=binaricat/Netcatty&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=binaricat/Netcatty&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=binaricat/Netcatty&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/star-history/star-history-dark.svg" />
+   <source media="(prefers-color-scheme: light)" srcset="docs/assets/star-history/star-history-light.svg" />
+   <img alt="Star History Chart" src="docs/assets/star-history/star-history-light.svg" />
  </picture>
 </a>
 

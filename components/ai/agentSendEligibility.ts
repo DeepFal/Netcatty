@@ -1,10 +1,15 @@
 import type { ExternalAgentConfig } from "../../infrastructure/ai/types";
+import { getExternalAgentSdkBackend } from "../../infrastructure/ai/managedAgents";
 
 export function findEnabledExternalAgent(
   agents: ExternalAgentConfig[],
   agentId: string,
 ): ExternalAgentConfig | undefined {
-  return agents.find((agent) => agent.id === agentId && agent.enabled);
+  return agents.find((agent) =>
+    agent.id === agentId &&
+    agent.enabled &&
+    agent.available !== false &&
+    Boolean(getExternalAgentSdkBackend(agent)));
 }
 
 export function canSendWithAgent(

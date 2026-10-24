@@ -1,16 +1,35 @@
 /* eslint-disable no-undef */
+const { runWhenProxyConnectionReady } = require("../proxyUtils.cjs");
+const { executeBoundedSshCommand } = require("../boundedSshExec.cjs");
+
+const SSH_EXEC_COMMAND_MAX_OUTPUT_BYTES = 1024 * 1024;
+
 function createExecCommandApi(ctx) {
   with (ctx) {
     async function execCommand(event, payload) {
       const enableKeyboardInteractive = !!payload.enableKeyboardInteractive;
-      const baseTimeoutMs = payload.timeout || 10000;
-      const timeoutMs = enableKeyboardInteractive ? Math.max(baseTimeoutMs, 120000) : baseTimeoutMs;
+      const commandTimeoutMs = payload.timeout || 10000;
+      const { tcpConnectTimeoutMs, authReadyTimeoutMs } = resolveSshConnectionTimeouts(payload);
       const sender = event.sender;
       const sessionId = payload.sessionId || randomUUID();
-      const defaultKeys = enableKeyboardInteractive ? await findAllDefaultPrivateKeysFromHelper() : [];
+      const hasCertificate = typeof payload.certificate === "string" && payload.certificate.trim().length > 0;
+      const fallbackAgentSocket = payload.useSshAgent === false
+        ? null
+        : payload.useSshAgent === true
+          ? undefined
+          : await getAvailableAgentSocket();
+      const { enhanceAuthOptionsForFido } = require("../sshAuthHelper.cjs");
+      const prep = await enhanceAuthOptionsForFido(payload, sender);
+      const isFido = prep.useFidoAgent === true;
+      const systemAuthAgent = (hasCertificate && !isFido)
+        ? null
+        : await prepareSystemSshAgentForAuth(prep, "[SSH Exec]");
+      const defaultKeys = enableKeyboardInteractive && !(systemAuthAgent && payload.identitiesOnly)
+        ? await findAllDefaultPrivateKeysFromHelper()
+        : [];
       let identityFilePrivateKey = null;
       let identityFilePassphrase = null;
-      const inlineKey = payload.privateKey
+      const inlineKey = payload.privateKey && !systemAuthAgent
         ? await preparePrivateKeyForAuth({
           sender,
           privateKey: payload.privateKey,
@@ -22,7 +41,7 @@ function createExecCommandApi(ctx) {
         })
         : null;
     
-      if (!payload.privateKey && payload.identityFilePaths?.length > 0) {
+      if (!payload.privateKey && !systemAuthAgent && payload.identityFilePaths?.length > 0) {
         for (const keyPath of payload.identityFilePaths) {
           try {
             const identityFile = await loadIdentityFileForAuth({
@@ -49,66 +68,70 @@ function createExecCommandApi(ctx) {
     
       return new Promise((resolve, reject) => {
         const conn = new SSHClient();
-        let stdout = "";
-        let stderr = "";
         let settled = false;
-        const timer = setTimeout(() => {
+        let authReadyTimer = null;
+        let commandController = null;
+        const clearTimers = () => {
+          if (authReadyTimer) clearTimeout(authReadyTimer);
+          authReadyTimer = null;
+        };
+        const rejectConnection = (err) => {
           if (settled) return;
           settled = true;
+          clearTimers();
+          commandController?.abort?.(err);
           conn.end();
-          reject(new Error("SSH exec timeout"));
-        }, timeoutMs);
+          reject(err);
+        };
     
         conn
-          .once("ready", () => {
-            conn.exec(payload.command, (err, stream) => {
-              if (err) {
-                clearTimeout(timer);
-                settled = true;
-                conn.end();
-                return reject(err);
-              }
-              stream
-                .on("data", (data) => {
-                  stdout += data.toString();
-                })
-                .stderr.on("data", (data) => {
-                  stderr += data.toString();
-                })
-                .on("close", (code) => {
-                  if (settled) return;
-                  clearTimeout(timer);
-                  settled = true;
-                  conn.end();
-                  resolve({ stdout, stderr, code: code ?? (stderr ? 1 : 0) });
-                });
+          .once("connect", () => {
+            runWhenProxyConnectionReady(conn._sock, () => {
+              try { conn._sock?.setTimeout?.(0); } catch { /* ignore */ }
+              authReadyTimer = setTimeout(() => {
+                rejectConnection(new Error(`SSH authentication timeout to ${payload.hostname}`));
+              }, authReadyTimeoutMs);
+              authReadyTimer.unref?.();
             });
           })
+          .once("ready", () => {
+            if (authReadyTimer) clearTimeout(authReadyTimer);
+            authReadyTimer = null;
+            commandController = new AbortController();
+            void executeBoundedSshCommand(conn, payload.command, {
+              signal: commandController.signal,
+              openingTimeoutMs: commandTimeoutMs,
+              runTimeoutMs: commandTimeoutMs,
+              maxOutputBytes: SSH_EXEC_COMMAND_MAX_OUTPUT_BYTES,
+            }).then((result) => {
+              if (settled) return;
+              settled = true;
+              clearTimers();
+              conn.end();
+              resolve({
+                stdout: result.stdout,
+                stderr: result.stderr,
+                code: result.code ?? (result.stderr ? 1 : 0),
+              });
+            }, rejectConnection);
+          })
           .on("error", (err) => {
-            if (settled) return;
-            clearTimeout(timer);
-            settled = true;
-            conn.end();
-            reject(err);
+            rejectConnection(err);
+          })
+          .once("timeout", () => {
+            rejectConnection(new Error(`SSH connection timeout to ${payload.hostname}`));
           })
           .once("end", () => {
             if (settled) return;
-            clearTimeout(timer);
-            settled = true;
-            if (stderr || stdout) {
-              resolve({ stdout, stderr, code: 0 });
-            } else {
-              reject(new Error("SSH connection closed unexpectedly"));
-            }
+            rejectConnection(new Error("SSH connection closed unexpectedly"));
           });
-    
-        const hasCertificate = typeof payload.certificate === "string" && payload.certificate.trim().length > 0;
     
         const connectOpts = {
           host: payload.hostname,
           port: payload.port || 22,
           username: payload.username,
-          readyTimeout: enableKeyboardInteractive ? Math.max(timeoutMs, 120000) : timeoutMs,
+          timeout: tcpConnectTimeoutMs,
+          readyTimeout: 0,
           keepaliveInterval: 0,
           // Honor the host's algorithm settings so one-off commands (e.g. the
           // keychain "export public key to host" flow) negotiate with the same
@@ -124,7 +147,10 @@ function createExecCommandApi(ctx) {
         let authAgent = null;
         const effectivePrivateKey = inlineKey?.privateKey || identityFilePrivateKey;
         const effectivePassphrase = inlineKey?.passphrase || identityFilePassphrase;
-        if (hasCertificate) {
+        if (systemAuthAgent) {
+          connectOpts.agent = systemAuthAgent;
+          require("../attachFidoAgentRelease.cjs").attachFidoAgentRelease(conn, systemAuthAgent);
+        } else if (hasCertificate && !isFido) {
           authAgent = new NetcattyAgent({
             mode: "certificate",
             webContents: event.sender,
@@ -136,7 +162,7 @@ function createExecCommandApi(ctx) {
             },
           });
           connectOpts.agent = authAgent;
-        } else if (effectivePrivateKey) {
+        } else if (effectivePrivateKey && !isFido) {
           connectOpts.privateKey = effectivePrivateKey;
           if (effectivePassphrase) {
             connectOpts.passphrase = effectivePassphrase;
@@ -145,10 +171,13 @@ function createExecCommandApi(ctx) {
     
         if (payload.password) connectOpts.password = payload.password;
     
+        let authBanner = "";
         if (enableKeyboardInteractive) {
           connectOpts.tryKeyboard = true;
     
           const authConfig = buildAuthHandler({
+            authMethod: payload.authMethod,
+            requiresMfa: !!payload.requiresMfa,
             privateKey: connectOpts.privateKey,
             password: connectOpts.password,
             passphrase: connectOpts.passphrase,
@@ -156,18 +185,29 @@ function createExecCommandApi(ctx) {
             username: connectOpts.username,
             logPrefix: "[SSH Exec]",
             defaultKeys,
+            sshAgentSocketOverride: fallbackAgentSocket,
+            allowAgentFallback: payload.useSshAgent !== false,
           });
     
           applyAuthToConnOpts(connectOpts, authConfig);
-    
+          const execAuthPhase = authConfig.authPhase || { hadPartialSuccess: false };
+
+          conn.on("banner", (message) => {
+            authBanner = String(message || "").trim();
+          });
           conn.on("keyboard-interactive", createKeyboardInteractiveHandler({
             sender,
             sessionId,
+            hostId: payload.hostId,
             hostname: payload.hostname,
             password: payload.password,
+            totp: payload.totp,
             logPrefix: "[SSH Exec]",
+            scope: "external",
+            getAuthBanner: () => authBanner,
+            shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(execAuthPhase),
           }));
-        } else if (authAgent) {
+        } else if (connectOpts.agent) {
           const order = ["agent"];
           if (connectOpts.password) order.push("password");
           connectOpts.authHandler = order;
@@ -181,4 +221,4 @@ function createExecCommandApi(ctx) {
   }
 }
 
-module.exports = { createExecCommandApi };
+module.exports = { createExecCommandApi, SSH_EXEC_COMMAND_MAX_OUTPUT_BYTES };

@@ -1,7 +1,7 @@
 import { collectSessionIds } from "../domain/workspace";
 import type { Workspace } from "../types";
 
-export type TopTabsSidePanelTab = "sftp" | "scripts" | "theme" | "ai" | null;
+export type TopTabsSidePanelTab = "sftp" | "scripts" | "history" | "theme" | "ai" | null;
 
 type ScopedTopTabsThemeInput = {
   activeSidePanelTab: TopTabsSidePanelTab;
@@ -28,7 +28,15 @@ export function getScopedTopTabsThemeId({
     return activeThemePreviewId;
   }
 
-  if (!isVisible || followAppTerminalTheme || !activeWorkspace || activeWorkspace.viewMode === "focus") {
+  if (!isVisible || followAppTerminalTheme) {
+    return null;
+  }
+
+  if (!activeWorkspace) {
+    return previewedOrVisibleThemeId;
+  }
+
+  if (activeWorkspace.viewMode === "focus") {
     return null;
   }
 

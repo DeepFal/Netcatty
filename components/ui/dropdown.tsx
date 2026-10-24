@@ -50,6 +50,16 @@ const Dropdown: React.FC<DropdownProps> = ({
     [controlledOpen, onOpenChange],
   );
 
+  useEffect(() => {
+    const closeOnPageHidden = () => {
+      if (document.visibilityState === "hidden") {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("visibilitychange", closeOnPageHidden);
+    return () => document.removeEventListener("visibilitychange", closeOnPageHidden);
+  }, [setOpen]);
+
   return (
     <DropdownContext.Provider value={{ open, setOpen, triggerRef }}>
       {children}
@@ -60,11 +70,13 @@ const Dropdown: React.FC<DropdownProps> = ({
 interface DropdownTriggerProps {
   children: React.ReactElement;
   asChild?: boolean;
+  toggleOnClick?: boolean;
 }
 
 const DropdownTrigger: React.FC<DropdownTriggerProps> = ({
   children,
   asChild,
+  toggleOnClick = true,
 }) => {
   const { open, setOpen, triggerRef } = useDropdown();
 
@@ -82,11 +94,13 @@ const DropdownTrigger: React.FC<DropdownTriggerProps> = ({
       {
         ref: triggerRef,
         onClick: (e: React.MouseEvent) => {
-          handleClick(e);
           const childProps = children.props as {
             onClick?: (e: React.MouseEvent) => void;
           };
           childProps?.onClick?.(e);
+          if (toggleOnClick && !e.defaultPrevented) {
+            handleClick(e);
+          }
         },
       },
     );
@@ -107,6 +121,10 @@ interface DropdownContentProps {
   side?: "top" | "bottom";
   /** If true, align to the trigger's parent element instead of the trigger itself */
   alignToParent?: boolean;
+  onMouseEnter?: React.MouseEventHandler<HTMLDivElement>;
+  onMouseLeave?: React.MouseEventHandler<HTMLDivElement>;
+  /** Opt in for action menus whose options need keyboard focus and navigation. */
+  keyboardNavigation?: boolean;
 }
 
 const DropdownContent: React.FC<DropdownContentProps> = ({
@@ -116,12 +134,17 @@ const DropdownContent: React.FC<DropdownContentProps> = ({
   sideOffset = 4,
   side = "bottom",
   alignToParent = false,
+  onMouseEnter,
+  onMouseLeave,
+  keyboardNavigation = false,
 }) => {
   const { open, setOpen, triggerRef } = useDropdown();
   const contentRef = useRef<HTMLDivElement>(null);
+  const didFocusOnOpen = useRef(false);
   const [position, setPosition] = useState<{
     top: number;
     left: number;
+    maxHeight?: number;
   } | null>(null);
 
   // Calculate position function
@@ -138,48 +161,75 @@ const DropdownContent: React.FC<DropdownContentProps> = ({
     const triggerRect = triggerRef.current.getBoundingClientRect();
     const contentEl = contentRef.current;
 
-    let top: number;
-    let left: number;
+    const contentHeight = contentEl?.offsetHeight ?? 0;
+    const contentWidth = contentEl?.offsetWidth ?? 0;
+    const viewportMargin = 8;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const spaceBelow = Math.max(
+      0,
+      viewportHeight - triggerRect.bottom - sideOffset - viewportMargin,
+    );
+    const spaceAbove = Math.max(
+      0,
+      triggerRect.top - sideOffset - viewportMargin,
+    );
 
-    // Use trigger's bottom for vertical positioning (not parent's)
+    // Prefer requested side when it fits; otherwise pick the side with more room.
+    // Never bounce oversized menus off-screen by flipping twice.
+    let placeBelow: boolean;
     if (side === "bottom") {
+      if (contentHeight <= spaceBelow || spaceBelow >= spaceAbove) {
+        placeBelow = true;
+      } else {
+        placeBelow = false;
+      }
+    } else if (contentHeight <= spaceAbove || spaceAbove > spaceBelow) {
+      placeBelow = false;
+    } else {
+      placeBelow = true;
+    }
+
+    const available = placeBelow ? spaceBelow : spaceAbove;
+    const maxHeight =
+      contentHeight > available && available > 0
+        ? available
+        : undefined;
+    const effectiveHeight = maxHeight ?? contentHeight;
+
+    let top: number;
+    if (placeBelow) {
       top = triggerRect.bottom + sideOffset;
     } else {
-      top = triggerRect.top - sideOffset;
+      top = triggerRect.top - effectiveHeight - sideOffset;
+      if (top < viewportMargin) {
+        top = viewportMargin;
+      }
     }
 
     // Use anchor element (parent or trigger) for horizontal positioning
+    let left: number;
     if (align === "start") {
       left = rect.left;
     } else if (align === "end") {
-      left = rect.right;
-      if (contentEl) {
-        left = rect.right - contentEl.offsetWidth;
-      }
+      left = contentEl ? rect.right - contentWidth : rect.right;
     } else {
       left = rect.left + rect.width / 2;
       if (contentEl) {
-        left -= contentEl.offsetWidth / 2;
+        left -= contentWidth / 2;
       }
     }
 
-    // Keep within viewport
     if (contentEl) {
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
-
-      if (left + contentEl.offsetWidth > viewportWidth - 8) {
-        left = viewportWidth - contentEl.offsetWidth - 8;
+      if (left + contentWidth > viewportWidth - viewportMargin) {
+        left = viewportWidth - contentWidth - viewportMargin;
       }
-      if (left < 8) {
-        left = 8;
-      }
-      if (top + contentEl.offsetHeight > viewportHeight - 8) {
-        top = rect.top - contentEl.offsetHeight - sideOffset;
+      if (left < viewportMargin) {
+        left = viewportMargin;
       }
     }
 
-    return { top, left };
+    return { top, left, maxHeight };
   }, [align, sideOffset, side, alignToParent, triggerRef]);
 
   // Calculate position synchronously after DOM updates
@@ -201,6 +251,17 @@ const DropdownContent: React.FC<DropdownContentProps> = ({
       setPosition(null);
     }
   }, [open, calculatePosition]);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      didFocusOnOpen.current = false;
+      return;
+    }
+    if (keyboardNavigation && position && !didFocusOnOpen.current) {
+      contentRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+      didFocusOnOpen.current = true;
+    }
+  }, [open, position, keyboardNavigation]);
 
   // Close on click outside
   useEffect(() => {
@@ -245,9 +306,53 @@ const DropdownContent: React.FC<DropdownContentProps> = ({
         "fixed z-[999999] rounded-md border border-border/60 bg-popover p-1 text-popover-foreground shadow-md",
         className,
       )}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      role={keyboardNavigation ? 'menu' : undefined}
+      onClickCapture={keyboardNavigation ? (event) => {
+        if (event.target instanceof Element && event.target.closest('button:not(:disabled)')) {
+          triggerRef.current?.focus();
+        }
+      } : undefined}
+      onKeyDown={keyboardNavigation ? (event) => {
+        const items = Array.from(
+          event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'),
+        );
+        const index = items.indexOf(document.activeElement as HTMLButtonElement);
+        let nextIndex: number;
+        switch (event.key) {
+          case 'ArrowDown':
+            nextIndex = (index + 1) % items.length;
+            break;
+          case 'ArrowUp':
+            nextIndex = (index - 1 + items.length) % items.length;
+            break;
+          case 'Home':
+            nextIndex = 0;
+            break;
+          case 'End':
+            nextIndex = items.length - 1;
+            break;
+          case 'Escape':
+          case 'Tab':
+            setOpen(false);
+            triggerRef.current?.focus();
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+            return;
+          default:
+            return;
+        }
+        event.preventDefault();
+        items[nextIndex]?.focus();
+      } : undefined}
       style={{
         top: position?.top ?? -9999,
         left: position?.left ?? -9999,
+        maxHeight: position?.maxHeight,
+        overflowY: position?.maxHeight ? "auto" : undefined,
         visibility: position ? "visible" : "hidden",
       }}
     >

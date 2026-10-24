@@ -1,209 +1,696 @@
-import { FolderTree, MessageSquare, PanelLeft, PanelRight, Palette, X, Zap } from 'lucide-react';
-import React, { memo, useCallback, useMemo, useRef, useState } from 'react';
-import { useActiveTabId } from '../application/state/activeTabStore';
+import { subscribeHostBrowserPanelRequests } from '../application/state/hostBrowserPanelRequests';
+import { openHostBrowserPanelUrl } from '../application/hostBrowser';
+import { captureTerminalBroadcastInput, isTerminalBroadcastInputCurrent, markTerminalBroadcastUserInput } from "./terminal/runtime/terminalPacedBroadcast";
+import { pruneComposeBarHistory } from '../application/state/composeBarHistoryStore';
+import { FolderTree, History, MessageSquare, PanelLeft, PanelRight, Palette, X, Zap } from 'lucide-react';
+import React, { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { activeTabStore } from '../application/state/activeTabStore';
+import { getScriptRecordingSnapshot } from '../application/state/scriptRecordingStore.ts';
 import { resolveTerminalSessionExitIntent, type TerminalSessionExitEvent } from '../application/state/resolveTerminalSessionExitIntent';
+import { prewarmAIStateStorageSnapshots } from '../application/state/aiStateSnapshots';
 import {
   getSessionActivityIdsToClear,
   getValidSessionActivityIds,
   shouldMarkSessionActivity,
 } from '../application/state/sessionActivity';
 import { sessionActivityStore } from '../application/state/sessionActivityStore';
+import { sessionCapabilitiesStore } from '../application/state/sessionCapabilitiesStore';
 import { useTerminalBackend } from '../application/state/useTerminalBackend';
+import {
+  useCodingCliSessionSignals,
+} from '../application/state/codingCliSessionSignalController';
 import { collectSessionIds } from '../domain/workspace';
-
+import { isPluginHostProtocol } from '../domain/pluginConnection';
+import { isSameSftpHostSelection } from '../domain/sftpTerminalIdentity';
 
 import { cn, normalizeLineEndings } from '../lib/utils';
 import { detectLocalOs } from '../lib/localShell';
 import { useStoredString } from '../application/state/useStoredString';
 import { useStoredNumber } from '../application/state/useStoredNumber';
+import { useStoredBoolean } from '../application/state/useStoredBoolean';
+import { STORAGE_KEY_TERMINAL_BROADCAST_PASSWORD_BYPASS } from '../infrastructure/config/storageKeys';
 import {
+  STORAGE_KEY_SIDE_PANEL_HEIGHT,
   STORAGE_KEY_SIDE_PANEL_WIDTH,
+  STORAGE_KEY_TERMINAL_COMPOSE_BAR_OPEN,
 } from '../infrastructure/config/storageKeys';
 import { buildCacheKey } from '../application/state/sftp/sharedRemoteHostCache';
+import {
+  getSftpReopenMemoryKey,
+  resolveSftpOpenLocation,
+  type SftpRememberedLocation,
+} from '../application/state/sftp/sftpReopenLocation';
 import type { DropEntry } from '../lib/sftpFileUtils';
-import { Host, KnownHost, TerminalSession } from '../types';
-import { resolveGroupDefaults, applyGroupDefaults } from '../domain/groupConfig';
-import { materializeHostProxyProfile } from '../domain/proxyProfiles';
+import { Host, KnownHost, TerminalSession, Workspace } from '../types';
+import { applySessionFontSizeToHost } from '../domain/terminalAppearance';
+import { resolveHostAutofillPassword } from '../domain/sshAuth';
+import { listPasswordPromptFillCandidates } from '../domain/passwordPromptAssist';
+import { isTerminalSensitiveInputActive } from './terminal/runtime/terminalSensitiveInputRegistry';
+import {
+  resolveEffectiveTerminalHost,
+  resolveTerminalChainHosts,
+  resolveTerminalSessionHost,
+} from '../domain/terminalHostResolution';
+import { useDefaultLocalShellContext } from '../lib/useDiscoveredShells';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
+import { toast } from './ui/toast';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { SftpSidePanel } from './SftpSidePanel';
 import { ScriptsSidePanel } from './ScriptsSidePanel';
+import { HistorySidePanel } from './HistorySidePanel';
+import { NotesManager } from './notes/NotesManager';
+import { terminalCwdStore } from '../application/state/terminalCwdStore';
 import { resolveSnippetCommand } from './SnippetExecutionProvider';
 import type { Snippet } from '../types';
+import { isScriptSnippet } from '../domain/snippetScript.ts';
+import {
+  pauseScriptRun,
+  resumeScriptRun,
+  runAutomationScript,
+  stopScriptRun,
+  waitForScriptRun,
+} from '../application/state/scriptAutomationCoordinator';
 import { ThemeSidePanel } from './terminal/ThemeSidePanel';
 import { focusTerminalSessionInput } from './terminal/focusTerminalSession';
 import { TerminalComposeBar } from './terminal/TerminalComposeBar';
+import { resolveTerminalFontSizeUpdateTarget } from './terminalLayer/terminalFontSizeUpdate';
+import { resolveTerminalBroadcastTargetIds } from '../domain/terminalBroadcast';
+import {
+  AUTO_RUN_SNIPPET_LINE_DELAY_MS,
+  shouldDelayAutoRunSnippetInput,
+  type TerminalBroadcastInputOptions,
+} from './terminal/terminalHelpers';
+import { dispatchKittyKeyboardBroadcastInput } from './terminal/runtime/kittyKeyboardBroadcast';
 import { Button } from './ui/button';
-import { setupMcpApprovalBridge } from '../infrastructure/ai/shared/approvalGate';
 import { resolveScriptsSidePanelShortcutIntent } from '../application/state/resolveSnippetsShortcutIntent';
 import { resolveSidePanelToggleIntent } from '../application/state/resolveSidePanelToggleIntent';
 import { resolveAiSidePanelToggleIntent } from '../application/state/resolveAiSidePanelToggleIntent';
 import { terminalLayerAreEqual } from './terminalLayerMemo';
-import { useTerminalLayerEffects } from './terminalLayer/useTerminalLayerEffects';
-import { TerminalLayerView } from './terminalLayer/TerminalLayerView';
-import { useTerminalFocusSidebar } from './terminalLayer/useTerminalFocusSidebar';
-import { useTerminalWorkspaceLayout } from './terminalLayer/useTerminalWorkspaceLayout';
-import { useTerminalThemePanelState } from './terminalLayer/useTerminalThemePanelState';
-import { useTerminalAiContexts } from './terminalLayer/useTerminalAiContexts';
-import { resolvePreferredTerminalCwd } from './terminal/sftpCwd';
+import { TerminalLayerTabBridge } from './terminalLayer/TerminalLayerTabBridge';
+import {
+  clearTerminalSessionRuntimeState,
+  pruneTerminalTabMemoryState,
+  pruneTerminalSessionRuntimeState,
+} from './terminalLayer/useTerminalLayerEffects';
+import { sftpTransferCenterStore } from '../application/state/sftpTransferCenterStore';
+import {
+  SFTP_TRANSFER_HISTORY_RETENTION_MS,
+  listInvalidSftpPanelTabIds,
+  listTerminalTabIdsWithRetainingTransfers,
+  resolveSftpActiveTransfersCount,
+  shouldCloseSftpSidePanel,
+  shouldClearSftpPanelAfterTransferChange,
+  shouldKeepSftpMountedAfterClose,
+  shouldMarkSftpPaneClosed,
+  shouldScheduleSftpRetainedPanelCleanup,
+  terminalSftpTransferOwnerId,
+} from './terminalLayer/sftpPanelLifecycle';
+import { resolveAiNoteArtifactPanelIntent } from './terminalLayer/aiNoteArtifactPanelIntent';
+import {
+  canUseDirectSessionWriteFallback,
+} from './terminalLayer/terminalLayerSessionRouting';
+import {
+  DEFAULT_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
+  resolveSessionSidePanelAutoOpen,
+} from '../domain/terminalSidePanelAutoOpen';
+import { canScheduleCommandCwdProbe, shouldProbeCommandCwd } from './terminalLayer/commandCwdProbe';
+import {
+  resolvePreferredTerminalCwd,
+  scheduleBackendCwdProbeAfterCommand,
+  type RendererCwdSource,
+  type TerminalCwdChangeMeta,
+} from './terminal/sftpCwd';
+import { classifyDistroId, hostRestrictsExtraSshChannels, shouldProbeSessionCwd } from '../domain/host';
+import {
+  collectSidePanelPanes,
+  sidePanelLayoutHasTool,
+  type SidePanelLayout,
+  type SidePanelSplitDirection,
+} from '../domain/sidePanelLayout';
+import { useWorkspaceLayoutPresetState } from '../application/state/useWorkspaceLayoutPresetState';
+import {
+  isPaneMagnificationSelectionValid,
+  resolvePaneMagnificationCandidate,
+  type PaneMagnificationController,
+  type PaneMagnificationTarget,
+} from '../domain/paneMagnification';
+import { useTerminalSidePanelLayoutState } from '../application/state/useTerminalSidePanelLayoutState';
+import {
+  TERMINAL_SIDE_PANEL_MAX_HEIGHT,
+  TERMINAL_SIDE_PANEL_MAX_WIDTH,
+  TERMINAL_SIDE_PANEL_MIN_HEIGHT,
+  TERMINAL_SIDE_PANEL_MIN_WIDTH,
+} from '../application/state/terminalSidePanelWidth';
+import { isSidePanelDockPosition } from '../domain/sidePanelLayout';
 
 import {
   AIChatPanelsHost,
+  AISidePanelStateRoot,
   AIStateMaintenanceHost,
   AIStateProvider,
   ChunkedEscapeFilter,
+  clearHostTreePreviewVars,
   TerminalPanesHost,
   clearTerminalPreviewVars,
   clearTopTabsPreviewVars,
   filterTabsMap,
   hasNotifiableTerminalOutput,
   type PendingSftpUpload,
+  type PendingTerminalSelectionForAI,
   type SidePanelTab,
   type SnippetExecutor,
   type TerminalLayerProps,
 } from './terminalLayer/TerminalLayerSupport';
 
+const addMountedSidePanelTabId = (
+  tabIds: string[],
+  tabId: string,
+): string[] => (tabIds.includes(tabId) ? tabIds : [...tabIds, tabId]);
+
+const removeMountedSidePanelTabId = (
+  tabIds: string[],
+  tabId: string,
+): string[] => tabIds.filter((id) => id !== tabId);
+
+function buildScriptSessionMeta(
+  sessionId: string,
+  sessions: TerminalSession[],
+  hosts: Host[],
+) {
+  const session = sessions.find((entry) => entry.id === sessionId);
+  if (!session) return undefined;
+  const host = hosts.find((entry) => entry.id === session.hostId);
+  return {
+    connected: session.status === 'connected',
+    name: session.customName || session.hostLabel || host?.label,
+    hostname: host?.hostname ?? session.hostname,
+    username: session.protocol === 'local' ? session.username : host?.username ?? session.username,
+  };
+}
+
 const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   hosts,
+  portForwardingRules = [],
+  customGroups,
   groupConfigs,
   proxyProfiles,
   keys,
   identities,
   snippets,
   snippetPackages,
+  openNoteRequest,
+  onOpenVaultNoteFromChat,
+  onOpenVaultHostFromChat,
+  onOpenVaultSectionFromChat,
+  onOpenVaultSnippetFromChat,
   sessions,
   workspaces,
   knownHosts = [],
   draggingSessionId,
   terminalTheme,
+  terminalThemeId = terminalTheme.id,
   followAppTerminalTheme = false,
+  pickTerminalTheme,
+  clearThemeIntent,
+  settleManualThemeIntent,
+  resolveSessionAppearance,
   accentMode = 'theme',
   customAccent = '',
   terminalSettings,
   terminalFontFamilyId,
   fontSize = 14,
   hotkeyScheme = 'disabled',
+  disableTerminalFontZoom = false,
+  restoreTerminalCwd = false,
   keyBindings = [],
   onHotkeyAction,
   onUpdateTerminalThemeId,
   onUpdateTerminalFontFamilyId,
   onUpdateTerminalFontSize,
   onUpdateTerminalFontWeight,
+  onUpdateSessionFontSize,
+  onUpdateSessionRestoreCwd,
+  onUpdateSessionDynamicTitle,
+  onUpdateSessionCodingCliProvider,
+  onClearSessionFontSizeOverride,
   onCloseSession,
   onUpdateSessionStatus,
   onUpdateHostDistro,
   onUpdateHost,
   onAddKnownHost,
   onCommandExecuted,
+  onDeleteShellHistoryEntry,
+  onClearCommandHistory,
   onTerminalDataCapture,
   onCreateWorkspaceFromSessions,
   onAddSessionToWorkspace,
   onRequestAddToWorkspace,
+  onAppendHostToWorkspace,
   onUpdateSplitSizes,
   onSetDraggingSessionId,
   onToggleWorkspaceViewMode,
   onSetWorkspaceFocusedSession,
   onReorderWorkspaceSessions,
+  onReorderTabs,
+  onCopySession,
+  onDuplicateSession,
+  onCopySessionToNewWindow,
   onSplitSession,
+  onConnectToHost,
+  onCreateLocalTerminal,
   isBroadcastEnabled,
   onToggleBroadcast,
+  isComposeSendToAll,
+  onToggleComposeSendTarget,
+  isGlobalBroadcastEnabled,
+  isGlobalComposeSendToAll,
+  onToggleGlobalBroadcast,
+  onToggleGlobalComposeSendTarget,
+  canUseGlobalBroadcast,
   updateHosts,
+  updateSnippets,
+  updateSnippetPackages,
   sftpDefaultViewMode,
   sftpDoubleClickBehavior,
   sftpAutoSync,
   sftpShowHiddenFiles,
   sftpUseCompressedUpload,
   sftpAutoOpenSidebar,
+  terminalSidePanelAutoOpen = false,
+  terminalSidePanelAutoOpenTab = DEFAULT_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
+  localShellSidePanelAutoOpen = false,
+  localShellSidePanelAutoOpenTab = 'scripts',
+  sftpFollowTerminalCwd,
+  setSftpFollowTerminalCwd,
   editorWordWrap,
   setEditorWordWrap,
   sessionLogsEnabled,
   sessionLogsDir,
   sessionLogsFormat,
+  sessionLogsTimestampsEnabled,
   sshDebugLogsEnabled,
+  showHostTreeSidebar = true,
   toggleScriptsSidePanelRef,
   toggleSidePanelRef,
+  paneMagnificationRef,
+  // Session rename props
+  onStartSessionRename,
+  onSubmitSessionRename,
+  onRemoveSessionFromWorkspace,
 }) => {
   const { t } = useI18n();
-  // Subscribe to activeTabId from external store
-  const activeTabId = useActiveTabId();
-  const isVaultActive = activeTabId === 'vault';
-  const isSftpActive = activeTabId === 'sftp';
-  const isVisible = (!isVaultActive && !isSftpActive) || !!draggingSessionId;
-  const terminalRendererCwdBySessionRef = useRef<Map<string, string>>(new Map());
+  const [magnifiedPane, setMagnifiedPane] = useState<{
+    tabId: string;
+    target: PaneMagnificationTarget;
+  } | null>(null);
+  const magnifiedPaneRef = useRef(magnifiedPane);
+  magnifiedPaneRef.current = magnifiedPane;
+  const lastInteractedPaneRef = useRef<Map<string, PaneMagnificationTarget>>(new Map());
+  // Side panel state must be initialized before any callbacks reference its
+  // setters or refs in their dependency arrays.
+  const {
+    sidePanelOpenTabs,
+    setSidePanelOpenTabs,
+    sidePanelOpenTabsRef,
+    sidePanelLayouts,
+    setSidePanelLayouts,
+    sidePanelLayoutsRef,
+    focusPane: focusSidePanelPaneForTab,
+    splitPane: splitSidePanelPaneForTab,
+    closePane: closeSidePanelPaneForTab,
+    resizeSplit: resizeSidePanelSplitForTab,
+    selectSidePanelToolForTab,
+  } = useTerminalSidePanelLayoutState();
+  useEffect(() => {
+    pruneComposeBarHistory(sessions.map((session) => session.id));
+  }, [sessions]);
 
-  const handleTerminalCwdChange = useCallback((sessionId: string, cwd: string | null) => {
-    if (cwd && cwd.trim().length > 0) {
-      terminalRendererCwdBySessionRef.current.set(sessionId, cwd);
+  useEffect(() => {
+    setMagnifiedPane((current) => {
+      if (!current) return current;
+      const terminalPanes = sessions.map((session) => ({
+        tabId: session.workspaceId ?? session.id,
+        sessionId: session.id,
+      }));
+      const sidePanelPanes = Array.from(sidePanelLayouts.entries()).flatMap(([tabId, layout]) => (
+        collectSidePanelPanes(layout.root).map((pane) => ({ tabId, paneId: pane.id }))
+      ));
+      return isPaneMagnificationSelectionValid(current, terminalPanes, sidePanelPanes)
+        ? current
+        : null;
+    });
+  }, [sessions, sidePanelLayouts]);
+  const terminalRendererCwdBySessionRef = useRef<Map<string, string>>(new Map());
+  const terminalRendererCwdSourceBySessionRef = useRef<Map<string, RendererCwdSource>>(new Map());
+  const stableRef = useRef<Record<string, unknown>>({});
+  const activeTabIdRef = useRef(activeTabStore.getActiveTabId());
+  const activeWorkspaceRef = useRef<Workspace | undefined>(undefined);
+  const activeSessionRef = useRef<TerminalSession | undefined>(undefined);
+  const focusedSessionIdRef = useRef<string | undefined>(undefined);
+  const terminalOsc7SignalBySessionRef = useRef<Map<string, number>>(new Map());
+  const cwdProbeCancelersRef = useRef<Map<string, () => void>>(new Map());
+  const cwdProbeGenerationRef = useRef<Map<string, number>>(new Map());
+
+  useEffect(() => {
+    const liveSessionIds = new Set(sessions.map((session) => session.id));
+    pruneTerminalSessionRuntimeState({
+      terminalRendererCwdBySessionRef,
+      terminalRendererCwdSourceBySessionRef,
+      terminalOsc7SignalBySessionRef,
+      cwdProbeGenerationRef,
+      cwdProbeCancelersRef,
+    }, liveSessionIds);
+    terminalCwdStore.prune(liveSessionIds);
+  }, [sessions]);
+
+  useEffect(() => {
+    const runPrewarm = () => prewarmAIStateStorageSnapshots();
+    if (typeof window.requestIdleCallback === 'function') {
+      const idleId = window.requestIdleCallback(runPrewarm, { timeout: 2500 });
+      return () => window.cancelIdleCallback(idleId);
+    }
+    const timeoutId = window.setTimeout(runPrewarm, 500);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  const handleTerminalCwdChange = useCallback((
+    sessionId: string,
+    cwd: string | null,
+    meta?: TerminalCwdChangeMeta,
+  ) => {
+    if (meta?.source === 'osc7') {
+      // Bump on every OSC 7 report, even when the decoded path is unchanged.
+      // PROMPT_COMMAND/precmd emits OSC 7 after each command; skipping the
+      // backend pwd probe in that case prevents SFTP follow from toggling
+      // between OSC 7 cwd and login-shell fallback pwd (notably after sudo).
+      const nextSignal = (terminalOsc7SignalBySessionRef.current.get(sessionId) ?? 0) + 1;
+      terminalOsc7SignalBySessionRef.current.set(sessionId, nextSignal);
+    }
+
+    const currentCwd = terminalRendererCwdBySessionRef.current.get(sessionId) ?? null;
+    const nextCwd = cwd && cwd.trim().length > 0 ? cwd : null;
+    const nextCwdSource: RendererCwdSource = meta?.source ?? 'backend';
+    if (currentCwd === nextCwd) {
+      if (nextCwd) {
+        terminalRendererCwdSourceBySessionRef.current.set(sessionId, nextCwdSource);
+      }
+      // Heal store drift and publish provenance changes even when the path is unchanged.
+      terminalCwdStore.setCwd(sessionId, nextCwd, nextCwd ? nextCwdSource : undefined);
+      return;
+    }
+
+    if (nextCwd) {
+      terminalRendererCwdBySessionRef.current.set(sessionId, nextCwd);
+      terminalRendererCwdSourceBySessionRef.current.set(sessionId, nextCwdSource);
     } else {
       terminalRendererCwdBySessionRef.current.delete(sessionId);
+      terminalRendererCwdSourceBySessionRef.current.delete(sessionId);
     }
+    onUpdateSessionRestoreCwd?.(sessionId, nextCwd);
+    // External store: side-panel live snapshot subscribers update without
+    // re-rendering TerminalLayerInner.
+    terminalCwdStore.setCwd(sessionId, nextCwd, nextCwd ? nextCwdSource : undefined);
+  }, [onUpdateSessionRestoreCwd]);
+
+  // Stable while only presentation fields (title/provider) change.
+  const codingCliSessionIdsKey = sessions.map((session) => session.id).join('\0');
+  const codingCliSessionIds = useMemo(
+    () => (codingCliSessionIdsKey ? codingCliSessionIdsKey.split('\0') : []),
+    [codingCliSessionIdsKey],
+  );
+  const codingCliSignalController = useCodingCliSessionSignals({
+    dynamicTabTitleMode: terminalSettings?.dynamicTabTitleMode ?? 'agent',
+    sessionIds: codingCliSessionIds,
+    getSession: (sessionId) => sessionsRef.current.find((candidate) => candidate.id === sessionId),
+    onUpdateSessionCodingCliProvider,
+    onUpdateSessionDynamicTitle,
+  });
+  const handleTerminalTitleChange = codingCliSignalController.handleTerminalTitleChange;
+  const handleTerminalOutput = codingCliSignalController.handleTerminalOutput;
+
+  const handleTerminalBell = useCallback((sessionId: string) => {
+    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
+    if (!session) return;
+    if (!shouldMarkSessionActivity(activeTabStore.getActiveTabId(), session)) return;
+    sessionActivityStore.setTabActive(sessionId, true);
   }, []);
 
   // Stable callback references for Terminal components
   const handleCloseSession = useCallback((sessionId: string) => {
+    setMagnifiedPane((current) => (
+      current?.target.kind === 'terminal' && current.target.sessionId === sessionId
+        ? null
+        : current
+    ));
+    for (const [tabId, target] of lastInteractedPaneRef.current) {
+      if (target.kind === 'terminal' && target.sessionId === sessionId) {
+        lastInteractedPaneRef.current.delete(tabId);
+      }
+    }
+    clearTerminalSessionRuntimeState({
+      terminalRendererCwdBySessionRef,
+      terminalOsc7SignalBySessionRef,
+      cwdProbeGenerationRef,
+      cwdProbeCancelersRef,
+    }, sessionId);
+    codingCliSignalController.forgetSession(sessionId);
+    sessionCapabilitiesStore.delete(sessionId);
     onCloseSession(sessionId);
-  }, [onCloseSession]);
+  }, [codingCliSignalController, onCloseSession]);
 
   const sftpAutoOpenSidebarRef = useRef(sftpAutoOpenSidebar);
   sftpAutoOpenSidebarRef.current = sftpAutoOpenSidebar;
+  const terminalSidePanelAutoOpenRef = useRef(terminalSidePanelAutoOpen);
+  terminalSidePanelAutoOpenRef.current = terminalSidePanelAutoOpen;
+  const terminalSidePanelAutoOpenTabRef = useRef(terminalSidePanelAutoOpenTab);
+  terminalSidePanelAutoOpenTabRef.current = terminalSidePanelAutoOpenTab;
+  const localShellSidePanelAutoOpenRef = useRef(localShellSidePanelAutoOpen);
+  localShellSidePanelAutoOpenRef.current = localShellSidePanelAutoOpen;
+  const localShellSidePanelAutoOpenTabRef = useRef(localShellSidePanelAutoOpenTab);
+  localShellSidePanelAutoOpenTabRef.current = localShellSidePanelAutoOpenTab;
+  const sftpFollowTerminalCwdRef = useRef(sftpFollowTerminalCwd);
+  sftpFollowTerminalCwdRef.current = sftpFollowTerminalCwd;
 
-  const handleStatusChange = useCallback((sessionId: string, status: TerminalSession['status']) => {
-    onUpdateSessionStatus(sessionId, status);
+  // Destructure the stable hook callbacks: the hook returns a fresh object
+  // each render, and depending on that object would recreate the preset
+  // callbacks (and in turn handleStatusChange) on unrelated state updates,
+  // defeating the terminal pane memoization.
+  const { resolveDefaultLayoutForSession, saveWorkspaceLayoutAsDefault: persistWorkspaceLayoutAsDefault } =
+    useWorkspaceLayoutPresetState();
 
-    // Auto-open SFTP sidebar when a remote host connects (if setting enabled)
-    if (status === 'connected' && sftpAutoOpenSidebarRef.current) {
-      const session = sessionsRef.current.find(s => s.id === sessionId);
-      if (!session) return;
-      // Only auto-open for SSH/Mosh (SFTP requires SSH); skip local/unset protocol
-      const proto = session.protocol;
-      if (proto !== 'ssh' && proto !== 'mosh') return;
+  const applyWorkspaceLayoutPresetForSession = useCallback((session: TerminalSession, tabId: string, sftpHostOverride?: Host) => {
+    // Preset persistence and resolution live in the application layer; the
+    // component only mounts the resolved panes into its UI state.
+    const resolved = resolveDefaultLayoutForSession(session);
+    if (!resolved) return false;
+    const { layout, focusedTool, protocol: proto } = resolved;
 
-      const host = hostsRef.current.find(h => h.id === session.hostId);
-
-      // Determine the tab ID (workspace or solo session)
-      const tabId = session.workspaceId || sessionId;
-
-      // Only open if the sidebar is not already open for this tab
-      if (sidePanelOpenTabsRef.current.has(tabId)) return;
-
-      const hostWithOverrides: Host = host
-        ? {
+    for (const pane of collectSidePanelPanes(layout.root)) {
+      if (pane.tool === 'ai') {
+        setAiMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      } else if (pane.tool === 'scripts') {
+        setScriptsMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      } else if (pane.tool === 'theme') {
+        setThemeMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      } else if (pane.tool === 'system') {
+        setSystemMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      } else if (pane.tool === 'browser') {
+        setBrowserMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      } else if (pane.tool === 'notes') {
+        setNotesMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      } else if (pane.tool === 'sftp') {
+        // Mirror the normal SFTP open path: a previously retained panel (kept
+        // mounted while transfers or external edits finished after close) must
+        // not keep suppressing command-triggered refreshes once the preset
+        // reopens SFTP for this tab. Mark the tab as opening first so an
+        // activity callback firing before React commits the open state still
+        // sees the panel as open instead of pruning the retained host state.
+        const cleanupTimer = sftpRetainedCleanupTimersRef.current.get(tabId);
+        if (cleanupTimer !== undefined) {
+          window.clearTimeout(cleanupTimer);
+          sftpRetainedCleanupTimersRef.current.delete(tabId);
+        }
+        sftpOpeningTabIdsRef.current.add(tabId);
+        sftpRetainedAfterCloseTabIdsRef.current.delete(tabId);
+        sftpPaneClosedTabIdsRef.current.delete(tabId);
+        setSftpHostSourceSessionForTab(prev => new Map(prev).set(tabId, session.id));
+        const host = hostsRef.current.find(h => h.id === session.hostId);
+        const hostWithOverrides: Host = host
+          ? {
             ...host,
             protocol: session.protocol ?? host.protocol,
             port: session.port ?? host.port,
             moshEnabled: session.moshEnabled ?? host.moshEnabled,
+            etEnabled: session.etEnabled ?? host.etEnabled,
           }
-        : {
-            // Quick Connect / temporary session — build minimal host from session data
-            id: session.hostId || sessionId,
+          : {
+            id: session.hostId || session.id,
             hostname: session.hostname,
             username: session.username,
             port: session.port ?? 22,
             protocol: proto,
-            label: session.label || session.hostname,
+            label: session.customName || session.hostLabel || session.hostname,
           } as Host;
+        setSftpHostForTab(prev => {
+          const next = new Map(prev);
+          next.set(tabId, sftpHostOverride ?? hostWithOverrides);
+          return next;
+        });
+      }
+    }
 
-      setSidePanelOpenTabs(prev => {
+    setSidePanelLayouts((prev) => {
+      const next = new Map(prev);
+      next.set(tabId, layout);
+      return next;
+    });
+    lastSidePanelTabRef.current.set(tabId, focusedTool);
+    setSidePanelOpenTabs(prev => {
+      const next = new Map(prev);
+      next.set(tabId, focusedTool);
+      return next;
+    });
+    return true;
+  }, [resolveDefaultLayoutForSession, setSidePanelLayouts, setSidePanelOpenTabs]);
+
+  const handleSaveWorkspaceLayoutAsDefault = useCallback((layout: SidePanelLayout): boolean => {
+    if (!persistWorkspaceLayoutAsDefault(layout)) {
+      toast.error(t('terminal.layer.layoutSaveFailed'));
+      return false;
+    }
+    toast.success(t('terminal.layer.layoutSavedAsDefault'));
+    return true;
+  }, [persistWorkspaceLayoutAsDefault, t]);
+
+  const handleStatusChange = useCallback((sessionId: string, status: TerminalSession['status'], sftpHostOverride?: Host) => {
+    onUpdateSessionStatus(sessionId, status);
+
+    if (status !== 'connected') return;
+
+    setSftpAuthHostBySessionId(prev => {
+      const next = new Map(prev);
+      if (sftpHostOverride) next.set(sessionId, sftpHostOverride);
+      else next.delete(sessionId);
+      return next;
+    });
+
+    const session = sessionsRef.current.find(s => s.id === sessionId);
+    if (!session) return;
+    const workspaceId = session.workspaceId;
+    const tabId = workspaceId || sessionId;
+
+    // Within a workspace every member session maps to the same tab id, so the
+    // preset (and any auto-open host binding) must come from the workspace's
+    // focused session; otherwise whichever pane connects first would decide
+    // SFTP pruning and host selection regardless of focus.
+    let presetSession = session;
+    if (workspaceId) {
+      const focusedSessionId = workspacesRef.current.find(ws => ws.id === workspaceId)?.focusedSessionId;
+      const focusedSession = focusedSessionId
+        ? sessionsRef.current.find(s => s.id === focusedSessionId)
+        : undefined;
+      if (focusedSession) presetSession = focusedSession;
+    }
+    const proto = presetSession.protocol ?? 'ssh';
+
+    if (presetSession.id === sessionId && (sftpHostOverride || sftpHostSourceSessionForTabRef.current.get(tabId) === sessionId)) {
+      const connectedHost = sftpHostOverride ?? sessionHostsMapRef.current.get(sessionId);
+      if (connectedHost) {
+        setSftpHostForTab(prev => new Map(prev).set(tabId, connectedHost));
+      }
+      setSftpHostSourceSessionForTab(prev => {
+        if (!sftpHostOverride) return prev;
         const next = new Map(prev);
-        next.set(tabId, 'sftp');
-        return next;
-      });
-      setSftpHostForTab(prev => {
-        const next = new Map(prev);
-        next.set(tabId, hostWithOverrides);
+        next.set(tabId, sessionId);
         return next;
       });
     }
-  }, [onUpdateSessionStatus]);
+
+    if (sidePanelOpenTabsRef.current.has(tabId)) return;
+
+    const targetPanel = resolveSessionSidePanelAutoOpen({
+      session: presetSession,
+      terminalEnabled: terminalSidePanelAutoOpenRef.current,
+      terminalTab: terminalSidePanelAutoOpenTabRef.current,
+      localEnabled: localShellSidePanelAutoOpenRef.current,
+      localTab: localShellSidePanelAutoOpenTabRef.current,
+      legacySftpEnabled: sftpAutoOpenSidebarRef.current,
+    });
+
+    // Explicit SFTP (JumpServer deep link / host.autoOpenSftpPanel) wins over a
+    // saved default that may omit file transfer — only when SFTP is actually
+    // available. Ordinary auto-open still yields to the saved default.
+    if (targetPanel !== "sftp") {
+      if (applyWorkspaceLayoutPresetForSession(
+        presetSession,
+        tabId,
+        presetSession.id === sessionId ? sftpHostOverride : undefined,
+      )) return;
+      if (!targetPanel) return;
+    }
+
+    lastSidePanelTabRef.current.set(tabId, targetPanel);
+
+    if (targetPanel === 'sftp') {
+      sftpPaneClosedTabIdsRef.current.delete(tabId);
+      setSftpHostSourceSessionForTab(prev => new Map(prev).set(tabId, presetSession.id));
+      const host = hostsRef.current.find(h => h.id === presetSession.hostId);
+      const hostWithOverrides: Host = host
+        ? {
+          ...host,
+          protocol: presetSession.protocol ?? host.protocol,
+          port: presetSession.port ?? host.port,
+          moshEnabled: presetSession.moshEnabled ?? host.moshEnabled,
+          etEnabled: presetSession.etEnabled ?? host.etEnabled,
+        }
+        : {
+          id: presetSession.hostId || presetSession.id,
+          hostname: presetSession.hostname,
+          username: presetSession.username,
+          port: presetSession.port ?? 22,
+          protocol: proto,
+          label: presetSession.customName || presetSession.hostLabel || presetSession.hostname,
+        } as Host;
+
+      setSftpHostForTab(prev => {
+        const next = new Map(prev);
+        next.set(tabId, presetSession.id === sessionId && sftpHostOverride ? sftpHostOverride : hostWithOverrides);
+        return next;
+      });
+    } else if (targetPanel === 'ai') {
+      setAiMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    } else if (targetPanel === 'scripts') {
+      setScriptsMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    } else if (targetPanel === 'theme') {
+      setThemeMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    } else if (targetPanel === 'system') {
+      setSystemMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    } else if (targetPanel === 'notes') {
+      setNotesMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    } else if (targetPanel === 'browser') {
+      setBrowserMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    }
+
+    setSidePanelOpenTabs(prev => {
+      const next = new Map(prev);
+      next.set(tabId, targetPanel);
+      return next;
+    });
+  }, [applyWorkspaceLayoutPresetForSession, onUpdateSessionStatus, setSidePanelOpenTabs, sidePanelOpenTabsRef]);
 
   const handleSessionExit = useCallback((sessionId: string, evt: TerminalSessionExitEvent) => {
-    const intent = resolveTerminalSessionExitIntent(evt);
+    const intent = resolveTerminalSessionExitIntent(
+      evt,
+      // No terminal settings loaded yet -> do not close the tab; auto-close is
+      // opt-in via Settings -> Terminal -> Behavior (DEFAULT_TERMINAL_SETTINGS).
+      terminalSettings?.autoCloseOnExit ?? false,
+    );
     if (intent.kind === "closeSession") {
-      onCloseSession(sessionId);
+      handleCloseSession(sessionId);
     } else {
       onUpdateSessionStatus(sessionId, 'disconnected');
     }
-  }, [onCloseSession, onUpdateSessionStatus]);
+  }, [handleCloseSession, onUpdateSessionStatus, terminalSettings?.autoCloseOnExit]);
 
   const handleOsDetected = useCallback((hostId: string, distro: string) => {
     onUpdateHostDistro(hostId, distro);
@@ -217,17 +704,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     onAddKnownHost?.(knownHost);
   }, [onAddKnownHost]);
 
-  const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
-    onCommandExecuted?.(command, hostId, hostLabel, sessionId);
-  }, [onCommandExecuted]);
-
   const handleTerminalDataCapture = useCallback((sessionId: string, data: string) => {
-    onTerminalDataCapture?.(sessionId, data);
+    return onTerminalDataCapture?.(sessionId, data);
   }, [onTerminalDataCapture]);
 
   // Terminal backend for broadcast writes
   const terminalBackend = useTerminalBackend();
   const snippetExecutorsRef = useRef<Map<string, SnippetExecutor>>(new Map());
+  const broadcastInterruptPrioritizersRef = useRef<Map<string, () => void>>(new Map());
+  const programmaticCommandLogRewriteHandlersRef = useRef<Map<string, (rewrite: ProgrammaticCommandLogRewrite) => void>>(new Map());
 
   const handleSnippetExecutorChange = useCallback((sessionId: string, executor: SnippetExecutor | null) => {
     if (executor) {
@@ -237,122 +722,340 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     snippetExecutorsRef.current.delete(sessionId);
   }, []);
 
+  const handleBroadcastInterruptPriorityChange = useCallback((
+    sessionId: string,
+    prioritize: (() => void) | null,
+  ) => {
+    if (prioritize) {
+      broadcastInterruptPrioritizersRef.current.set(sessionId, prioritize);
+      return;
+    }
+    broadcastInterruptPrioritizersRef.current.delete(sessionId);
+  }, []);
+
+  const handleProgrammaticCommandLogRewriteChange = useCallback((
+    sessionId: string,
+    queueRewrite: ((rewrite: ProgrammaticCommandLogRewrite) => void) | null,
+  ) => {
+    if (queueRewrite) {
+      programmaticCommandLogRewriteHandlersRef.current.set(sessionId, queueRewrite);
+      return;
+    }
+    programmaticCommandLogRewriteHandlersRef.current.delete(sessionId);
+  }, []);
+
   const onSessionData = terminalBackend.onSessionData;
 
   const workspaceById = useMemo(
     () => new Map(workspaces.map((workspace) => [workspace.id, workspace])),
     [workspaces],
   );
-  const activeWorkspace = useMemo(() => activeTabId ? workspaceById.get(activeTabId) : undefined, [workspaceById, activeTabId]);
-  const activeSession = useMemo(() => sessions.find(s => s.id === activeTabId), [sessions, activeTabId]);
-  const isFocusMode = activeWorkspace?.viewMode === 'focus';
-
-  const {
-    activeResizers,
-    computeSplitHint,
-    dropHint,
-    findSplitNode,
-    handleWorkspaceDrop,
-    resizing,
-    setDropHint,
-    setResizing,
-    setWorkspaceArea,
-    workspaceInnerRef,
-    workspaceOuterRef,
-    workspaceOverlayRef,
-    workspaceRectsById,
-  } = useTerminalWorkspaceLayout({
-    activeSession,
-    activeWorkspace,
-    isFocusMode,
-    onAddSessionToWorkspace,
-    onCreateWorkspaceFromSessions,
-    onSetDraggingSessionId,
-    sessions,
-    workspaces,
-  });
 
   // Workspace-level compose bar state
-  const [isComposeBarOpen, setIsComposeBarOpen] = useState(false);
-  const activeTabIdRef = useRef(activeTabId);
-  activeTabIdRef.current = activeTabId;
-  const activeWorkspaceRef = useRef(activeWorkspace);
-  activeWorkspaceRef.current = activeWorkspace;
-  const activeSessionRef = useRef(activeSession);
-  activeSessionRef.current = activeSession;
+  const [isComposeBarOpen, setIsComposeBarOpen] = useStoredBoolean(
+    STORAGE_KEY_TERMINAL_COMPOSE_BAR_OPEN,
+    false,
+  );
+  // Opt-in "broadcast without password protection" (#3488): when enabled, the
+  // fail-closed password-prompt heuristic no longer pauses workspace broadcast.
+  const [broadcastPasswordBypass] = useStoredBoolean(
+    STORAGE_KEY_TERMINAL_BROADCAST_PASSWORD_BYPASS,
+    false,
+  );
+  const broadcastPasswordBypassRef = useRef(broadcastPasswordBypass);
+  broadcastPasswordBypassRef.current = broadcastPasswordBypass;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   const workspacesRef = useRef(workspaces);
   workspacesRef.current = workspaces;
   const hostsRef = useRef(hosts);
   hostsRef.current = hosts;
+  const portForwardingRulesRef = useRef(portForwardingRules);
+  portForwardingRulesRef.current = portForwardingRules;
   const onSetWorkspaceFocusedSessionRef = useRef(onSetWorkspaceFocusedSession);
   onSetWorkspaceFocusedSessionRef.current = onSetWorkspaceFocusedSession;
 
-  // Handle broadcast input - write to all other sessions in the source workspace.
-  const handleBroadcastInput = useCallback((data: string, sourceSessionId: string) => {
-    const sourceSession = sessionsRef.current.find((session) => session.id === sourceSessionId);
-    const workspaceId = sourceSession?.workspaceId;
-    if (!workspaceId) return;
-
-    for (const session of sessionsRef.current) {
-      if (session.workspaceId === workspaceId && session.id !== sourceSessionId) {
-        terminalBackend.writeToSession(session.id, data);
-      }
-    }
-  }, [terminalBackend]);
-
-  // Side panel state - per-tab tracking of which sub-panel is active
-  // Maps tab IDs to the active sub-panel type (sftp/scripts/theme), absent = closed
-  const [sidePanelOpenTabs, setSidePanelOpenTabs] = useState<Map<string, SidePanelTab>>(new Map());
+  // Keep AI/scripts/theme panels mounted while switching sub-tabs (like SFTP).
+  const [aiMountedTabIds, setAiMountedTabIds] = useState<string[]>([]);
+  const [scriptsMountedTabIds, setScriptsMountedTabIds] = useState<string[]>([]);
+  const [systemMountedTabIds, setSystemMountedTabIds] = useState<string[]>([]);
+  const [themeMountedTabIds, setThemeMountedTabIds] = useState<string[]>([]);
+  const [browserMountedTabIds, setBrowserMountedTabIds] = useState<string[]>([]);
+  const [notesMountedTabIds, setNotesMountedTabIds] = useState<string[]>([]);
   const [sidePanelWidth, setSidePanelWidth, persistSidePanelWidth] = useStoredNumber(
-    STORAGE_KEY_SIDE_PANEL_WIDTH, 420, { min: 280, max: 800 },
+    STORAGE_KEY_SIDE_PANEL_WIDTH,
+    420,
+    { min: TERMINAL_SIDE_PANEL_MIN_WIDTH, max: TERMINAL_SIDE_PANEL_MAX_WIDTH },
   );
-  const [sidePanelPosition, setSidePanelPosition] = useStoredString<'left' | 'right'>(
+  const [sidePanelPosition, setSidePanelPosition] = useStoredString<'left' | 'right' | 'bottom'>(
     'netcatty_side_panel_position',
     'left',
-    (v): v is 'left' | 'right' => v === 'left' || v === 'right',
+    isSidePanelDockPosition,
   );
-  const sftpResizingRef = useRef(false);
-  const sidePanelOpenTabsRef = useRef(sidePanelOpenTabs);
-  sidePanelOpenTabsRef.current = sidePanelOpenTabs;
-
+  const [sidePanelHeight, setSidePanelHeight, persistSidePanelHeight] = useStoredNumber(
+    STORAGE_KEY_SIDE_PANEL_HEIGHT,
+    360,
+    { min: TERMINAL_SIDE_PANEL_MIN_HEIGHT, max: TERMINAL_SIDE_PANEL_MAX_HEIGHT },
+  );
   // Remember the last sub-panel shown per tab so the toggle shortcut can
   // restore it after a close. Overwritten on open, never cleared on close.
   const lastSidePanelTabRef = useRef<Map<string, SidePanelTab>>(new Map());
-
-  // Whether side panel is open for the currently active tab and which sub-panel
-  const isSidePanelOpenForCurrentTab = activeTabId ? sidePanelOpenTabs.has(activeTabId) : false;
-  const activeSidePanelTab = activeTabId ? sidePanelOpenTabs.get(activeTabId) ?? null : null;
-  // Legacy compatibility helpers for SFTP-specific logic
-  const isSftpOpenForCurrentTab = activeSidePanelTab === 'sftp';
+  const notesReturnTabRef = useRef<Map<string, SidePanelTab>>(new Map());
 
   // The host to pass to the SFTP panel - stored when the user opens SFTP
   const [sftpHostForTab, setSftpHostForTab] = useState<Map<string, Host>>(new Map());
+  const [sftpHostSourceSessionForTab, setSftpHostSourceSessionForTab] = useState<Map<string, string>>(new Map());
+  const [sftpAuthHostBySessionId, setSftpAuthHostBySessionId] = useState<Map<string, Host>>(new Map());
+  useEffect(() => {
+    setSftpAuthHostBySessionId(prev => {
+      const liveIds = new Set(sessions.map(session => session.id));
+      const next = new Map([...prev].filter(([id]) => liveIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [sessions]);
   const [sftpInitialLocationForTab, setSftpInitialLocationForTab] = useState<
     Map<string, { hostId: string; path: string }>
   >(new Map());
   const [sftpPendingUploadsForTab, setSftpPendingUploadsForTab] = useState<
-    Map<string, PendingSftpUpload>
+    Map<string, PendingSftpUpload[]>
   >(new Map());
+  const [pendingTerminalSelectionForAI, setPendingTerminalSelectionForAI] =
+    useState<PendingTerminalSelectionForAI | null>(null);
+  const [notesOpenNoteByTab, setNotesOpenNoteByTab] = useState<Map<string, { noteId: string; requestId: number }>>(new Map());
+  const notesOpenRequestIdRef = useRef(0);
   const sftpHostForTabRef = useRef(sftpHostForTab);
   sftpHostForTabRef.current = sftpHostForTab;
+  const sftpHostSourceSessionForTabRef = useRef(sftpHostSourceSessionForTab);
+  sftpHostSourceSessionForTabRef.current = sftpHostSourceSessionForTab;
+  const sftpActiveTransfersByTabRef = useRef<Map<string, number>>(new Map());
+  const sftpActiveExternalEditsByTabRef = useRef<Map<string, number>>(new Map());
+  const sftpRetainedAfterCloseTabIdsRef = useRef<Set<string>>(new Set());
+  const sftpPaneClosedTabIdsRef = useRef<Set<string>>(new Set());
+  const sftpOpeningTabIdsRef = useRef<Set<string>>(new Set());
+  const sftpRetainedCleanupTimersRef = useRef<Map<string, number>>(new Map());
+  const sftpLastPathForSourceRef = useRef<Map<string, SftpRememberedLocation>>(new Map());
+
+  const resolveSftpOpenTarget = useCallback((params: {
+    tabId: string;
+    host: Host;
+    initialPath?: string;
+    pendingUploadEntries?: DropEntry[];
+    originSessionId?: string | null;
+  }) => {
+    const { tabId, host, initialPath, pendingUploadEntries, originSessionId } = params;
+    const connectionKey = buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username, host.sftpFileProtocol);
+    const memoryKey = getSftpReopenMemoryKey({ tabId, sourceSessionId: originSessionId });
+    const effectiveInitialPath = resolveSftpOpenLocation({
+      hostId: host.id,
+      connectionKey,
+      terminalCwd: initialPath,
+      explicitTargetPath: pendingUploadEntries?.length ? initialPath : undefined,
+      hasPendingUpload: !!pendingUploadEntries?.length,
+      remembered: sftpLastPathForSourceRef.current.get(memoryKey),
+    });
+
+    return { connectionKey, effectiveInitialPath };
+  }, []);
+
+  const clearSftpPanelState = useCallback((tabId: string) => {
+    const cleanupTimer = sftpRetainedCleanupTimersRef.current.get(tabId);
+    if (cleanupTimer !== undefined) {
+      window.clearTimeout(cleanupTimer);
+      sftpRetainedCleanupTimersRef.current.delete(tabId);
+    }
+    sftpActiveTransfersByTabRef.current.delete(tabId);
+    sftpActiveExternalEditsByTabRef.current.delete(tabId);
+    sftpRetainedAfterCloseTabIdsRef.current.delete(tabId);
+    sftpPaneClosedTabIdsRef.current.delete(tabId);
+    sftpOpeningTabIdsRef.current.delete(tabId);
+    setSftpHostForTab(prev => {
+      if (!prev.has(tabId)) return prev;
+      const next = new Map(prev);
+      next.delete(tabId);
+      return next;
+    });
+    setSftpHostSourceSessionForTab(prev => {
+      if (!prev.has(tabId)) return prev;
+      const next = new Map(prev);
+      next.delete(tabId);
+      return next;
+    });
+    setSftpPendingUploadsForTab(prev => {
+      if (!prev.has(tabId)) return prev;
+      const next = new Map(prev);
+      next.delete(tabId);
+      return next;
+    });
+    setSftpInitialLocationForTab(prev => {
+      if (!prev.has(tabId)) return prev;
+      const next = new Map(prev);
+      next.delete(tabId);
+      return next;
+    });
+  }, []);
+
+  // Panel-reported count can lag a tick; the global store is the authority for
+  // unfinished work under this tab's transfer owner (terminal:<tabId>).
+  const resolveTabActiveTransfersCount = useCallback((tabId: string, reportedCount?: number) => {
+    return resolveSftpActiveTransfersCount({
+      reportedCount: reportedCount ?? sftpActiveTransfersByTabRef.current.get(tabId) ?? 0,
+      storeTasks: sftpTransferCenterStore.getSnapshot().tasks,
+      ownerId: terminalSftpTransferOwnerId(tabId),
+    });
+  }, []);
+
+  const resolveTabActiveExternalEditCount = useCallback((tabId: string, reportedCount?: number) => {
+    return Math.max(0, reportedCount ?? sftpActiveExternalEditsByTabRef.current.get(tabId) ?? 0);
+  }, []);
+
+  const evaluateSftpPanelRetentionAfterActivity = useCallback((tabId: string, params: {
+    activeTransfersCount: number;
+    activeExternalEditCount: number;
+  }) => {
+    const { activeTransfersCount, activeExternalEditCount } = params;
+    if (activeTransfersCount > 0 || activeExternalEditCount > 0) {
+      const cleanupTimer = sftpRetainedCleanupTimersRef.current.get(tabId);
+      if (cleanupTimer !== undefined) {
+        window.clearTimeout(cleanupTimer);
+        sftpRetainedCleanupTimersRef.current.delete(tabId);
+      }
+      return;
+    }
+    const lifecycle = {
+      activeTransfersCount,
+      activeExternalEditCount,
+      panelOpen: sidePanelOpenTabsRef.current.has(tabId) || sftpOpeningTabIdsRef.current.has(tabId),
+      retainedAfterClose: sftpRetainedAfterCloseTabIdsRef.current.has(tabId),
+    };
+    if (shouldClearSftpPanelAfterTransferChange(lifecycle)) {
+      clearSftpPanelState(tabId);
+      return;
+    }
+    if (
+      shouldScheduleSftpRetainedPanelCleanup({
+        activeTransfersCount: lifecycle.activeTransfersCount,
+        activeExternalEditCount: lifecycle.activeExternalEditCount,
+        retainedAfterClose: lifecycle.retainedAfterClose,
+      })
+      && !sftpRetainedCleanupTimersRef.current.has(tabId)
+    ) {
+      const cleanupTimer = window.setTimeout(() => {
+        sftpRetainedCleanupTimersRef.current.delete(tabId);
+        const currentTransfers = resolveTabActiveTransfersCount(tabId);
+        const currentExternalEdits = resolveTabActiveExternalEditCount(tabId);
+        if (
+          currentTransfers <= 0
+          && currentExternalEdits <= 0
+          && !sidePanelOpenTabsRef.current.has(tabId)
+          && !sftpOpeningTabIdsRef.current.has(tabId)
+          && sftpRetainedAfterCloseTabIdsRef.current.has(tabId)
+        ) {
+          clearSftpPanelState(tabId);
+        }
+      }, SFTP_TRANSFER_HISTORY_RETENTION_MS);
+      sftpRetainedCleanupTimersRef.current.set(tabId, cleanupTimer);
+    }
+  }, [
+    clearSftpPanelState,
+    resolveTabActiveExternalEditCount,
+    resolveTabActiveTransfersCount,
+    sidePanelOpenTabsRef,
+  ]);
+
+  const handleSftpActiveTransfersChange = useCallback((tabId: string, count: number) => {
+    const activeTransfersCount = resolveTabActiveTransfersCount(tabId, Math.max(0, count));
+    if (activeTransfersCount > 0) {
+      sftpActiveTransfersByTabRef.current.set(tabId, activeTransfersCount);
+    } else {
+      sftpActiveTransfersByTabRef.current.delete(tabId);
+    }
+    evaluateSftpPanelRetentionAfterActivity(tabId, {
+      activeTransfersCount,
+      activeExternalEditCount: resolveTabActiveExternalEditCount(tabId),
+    });
+  }, [
+    evaluateSftpPanelRetentionAfterActivity,
+    resolveTabActiveExternalEditCount,
+    resolveTabActiveTransfersCount,
+  ]);
+
+  const handleSftpActiveExternalEditsChange = useCallback((tabId: string, count: number) => {
+    const activeExternalEditCount = resolveTabActiveExternalEditCount(tabId, Math.max(0, count));
+    if (activeExternalEditCount > 0) {
+      sftpActiveExternalEditsByTabRef.current.set(tabId, activeExternalEditCount);
+    } else {
+      sftpActiveExternalEditsByTabRef.current.delete(tabId);
+    }
+    evaluateSftpPanelRetentionAfterActivity(tabId, {
+      activeTransfersCount: resolveTabActiveTransfersCount(tabId),
+      activeExternalEditCount,
+    });
+  }, [
+    evaluateSftpPanelRetentionAfterActivity,
+    resolveTabActiveExternalEditCount,
+    resolveTabActiveTransfersCount,
+  ]);
+
+  const closeTerminalSidePanelTab = useCallback((tabId: string) => {
+    setSidePanelOpenTabs((previous) => {
+      const next = new Map(previous);
+      next.delete(tabId);
+      return next;
+    });
+    sftpOpeningTabIdsRef.current.delete(tabId);
+    const activeTransfersCount = resolveTabActiveTransfersCount(tabId);
+    const activeExternalEditCount = resolveTabActiveExternalEditCount(tabId);
+    if (shouldKeepSftpMountedAfterClose({ activeTransfersCount, activeExternalEditCount })) {
+      sftpRetainedAfterCloseTabIdsRef.current.add(tabId);
+      if (activeTransfersCount > 0) {
+        sftpActiveTransfersByTabRef.current.set(tabId, activeTransfersCount);
+      }
+      if (activeExternalEditCount > 0) {
+        sftpActiveExternalEditsByTabRef.current.set(tabId, activeExternalEditCount);
+      }
+    } else {
+      clearSftpPanelState(tabId);
+    }
+    setAiMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    setScriptsMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    setThemeMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    setSystemMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    setBrowserMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    setNotesMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    setNotesOpenNoteByTab((previous) => {
+      const next = new Map(previous);
+      next.delete(tabId);
+      return next;
+    });
+    notesReturnTabRef.current.delete(tabId);
+  }, [
+    clearSftpPanelState,
+    resolveTabActiveExternalEditCount,
+    resolveTabActiveTransfersCount,
+    setSidePanelOpenTabs,
+  ]);
 
   const handleToggleWorkspaceComposeBar = useCallback(() => {
     setIsComposeBarOpen(prev => !prev);
-  }, []);
+  }, [setIsComposeBarOpen]);
 
-  const handleOpenSftp = useCallback((host: Host, initialPath?: string, pendingUploadEntries?: DropEntry[], sourceSessionId?: string) => {
+  const handleOpenSftp = useCallback((
+    host: Host,
+    initialPath?: string,
+    pendingUploadEntries?: DropEntry[],
+    originSessionId?: string,
+    sourceSessionId?: string,
+  ) => {
     const tabId = activeTabIdRef.current;
     if (!tabId) return;
 
     // When SFTP is opened from a non-focused workspace pane (toolbar click
     // or drag-drop), switch focus first so the SFTP panel binds to the
-    // correct host.
-    if (sourceSessionId) {
+    // originating terminal.
+    if (originSessionId) {
       const ws = activeWorkspaceRef.current;
-      if (ws && ws.focusedSessionId !== sourceSessionId) {
-        onSetWorkspaceFocusedSessionRef.current?.(ws.id, sourceSessionId);
+      if (ws && ws.focusedSessionId !== originSessionId) {
+        onSetWorkspaceFocusedSessionRef.current?.(ws.id, originSessionId);
       }
     }
 
@@ -363,42 +1066,68 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // Compare full endpoint identity so that session-time overrides
     // (different port/protocol for the same host ID) trigger a switch
     // instead of toggling the panel closed.
-    const isSameEndpoint = currentHost
-      && currentHost.id === host.id
-      && currentHost.hostname === host.hostname
-      && currentHost.port === host.port
-      && currentHost.protocol === host.protocol
-      && currentHost.username === host.username
-      && currentHost.sftpSudo === host.sftpSudo;
+    const isSameEndpoint = isSameSftpHostSelection(currentHost, host);
 
-    const isClosing = !shouldKeepOpen && isOpen && isSameEndpoint;
+    const currentLayout = sidePanelLayoutsRef.current.get(tabId);
+    const paneCount = currentLayout
+      ? collectSidePanelPanes(currentLayout.root).length
+      : 1;
+    const isClosing = shouldCloseSftpSidePanel({
+      shouldKeepOpen,
+      isOpen,
+      isSameEndpoint: !!isSameEndpoint,
+      paneCount,
+    });
+    if (isClosing) {
+      closeTerminalSidePanelTab(tabId);
+      return;
+    }
+
+    sftpOpeningTabIdsRef.current.add(tabId);
+    const cleanupTimer = sftpRetainedCleanupTimersRef.current.get(tabId);
+    if (cleanupTimer !== undefined) {
+      window.clearTimeout(cleanupTimer);
+      sftpRetainedCleanupTimersRef.current.delete(tabId);
+    }
+    sftpRetainedAfterCloseTabIdsRef.current.delete(tabId);
+    sftpPaneClosedTabIdsRef.current.delete(tabId);
 
     setSidePanelOpenTabs(prev => {
       const next = new Map(prev);
-      if (isClosing) {
-        next.delete(tabId);
-      } else {
-        next.set(tabId, 'sftp');
-      }
+      next.set(tabId, 'sftp');
       return next;
     });
 
-    // Store or remove the host for this tab.
-    // Removing on close unmounts the panel so SFTP sessions are cleaned up.
     setSftpHostForTab(prev => {
       const next = new Map(prev);
-      if (isClosing) {
-        next.delete(tabId);
-      } else {
-        next.set(tabId, host);
-      }
+      next.set(tabId, host);
       return next;
+    });
+    setSftpHostSourceSessionForTab(prev => {
+      const next = new Map(prev);
+      if (originSessionId) next.set(tabId, originSessionId);
+      else next.delete(tabId);
+      return next;
+    });
+    if (originSessionId) {
+      const sessionHost = sessionHostsMapRef.current.get(originSessionId);
+      if (sessionHost && (host.username !== sessionHost.username || host.identityId !== sessionHost.identityId)) {
+        setSftpAuthHostBySessionId(prev => new Map(prev).set(originSessionId, host));
+      }
+    }
+
+    const { connectionKey, effectiveInitialPath } = resolveSftpOpenTarget({
+      tabId,
+      host,
+      initialPath,
+      pendingUploadEntries,
+      originSessionId,
     });
 
     setSftpInitialLocationForTab(prev => {
       const next = new Map(prev);
-      if (initialPath) {
-        next.set(tabId, { hostId: host.id, path: initialPath });
+      if (effectiveInitialPath) {
+        next.set(tabId, { hostId: host.id, path: effectiveInitialPath });
       } else {
         next.delete(tabId);
       }
@@ -406,31 +1135,47 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     });
 
     setSftpPendingUploadsForTab(prev => {
-      const next = new Map(prev);
-      if (isClosing || !pendingUploadEntries?.length) {
-        // Clear any stale pending upload on close or when opening without new files
-        next.delete(tabId);
-      } else {
-        next.set(tabId, {
-          requestId: crypto.randomUUID(),
-          hostId: host.id,
-          connectionKey: buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username),
-          targetPath: initialPath,
-          entries: pendingUploadEntries,
-        });
-      }
-      return next;
-    });
-  }, []);
-
-  const handlePendingUploadHandled = useCallback((tabId: string, requestId: string) => {
-    setSftpPendingUploadsForTab(prev => {
-      const current = prev.get(tabId);
-      if (!current || current.requestId !== requestId) {
+      if (!pendingUploadEntries?.length) {
+        // Opening the panel without new files must not discard drops that are
+        // still queued and waiting to upload; leave the queue untouched.
+        // Stale entries are cancelled by the panel itself (with a toast) when
+        // their host/connection no longer matches.
         return prev;
       }
       const next = new Map(prev);
-      next.delete(tabId);
+      // Queue the drop behind any earlier pending request for this tab so a
+      // second drop that arrives before the first has started uploading
+      // cannot silently discard the first batch.
+      const queue = prev.get(tabId) ?? [];
+      next.set(tabId, [
+        ...queue,
+        {
+          requestId: crypto.randomUUID(),
+          hostId: host.id,
+          connectionKey,
+          originSessionId,
+          sourceSessionId,
+          targetPath: initialPath,
+          entries: pendingUploadEntries,
+        },
+      ]);
+      return next;
+    });
+  }, [closeTerminalSidePanelTab, resolveSftpOpenTarget, setSidePanelOpenTabs, sidePanelLayoutsRef, sidePanelOpenTabsRef]);
+
+  const handlePendingUploadHandled = useCallback((tabId: string, requestId: string) => {
+    setSftpPendingUploadsForTab(prev => {
+      const queue = prev.get(tabId);
+      if (!queue?.length) return prev;
+      const index = queue.findIndex(item => item.requestId === requestId);
+      if (index === -1) return prev;
+      const next = new Map(prev);
+      const remaining = queue.filter((_, itemIndex) => itemIndex !== index);
+      if (remaining.length) {
+        next.set(tabId, remaining);
+      } else {
+        next.delete(tabId);
+      }
       return next;
     });
   }, []);
@@ -447,35 +1192,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     });
   }, []);
 
-  // Side panel resize handler
-  const handleSidePanelResizeStart = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    sftpResizingRef.current = true;
-    const startX = e.clientX;
-    const startWidth = sidePanelWidth;
-
-    let lastWidth = startWidth;
-    let rafId: number | null = null;
-    const onMouseMove = (ev: MouseEvent) => {
-      const delta = ev.clientX - startX;
-      lastWidth = Math.max(280, Math.min(800, startWidth + (sidePanelPosition === 'left' ? delta : -delta)));
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(() => {
-        rafId = null;
-        setSidePanelWidth(lastWidth);
-      });
-    };
-    const onMouseUp = () => {
-      if (rafId !== null) cancelAnimationFrame(rafId);
-      setSidePanelWidth(lastWidth);
-      sftpResizingRef.current = false;
-      persistSidePanelWidth(lastWidth);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-    };
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-  }, [sidePanelWidth, sidePanelPosition, setSidePanelWidth, persistSidePanelWidth]);
+  const handleSftpCurrentPathChange = useCallback((memoryKey: string, location: SftpRememberedLocation) => {
+    if (!memoryKey || !location.path) return;
+    sftpLastPathForSourceRef.current.set(memoryKey, location);
+  }, []);
 
   // Pre-compute host lookup map for O(1) access
   const hostMap = useMemo(() => {
@@ -489,123 +1209,263 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     () => new Set(proxyProfiles.map((profile) => profile.id)),
     [proxyProfiles],
   );
+  const defaultLocalShell = useDefaultLocalShellContext(terminalSettings);
   const effectiveHosts = useMemo(
-    () => hosts.map((host) => {
-      const groupDefaults = host.group
-        ? resolveGroupDefaults(host.group, groupConfigs, { validProxyProfileIds: proxyProfileIdSet })
-        : {};
-      return materializeHostProxyProfile(
-        applyGroupDefaults(host, groupDefaults, { validProxyProfileIds: proxyProfileIdSet }),
-        proxyProfiles,
-      );
-    }),
-    [groupConfigs, hosts, proxyProfileIdSet, proxyProfiles],
+    () => hosts.map((host) => resolveEffectiveTerminalHost({
+      host,
+      groupConfigs,
+      proxyProfiles,
+      validProxyProfileIds: proxyProfileIdSet,
+      defaultLocalShell,
+    })),
+    [groupConfigs, hosts, proxyProfileIdSet, proxyProfiles, defaultLocalShell],
   );
 
   // Pre-compute fallback hosts to avoid creating new objects on every render
   const sessionHostsMap = useMemo(() => {
     const map = new Map<string, Host>();
     for (const session of sessions) {
-      const rawHost = hostMap.get(session.hostId);
-      if (rawHost) {
-        // Apply group config defaults so Terminal sees the merged host
-        const groupDefaults = rawHost.group
-          ? resolveGroupDefaults(rawHost.group, groupConfigs, { validProxyProfileIds: proxyProfileIdSet })
-          : {};
-        const existingHost = materializeHostProxyProfile(
-          applyGroupDefaults(rawHost, groupDefaults, { validProxyProfileIds: proxyProfileIdSet }),
-          proxyProfiles,
-        );
-
-        const protocol = session.protocol ?? existingHost.protocol;
-        const port = session.port ?? existingHost.port;
-        const moshEnabled = session.moshEnabled ?? existingHost.moshEnabled;
-
-        if (
-          protocol === existingHost.protocol &&
-          port === existingHost.port &&
-          moshEnabled === existingHost.moshEnabled
-        ) {
-          map.set(session.id, existingHost);
-        } else {
-          map.set(session.id, {
-            ...existingHost,
-            protocol,
-            port,
-            moshEnabled,
-          });
-        }
-      } else {
-        // Create stable fallback host object
-        const fallbackProtocol = session.protocol ?? 'local' as const;
-        map.set(session.id, {
-          id: session.hostId,
-          label: session.hostLabel || 'Local Terminal',
-          hostname: session.hostname || 'localhost',
-          username: session.username || 'local',
-          port: session.port ?? 22,
-          // Only local terminals adopt the client OS — unsaved serial
-          // sessions and orphaned remote sessions (whose host was deleted
-          // while the session lives on) also hit this fallback, and the
-          // non-local autocomplete path in Terminal.tsx trusts host.os, so
-          // a Windows-client 'windows' tag here would mis-shape POSIX
-          // remote/serial autocomplete (#1112 review).
-          os: fallbackProtocol === 'local'
-            ? detectLocalOs(navigator.userAgent || navigator.platform)
-            : 'linux',
-          group: '',
-          tags: [],
-          protocol: fallbackProtocol,
-          moshEnabled: session.moshEnabled,
-          charset: session.charset,
-          localShell: session.localShell,
-          localShellArgs: session.localShellArgs,
-          localShellName: session.localShellName,
-          localShellIcon: session.localShellIcon,
-        });
-      }
+      const hostForSession = resolveTerminalSessionHost({
+        session,
+        hosts,
+        groupConfigs,
+        proxyProfiles,
+        localOs: detectLocalOs(navigator.userAgent || navigator.platform),
+        defaultLocalShell,
+      });
+      map.set(session.id, applySessionFontSizeToHost(hostForSession, session));
     }
     return map;
-  }, [sessions, hostMap, groupConfigs, proxyProfileIdSet, proxyProfiles]);
+  }, [sessions, hosts, groupConfigs, proxyProfiles, defaultLocalShell]);
+  const resolvedSessionHostIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const session of sessions) {
+      if (hostMap.has(session.hostId) || session.protocol === 'local') ids.add(session.id);
+    }
+    return ids;
+  }, [hostMap, sessions]);
   const sessionChainHostsMap = useMemo(() => {
     const map = new Map<string, Host[]>();
     for (const session of sessions) {
       const host = sessionHostsMap.get(session.id);
-      if (!host?.hostChain?.hostIds?.length) continue;
-      map.set(
-        session.id,
-        host.hostChain.hostIds
-          .map((hostId) => {
-            const rawChainHost = hostMap.get(hostId);
-            if (!rawChainHost) return undefined;
-            const chainGroupDefaults = rawChainHost.group
-              ? resolveGroupDefaults(rawChainHost.group, groupConfigs, { validProxyProfileIds: proxyProfileIdSet })
-              : {};
-            return materializeHostProxyProfile(
-              applyGroupDefaults(rawChainHost, chainGroupDefaults, { validProxyProfileIds: proxyProfileIdSet }),
-              proxyProfiles,
-            );
-          })
-          .filter((value): value is Host => Boolean(value)),
-      );
+      const chainHosts = resolveTerminalChainHosts({
+        host,
+        hosts,
+        groupConfigs,
+        proxyProfiles,
+        validProxyProfileIds: proxyProfileIdSet,
+      });
+      if (chainHosts.length > 0) map.set(session.id, chainHosts);
     }
     return map;
-  }, [sessions, sessionHostsMap, hostMap, groupConfigs, proxyProfileIdSet, proxyProfiles]);
+  }, [sessions, sessionHostsMap, hosts, groupConfigs, proxyProfileIdSet, proxyProfiles]);
   const sessionHostsMapRef = useRef(sessionHostsMap);
   sessionHostsMapRef.current = sessionHostsMap;
-  const handleTerminalFontSizeChange = useCallback((sessionId: string, nextFontSize: number) => {
-    const sessionHost = sessionHostsMapRef.current.get(sessionId);
-    if (!sessionHost) return;
 
-    const rawHost = hostMapRef.current.get(sessionHost.id);
-    const usesGlobalFontSize = sessionHost.protocol === 'local' || sessionHost.id?.startsWith('local-') || !rawHost;
-    if (usesGlobalFontSize) {
-      onUpdateTerminalFontSize?.(nextFontSize);
-      return;
+  // Resolve the active broadcast mode, then write to its target sessions.
+  const handleBroadcastInput = useCallback((
+    data: string,
+    sourceSessionId: string,
+    options?: TerminalBroadcastInputOptions,
+  ) => {
+    const paced = options?.pacedBroadcast;
+    // Opt-in #3488 bypass: when enabled, sensitive-prompt targets stay in the
+    // fan-out instead of being silently dropped here.
+    const passwordBypass = broadcastPasswordBypassRef.current === true;
+    if (paced && !options?.preparePacedBroadcast) {
+      if (!paced.targets || (!passwordBypass && isTerminalSensitiveInputActive(sourceSessionId))) return [];
+      paced.targets = paced.targets.filter(target => isTerminalBroadcastInputCurrent(target)
+        && (passwordBypass || !isTerminalSensitiveInputActive(target.sessionId)));
     }
+    const targetSessionIds = resolveTerminalBroadcastTargetIds({
+      sessions: sessionsRef.current,
+      sourceSessionId,
+      globalBroadcastEnabled: isGlobalBroadcastEnabled,
+      directTargetSessionIds: options?.kittyKeyboardTargetSessionIds,
+      includeGlobalPeersWithoutToolbar: options?.composePeerFanOut === true,
+    }).filter(id => !paced?.targets || paced.targets.some(target => target.sessionId === id));
+    if (options?.preparePacedBroadcast && paced) {
+      paced.targets = targetSessionIds.filter(id => passwordBypass || !isTerminalSensitiveInputActive(id)).map(id => {
+        markTerminalBroadcastUserInput(id);
+        terminalBackend.interruptSession(id, undefined, { cancelPendingWritesOnly: true });
+        return captureTerminalBroadcastInput(id);
+      });
+      return paced.targets.map(target => target.sessionId);
+    }
+    if (targetSessionIds.length === 0) return [];
 
-    onUpdateHost({ ...rawHost, fontSize: nextFontSize, fontSizeOverride: true });
-  }, [onUpdateHost, onUpdateTerminalFontSize]);
+    const targetSessionIdSet = new Set(targetSessionIds);
+    const deliveredSessionIds: string[] = [];
+
+    for (const session of sessionsRef.current) {
+      if (!targetSessionIdSet.has(session.id)) continue;
+      if (!canUseDirectSessionWriteFallback(session)) continue;
+      if (!paced && (options?.automated !== true || options.lineDelayMs)) markTerminalBroadcastUserInput(session.id);
+
+      if (options?.kittyKeyboardInput) {
+        dispatchKittyKeyboardBroadcastInput(session.id, options.kittyKeyboardInput, {
+          beforeUrgentInterrupt: () => {
+            broadcastInterruptPrioritizersRef.current.get(session.id)?.();
+          },
+          // Bypassed password fan-out (#3488): the receiver forces sensitive
+          // writes so its input interceptors stay skipped for the secret.
+          ...(options?.sourceSensitive === true ? { sourceSensitive: true } : {}),
+        });
+        deliveredSessionIds.push(session.id);
+        continue;
+      }
+
+      const lineDelayMs = options?.lineDelayMs;
+      if (data === "\x03"
+        && isPluginHostProtocol(session.protocol)
+        && terminalBackend.signalPluginConnection) {
+        broadcastInterruptPrioritizersRef.current.get(session.id)?.();
+        terminalBackend.interruptSession(session.id, undefined, { cancelPendingWritesOnly: true });
+        void terminalBackend.signalPluginConnection(session.id, "interrupt").catch(() => {
+          terminalBackend.interruptSession(session.id);
+        });
+        deliveredSessionIds.push(session.id);
+        continue;
+      }
+      if (data === "\x03" && terminalBackend.interruptSession) {
+        broadcastInterruptPrioritizersRef.current.get(session.id)?.();
+        terminalBackend.interruptSession(session.id);
+        continue;
+      }
+      if (!passwordBypass && isTerminalSensitiveInputActive(session.id)) continue;
+      terminalBackend.writeToSession(session.id, data, {
+        automated: options?.automated === true,
+        // Retain the source-sensitive marker (bypassed password fan-out, #3488)
+        // so peer input interceptors stay skipped for the secret payload. A
+        // target that is itself awaiting a secret keeps its classification:
+        // bypassing the fan-out pause must not downgrade its own sensitive
+        // state (#3491).
+        sensitive: options?.sourceSensitive === true || isTerminalSensitiveInputActive(session.id),
+        ...(lineDelayMs ? { lineDelayMs } : {}),
+      });
+      deliveredSessionIds.push(session.id);
+    }
+    return deliveredSessionIds;
+  }, [terminalBackend, isGlobalBroadcastEnabled]);
+
+  const handleCommandSubmitted = useCallback((command: string, _hostId: string, _hostLabel: string, sessionId: string) => {
+    codingCliSignalController.handleCommandSubmitted(sessionId, command);
+
+    const tabId = activeTabIdRef.current;
+    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
+    // Local POSIX shells do not emit OSC 7. They share this probe so session
+    // restore can `cd` back after restart (#1952). Prompt return calls this
+    // again with an empty command once the shell is idle, so a slow command
+    // such as `sleep 1; cd /tmp` is not recorded at the 150ms snapshot.
+    // SSH keeps the extra-exec eligibility check inside canScheduleCommandCwdProbe.
+    if (!session || !canScheduleCommandCwdProbe(session)) return;
+    const sessionHost = sessionHostsMapRef.current.get(sessionId);
+    const visibleSftpHost = tabId && sidePanelLayoutHasTool(sidePanelLayoutsRef.current.get(tabId), 'sftp')
+      ? sftpHostForTabRef.current.get(tabId) ?? null
+      : null;
+    if (!shouldProbeCommandCwd({
+      restoreTerminalCwd,
+      visibleSftpHost,
+      sessionHost,
+      globalSftpFollowTerminalCwd: sftpFollowTerminalCwdRef.current,
+      restrictExtraSshChannels: hostRestrictsExtraSshChannels(sessionHost),
+    })) return;
+
+    const osc7SignalAtCommand = terminalOsc7SignalBySessionRef.current.get(sessionId) ?? 0;
+    const probeGeneration = (cwdProbeGenerationRef.current.get(sessionId) ?? 0) + 1;
+    cwdProbeGenerationRef.current.set(sessionId, probeGeneration);
+    cwdProbeCancelersRef.current.get(sessionId)?.();
+    const cancelProbe = scheduleBackendCwdProbeAfterCommand({
+      sessionId,
+      osc7SignalAtCommand,
+      getOsc7Signal: () => terminalOsc7SignalBySessionRef.current.get(sessionId) ?? 0,
+      getSessionPwd: (id, options) => terminalBackend.getSessionPwd(id, options),
+      canProbe: async () => {
+        if (cwdProbeGenerationRef.current.get(sessionId) !== probeGeneration) return false;
+        // Local cwd is the PTY process directory, not an extra SSH channel.
+        if (session.protocol === "local") return true;
+        const host = sessionHostsMapRef.current.get(sessionId);
+        if (!host) return false;
+        const hostDeviceClass = classifyDistroId(host.distro);
+        const hostIsNetworkDevice =
+          host.deviceType === 'network' || hostDeviceClass === 'network-device';
+        const info = await terminalBackend.getSessionRemoteInfo?.(sessionId);
+        return shouldProbeSessionCwd({
+          isNetworkDevice: hostIsNetworkDevice,
+          remoteSshVersion: info?.remoteSshVersion,
+          restrictExtraSshChannels: hostRestrictsExtraSshChannels(host),
+        });
+      },
+      onProbedCwd: (cwd) => {
+        if (cwdProbeGenerationRef.current.get(sessionId) !== probeGeneration) return;
+        const existing = terminalRendererCwdBySessionRef.current.get(sessionId);
+        if (existing === cwd) return;
+        handleTerminalCwdChange(sessionId, cwd, { source: 'backend-strict' });
+      },
+    });
+    cwdProbeCancelersRef.current.set(sessionId, cancelProbe);
+  }, [codingCliSignalController, handleTerminalCwdChange, restoreTerminalCwd, sidePanelLayoutsRef, terminalBackend]);
+
+  const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
+    onCommandExecuted?.(command, hostId, hostLabel, sessionId);
+  }, [onCommandExecuted]);
+
+  useEffect(() => () => {
+    pruneTerminalSessionRuntimeState({
+      terminalRendererCwdBySessionRef,
+      terminalRendererCwdSourceBySessionRef,
+      terminalOsc7SignalBySessionRef,
+      cwdProbeGenerationRef,
+      cwdProbeCancelersRef,
+    }, new Set());
+  }, []);
+  const sessionSudoAutofillPasswordsMap = useMemo(() => {
+    const map = new Map<string, string | undefined>();
+    for (const session of sessions) {
+      // Use the effective session host (group defaults / proxy materialization
+      // applied) so a password inherited from group settings is available.
+      const sessionHost = sessionHostsMap.get(session.id);
+      if (sessionHost) {
+        // Resolve through identity references too (host.identityId), not just
+        // host.password, so a password stored in a Keychain identity is filled
+        // (issue #1284) — same resolution SSH login uses.
+        map.set(session.id, resolveHostAutofillPassword({ host: sessionHost, keys, identities }));
+      }
+    }
+    return map;
+  }, [sessionHostsMap, sessions, keys, identities]);
+
+  const sessionSudoAutofillCandidatesMap = useMemo(() => {
+    const map = new Map<
+      string,
+      ReturnType<typeof listPasswordPromptFillCandidates> | undefined
+    >();
+    for (const session of sessions) {
+      const sessionHost = sessionHostsMap.get(session.id);
+      if (sessionHost) {
+        map.set(
+          session.id,
+          listPasswordPromptFillCandidates({ host: sessionHost, keys, identities }),
+        );
+      }
+    }
+    return map;
+  }, [sessionHostsMap, sessions, keys, identities]);
+
+  const handleTerminalFontSizeChange = useCallback((sessionId: string, nextFontSize: number) => {
+    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
+    const sessionHost = sessionHostsMapRef.current.get(sessionId);
+    const rawHost = sessionHost ? hostMapRef.current.get(sessionHost.id) : null;
+    const target = resolveTerminalFontSizeUpdateTarget({ session, sessionHost, rawHost });
+    if (target.kind === 'none') return;
+    if (target.kind === 'session') {
+      onUpdateSessionFontSize?.(sessionId, nextFontSize);
+    } else if (target.kind === 'global') {
+      onUpdateTerminalFontSize?.(nextFontSize);
+    } else {
+      onUpdateHost({ ...target.host, fontSize: nextFontSize, fontSizeOverride: true });
+    }
+  }, [onUpdateHost, onUpdateSessionFontSize, onUpdateTerminalFontSize]);
 
   const validAIScopeTargetIds = useMemo(() => {
     const ids = new Set<string>();
@@ -613,6 +1473,53 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     for (const workspace of workspaces) ids.add(workspace.id);
     return ids;
   }, [sessions, workspaces]);
+
+  useEffect(() => {
+    pruneTerminalTabMemoryState({
+      lastSidePanelTabRef,
+      notesReturnTabRef,
+      sftpLastPathForSourceRef,
+    }, validAIScopeTargetIds);
+  }, [validAIScopeTargetIds]);
+
+  useEffect(() => {
+    const storeActiveTransferTabIds = listTerminalTabIdsWithRetainingTransfers(
+      sftpTransferCenterStore.getSnapshot().tasks,
+    );
+    // Keep owners with unfinished transfers or external-editor temps mounted
+    // even after the terminal tab id drops out of the valid set.
+    const activeTransferTabIds = new Set([
+      ...sftpActiveTransfersByTabRef.current.keys(),
+      ...sftpActiveExternalEditsByTabRef.current.keys(),
+      ...storeActiveTransferTabIds,
+    ]);
+    const invalidTabIds = listInvalidSftpPanelTabIds({
+      mountedTabIds: sftpHostForTab.keys(),
+      activeTransferTabIds,
+      retainedTabIds: sftpRetainedAfterCloseTabIdsRef.current,
+      openingTabIds: sftpOpeningTabIdsRef.current,
+      cleanupTimerTabIds: sftpRetainedCleanupTimersRef.current.keys(),
+      validTabIds: validAIScopeTargetIds,
+    });
+    for (const tabId of invalidTabIds) {
+      clearSftpPanelState(tabId);
+    }
+  }, [clearSftpPanelState, sftpHostForTab, validAIScopeTargetIds]);
+
+  useEffect(() => {
+    for (const tabId of sftpOpeningTabIdsRef.current) {
+      if (sidePanelOpenTabs.get(tabId) === 'sftp') {
+        sftpOpeningTabIdsRef.current.delete(tabId);
+      }
+    }
+  }, [sidePanelOpenTabs]);
+
+  useEffect(() => () => {
+    for (const cleanupTimer of sftpRetainedCleanupTimersRef.current.values()) {
+      window.clearTimeout(cleanupTimer);
+    }
+    sftpRetainedCleanupTimersRef.current.clear();
+  }, []);
 
   const validSessionActivityIds = useMemo(() => {
     return getValidSessionActivityIds(sessions);
@@ -638,63 +1545,88 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   onToggleBroadcastRef.current = onToggleBroadcast;
   const workspaceBroadcastHandlersRef = useRef<Map<string, () => void>>(new Map());
 
-  const isTerminalLayerVisible = isVisible || !!draggingSessionId;
-
-  const focusedSessionId = activeWorkspace?.focusedSessionId;
-  const focusedSessionIdRef = useRef(focusedSessionId);
-  focusedSessionIdRef.current = focusedSessionId;
-
-  // Resolve the SFTP host for the current tab.
-  // Uses the stored host from when the user opened SFTP, but updates when
-  // the focused session changes in workspace mode.
-  const sftpActiveHost = useMemo((): Host | null => {
-    if (!isSftpOpenForCurrentTab || !activeTabId) return null;
-    // For workspace: follow focus
-    if (activeWorkspace && focusedSessionId) {
-      return sessionHostsMap.get(focusedSessionId) ?? sftpHostForTab.get(activeTabId) ?? null;
-    }
-    if (activeSession) {
-      return sessionHostsMap.get(activeSession.id) ?? sftpHostForTab.get(activeTabId) ?? null;
-    }
-    return sftpHostForTab.get(activeTabId) ?? null;
-  }, [isSftpOpenForCurrentTab, activeTabId, activeWorkspace, activeSession, focusedSessionId, sessionHostsMap, sftpHostForTab]);
+  const onToggleGlobalBroadcastRef = useRef(onToggleGlobalBroadcast);
+  onToggleGlobalBroadcastRef.current = onToggleGlobalBroadcast;
 
   const mountedSftpTabIds = useMemo(
     () => Array.from(sftpHostForTab.keys()),
     [sftpHostForTab],
   );
-  const mountedAiTabIds = useMemo(
-    () =>
-      Array.from(sidePanelOpenTabs.entries())
-        .filter(([, panel]) => panel === 'ai')
-        .map(([tabId]) => tabId),
-    [sidePanelOpenTabs],
-  );
+  const markSidePanelSubTabOpened = useCallback((tabId: string, panel: SidePanelTab) => {
+    if (panel === 'ai') {
+      setAiMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      return;
+    }
+    if (panel === 'scripts') {
+      setScriptsMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      return;
+    }
+    if (panel === 'theme') {
+      setThemeMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      return;
+    }
+    if (panel === 'system') {
+      setSystemMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      return;
+    }
+    if (panel === 'browser') {
+      setBrowserMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+      return;
+    }
+    if (panel === 'notes') {
+      setNotesMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    }
+  }, []);
 
   const getActiveTerminalSessionId = useCallback((): string | null => {
+    const activeWorkspace = activeWorkspaceRef.current;
+    const activeSession = activeSessionRef.current;
     if (!activeWorkspace) return activeSession?.id ?? null;
 
     const workspaceSessionIdSet = new Set(collectSessionIds(activeWorkspace.root));
-    const focusedSessionId = activeWorkspace.focusedSessionId;
-    if (focusedSessionId && workspaceSessionIdSet.has(focusedSessionId) && sessions.some((session) => session.id === focusedSessionId)) {
-      return focusedSessionId;
+    const focusedId = activeWorkspace.focusedSessionId;
+    if (focusedId && workspaceSessionIdSet.has(focusedId) && sessionsRef.current.some((session) => session.id === focusedId)) {
+      return focusedId;
     }
 
-    return sessions.find((session) => workspaceSessionIdSet.has(session.id))?.id ?? null;
-  }, [activeWorkspace, activeSession?.id, sessions]);
+    return sessionsRef.current.find((session) => workspaceSessionIdSet.has(session.id))?.id ?? null;
+  }, []);
 
   const syncWorkspaceFocusIfNeeded = useCallback((sessionId: string | null) => {
+    const activeWorkspace = activeWorkspaceRef.current;
     if (!activeWorkspace || !sessionId || activeWorkspace.focusedSessionId === sessionId) return;
     onSetWorkspaceFocusedSession?.(activeWorkspace.id, sessionId);
-  }, [activeWorkspace, onSetWorkspaceFocusedSession]);
+  }, [onSetWorkspaceFocusedSession]);
 
   // Get the focused terminal's current working directory
-  const getTerminalCwd = useCallback(async (): Promise<string | null> => {
+  const getTerminalCwd = useCallback(async (options?: {
+    preferFreshBackend?: boolean;
+    allowRendererFallback?: boolean;
+    requireActiveShellCwd?: boolean;
+  }): Promise<string | null> => {
     const sessionId = getActiveTerminalSessionId();
+    const host = sessionId ? sessionHostsMapRef.current.get(sessionId) : undefined;
+    // Same rule as the terminal's own SFTP path lookup (#3631).
+    let skipBackendPwd = hostRestrictsExtraSshChannels(host);
+    if (!skipBackendPwd && sessionId && host) {
+      const info = await terminalBackend.getSessionRemoteInfo?.(sessionId).catch(() => null);
+      skipBackendPwd = !shouldProbeSessionCwd({
+        isNetworkDevice: classifyDistroId(host.distro) === 'network-device',
+        remoteSshVersion: info?.remoteSshVersion,
+      });
+    }
     return resolvePreferredTerminalCwd({
       rendererCwd: sessionId ? terminalRendererCwdBySessionRef.current.get(sessionId) : undefined,
+      rendererCwdSource: sessionId
+        ? terminalRendererCwdSourceBySessionRef.current.get(sessionId)
+        : undefined,
       sessionId,
-      getSessionPwd: (id) => terminalBackend.getSessionPwd(id),
+      getSessionPwd: skipBackendPwd
+        ? async () => ({ success: false })
+        : (id, pwdOptions) => terminalBackend.getSessionPwd(id, pwdOptions),
+      preferFreshBackend: skipBackendPwd ? false : options?.preferFreshBackend,
+      allowRendererFallback: options?.allowRendererFallback,
+      requireActiveShellCwd: options?.requireActiveShellCwd,
     });
   }, [getActiveTerminalSessionId, terminalBackend]);
 
@@ -709,34 +1641,23 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [getActiveTerminalSessionId, refocusTerminalSession, syncWorkspaceFocusIfNeeded]);
 
   // Close the entire side panel for the current tab
+  const handleEndSessionDrag = useCallback(() => {
+    onSetDraggingSessionId(null);
+  }, [onSetDraggingSessionId]);
+
   const handleCloseSidePanel = useCallback(() => {
+    const activeTabId = activeTabIdRef.current;
     if (!activeTabId) return;
+    setMagnifiedPane((current) => (
+      current?.tabId === activeTabId && current.target.kind === 'side-panel'
+        ? null
+        : current
+    ));
     const sessionIdToRefocus = getActiveTerminalSessionId();
     syncWorkspaceFocusIfNeeded(sessionIdToRefocus);
-    setSidePanelOpenTabs(prev => {
-      const next = new Map(prev);
-      next.delete(activeTabId);
-      return next;
-    });
-    // Always clean up SFTP state (it may be mounted in the background
-    // while scripts/theme tab was active)
-    setSftpHostForTab(prev => {
-      const next = new Map(prev);
-      next.delete(activeTabId);
-      return next;
-    });
-    setSftpPendingUploadsForTab(prev => {
-      const next = new Map(prev);
-      next.delete(activeTabId);
-      return next;
-    });
-    setSftpInitialLocationForTab(prev => {
-      const next = new Map(prev);
-      next.delete(activeTabId);
-      return next;
-    });
+    closeTerminalSidePanelTab(activeTabId);
     refocusTerminalSession(sessionIdToRefocus);
-  }, [activeTabId, getActiveTerminalSessionId, refocusTerminalSession, syncWorkspaceFocusIfNeeded]);
+  }, [closeTerminalSidePanelTab, getActiveTerminalSessionId, refocusTerminalSession, syncWorkspaceFocusIfNeeded]);
 
   // Resolve the SFTP host for a tab: a previously-stored host, otherwise the
   // host of the workspace's focused session or the active session. null = none.
@@ -756,7 +1677,72 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     return null;
   }, []);
 
-  // Switch side panel to a specific tab (or toggle if already on that tab)
+  const prepareSidePanelTool = useCallback((tabId: string, tab: SidePanelTab): boolean => {
+    if (tab === 'sftp') {
+      sftpOpeningTabIdsRef.current.add(tabId);
+      const cleanupTimer = sftpRetainedCleanupTimersRef.current.get(tabId);
+      if (cleanupTimer !== undefined) {
+        window.clearTimeout(cleanupTimer);
+        sftpRetainedCleanupTimersRef.current.delete(tabId);
+      }
+      sftpRetainedAfterCloseTabIdsRef.current.delete(tabId);
+      sftpPaneClosedTabIdsRef.current.delete(tabId);
+    }
+
+    if (tab === 'sftp') {
+      const sourceSessionId = getActiveTerminalSessionId();
+      const sessionHost = sourceSessionId ? sessionHostsMapRef.current.get(sourceSessionId) : undefined;
+      const authHost = sourceSessionId ? sftpAuthHostBySessionId.get(sourceSessionId) : undefined;
+      const storedHost = sftpHostForTabRef.current.get(tabId);
+      if (sourceSessionId && sessionHost && authHost
+        && (!storedHost || sftpHostSourceSessionForTabRef.current.has(tabId)
+          || (storedHost.id === sessionHost.id
+            && storedHost.hostname === sessionHost.hostname
+            && (storedHost.port || 22) === (sessionHost.port || 22)))) {
+        setSftpHostForTab(prev => new Map(prev).set(tabId, authHost));
+        setSftpHostSourceSessionForTab(prev => new Map(prev).set(tabId, sourceSessionId));
+      }
+    }
+
+    // If switching to SFTP and no host is stored yet, resolve it
+    if (tab === 'sftp' && !sftpHostForTabRef.current.has(tabId)) {
+      const sourceSessionId = getActiveTerminalSessionId();
+      const host = (sourceSessionId && sftpAuthHostBySessionId.get(sourceSessionId))
+        ?? resolveSftpHostForTab(tabId);
+      if (!host) return;
+      if (sourceSessionId) {
+        setSftpHostSourceSessionForTab(prev => new Map(prev).set(tabId, sourceSessionId));
+      }
+      setSftpHostForTab(prev => {
+        const next = new Map(prev);
+        next.set(tabId, host);
+        return next;
+      });
+      const { effectiveInitialPath } = resolveSftpOpenTarget({
+        tabId,
+        host,
+        originSessionId: sourceSessionId,
+      });
+      setSftpInitialLocationForTab(prev => {
+        const next = new Map(prev);
+        if (effectiveInitialPath) {
+          next.set(tabId, { hostId: host.id, path: effectiveInitialPath });
+        } else {
+          next.delete(tabId);
+        }
+        return next;
+      });
+    }
+
+    // Keep the hidden SFTP panel mounted while switching sub-panels. A panel
+    // closed during a transfer is also retained until the user reopens it and
+    // explicitly closes the now-idle panel, preserving the completed history.
+    markSidePanelSubTabOpened(tabId, tab);
+    return true;
+  }, [getActiveTerminalSessionId, markSidePanelSubTabOpened, resolveSftpHostForTab, resolveSftpOpenTarget, sftpAuthHostBySessionId]);
+
+  // Switch only the focused pane. If the tool is already open elsewhere in
+  // the tree, the domain helper focuses that pane instead of duplicating it.
   const handleSwitchSidePanelTab = useCallback((tab: SidePanelTab) => {
     const tabId = activeTabIdRef.current;
     if (!tabId) return;
@@ -764,28 +1750,188 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
     // If already on this tab, do nothing — user must click X to close
     if (currentPanel === tab) return;
+    if (!prepareSidePanelTool(tabId, tab)) return;
 
-    // If switching to SFTP and no host is stored yet, resolve it
-    if (tab === 'sftp' && !sftpHostForTabRef.current.has(tabId)) {
-      const host = resolveSftpHostForTab(tabId);
-      if (!host) return;
-      setSftpHostForTab(prev => {
-        const next = new Map(prev);
-        next.set(tabId, host);
-        return next;
+    startTransition(() => {
+      selectSidePanelToolForTab(tabId, tab);
+    });
+  }, [prepareSidePanelTool, selectSidePanelToolForTab, sidePanelOpenTabsRef]);
+
+  const handleFocusSidePanelPane = useCallback((paneId: string) => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const layout = sidePanelLayoutsRef.current.get(tabId);
+    const pane = layout
+      ? collectSidePanelPanes(layout.root).find((candidate) => candidate.id === paneId)
+      : undefined;
+    if (pane) {
+      lastInteractedPaneRef.current.set(tabId, {
+        kind: 'side-panel',
+        paneId: pane.id,
+        tool: pane.tool,
       });
     }
+    focusSidePanelPaneForTab(tabId, paneId);
+  }, [focusSidePanelPaneForTab, sidePanelLayoutsRef]);
 
-    // Note: When switching away from SFTP, we keep the SFTP host state
-    // so the SftpSidePanel stays mounted (hidden) and preserves connections.
-    // SFTP state is only cleaned up when the panel is fully closed.
+  const handleTerminalPaneInteraction = useCallback((tabId: string, sessionId: string) => {
+    lastInteractedPaneRef.current.set(tabId, { kind: 'terminal', sessionId });
+  }, []);
 
-    setSidePanelOpenTabs(prev => {
-      const next = new Map(prev);
-      next.set(tabId, tab);
-      return next;
-    });
-  }, [resolveSftpHostForTab]);
+  const handleMagnifyTerminalPane = useCallback((tabId: string, sessionId: string) => {
+    const target: PaneMagnificationTarget = { kind: 'terminal', sessionId };
+    lastInteractedPaneRef.current.set(tabId, target);
+    setMagnifiedPane((current) => (
+      current?.tabId === tabId
+      && current.target.kind === 'terminal'
+      && current.target.sessionId === sessionId
+        ? null
+        : { tabId, target }
+    ));
+  }, []);
+
+  const handleMagnifySidePanelPane = useCallback((paneId: string) => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const layout = sidePanelLayoutsRef.current.get(tabId);
+    const pane = layout
+      ? collectSidePanelPanes(layout.root).find((candidate) => candidate.id === paneId)
+      : undefined;
+    if (!pane) return;
+    const target: PaneMagnificationTarget = {
+      kind: 'side-panel',
+      paneId: pane.id,
+      tool: pane.tool,
+    };
+    lastInteractedPaneRef.current.set(tabId, target);
+    setMagnifiedPane((current) => (
+      current?.tabId === tabId
+      && current.target.kind === 'side-panel'
+      && current.target.paneId === paneId
+        ? null
+        : { tabId, target }
+    ));
+  }, [sidePanelLayoutsRef]);
+
+  const handleRestoreMagnifiedPane = useCallback(() => {
+    const tabId = activeTabIdRef.current;
+    setMagnifiedPane((current) => current?.tabId === tabId ? null : current);
+  }, []);
+
+  useEffect(() => {
+    if (!paneMagnificationRef) return undefined;
+    const getTarget = (): { tabId: string; target: PaneMagnificationTarget; focused: boolean } | null => {
+      const tabId = activeTabStore.getActiveTabId();
+      if (!tabId) return null;
+      const workspace = workspacesRef.current.find((candidate) => candidate.id === tabId);
+      const hasCurrentMagnification = magnifiedPaneRef.current?.tabId === tabId;
+      if (workspace?.viewMode === 'focus' && !hasCurrentMagnification) return null;
+      const workspaceSessionIds = workspace ? collectSessionIds(workspace.root) : [];
+      const standaloneSession = sessionsRef.current.find((candidate) => (
+        candidate.id === tabId && !candidate.workspaceId
+      ));
+      const terminalSessionIds = workspaceSessionIds.length > 0
+        ? workspaceSessionIds
+        : standaloneSession ? [standaloneSession.id] : [];
+      const layout = sidePanelLayoutsRef.current.get(tabId);
+      const sidePanelPanes = layout ? collectSidePanelPanes(layout.root) : [];
+      const focusedSidePanelPane = sidePanelPanes.find((candidate) => (
+        candidate.id === layout?.focusedPaneId
+      ));
+      const candidate = resolvePaneMagnificationCandidate({
+        tabId,
+        terminalSessionIds,
+        focusedSessionId: workspace?.focusedSessionId,
+        sidePanelPanes: focusedSidePanelPane
+          ? [focusedSidePanelPane, ...sidePanelPanes.filter((pane) => pane !== focusedSidePanelPane)]
+          : sidePanelPanes,
+        lastTarget: lastInteractedPaneRef.current.get(tabId),
+        current: magnifiedPaneRef.current,
+      });
+      return candidate ? { tabId, ...candidate } : null;
+    };
+    const controller: PaneMagnificationController = {
+      getState: () => {
+        const target = getTarget();
+        return target ? (target.focused ? 'focused' : 'focusable') : 'unavailable';
+      },
+      focus: () => {
+        const target = getTarget();
+        if (!target || target.focused) return false;
+        setMagnifiedPane({ tabId: target.tabId, target: target.target });
+        return true;
+      },
+      restore: () => {
+        const target = getTarget();
+        if (!target?.focused) return false;
+        setMagnifiedPane(null);
+        return true;
+      },
+      toggle: () => {
+        const target = getTarget();
+        if (!target) return false;
+        setMagnifiedPane(target.focused ? null : { tabId: target.tabId, target: target.target });
+        return true;
+      },
+    };
+    paneMagnificationRef.current = controller;
+    return () => {
+      if (paneMagnificationRef.current === controller) paneMagnificationRef.current = null;
+    };
+  }, [paneMagnificationRef, sidePanelLayoutsRef]);
+
+  const handleSplitSidePanelPane = useCallback((
+    tool: SidePanelTab,
+    direction: SidePanelSplitDirection,
+    availableAxisLength: number,
+  ) => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    if (!sidePanelLayoutsRef.current.has(tabId) || !prepareSidePanelTool(tabId, tool)) return;
+    splitSidePanelPaneForTab(
+      tabId,
+      tool,
+      direction,
+      { paneId: crypto.randomUUID(), splitId: crypto.randomUUID() },
+      availableAxisLength,
+    );
+  }, [prepareSidePanelTool, sidePanelLayoutsRef, splitSidePanelPaneForTab]);
+
+  const handleCloseSidePanelPane = useCallback((paneId: string) => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const layout = sidePanelLayoutsRef.current.get(tabId);
+    const closingPane = layout
+      ? collectSidePanelPanes(layout.root).find((pane) => pane.id === paneId)
+      : undefined;
+    setMagnifiedPane((current) => (
+      current?.tabId === tabId
+      && current.target.kind === 'side-panel'
+      && current.target.paneId === paneId
+        ? null
+        : current
+    ));
+    const closesWholePanel = closeSidePanelPaneForTab(tabId, paneId);
+    if (closesWholePanel) {
+      handleCloseSidePanel();
+      return;
+    }
+    if (closingPane?.tool === 'browser') {
+      setBrowserMountedTabIds((previous) => removeMountedSidePanelTabId(previous, tabId));
+    }
+    if (shouldMarkSftpPaneClosed({
+      closingPaneTool: closingPane?.tool,
+      closesWholePanel: closesWholePanel,
+    })) {
+      sftpPaneClosedTabIdsRef.current.add(tabId);
+    }
+  }, [closeSidePanelPaneForTab, handleCloseSidePanel, sidePanelLayoutsRef]);
+
+  const handleResizeSidePanelSplit = useCallback((splitId: string, sizes: number[]) => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    resizeSidePanelSplitForTab(tabId, splitId, sizes);
+  }, [resizeSidePanelSplitForTab]);
 
   // Toggle SFTP from activity bar header
   const handleToggleSftpFromBar = useCallback(() => {
@@ -810,12 +1956,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       return;
     }
 
-    setSidePanelOpenTabs(prev => {
-      const next = new Map(prev);
-      next.set(tabId, 'scripts');
-      return next;
+    markSidePanelSubTabOpened(tabId, 'scripts');
+    startTransition(() => {
+      setSidePanelOpenTabs(prev => {
+        const next = new Map(prev);
+        next.set(tabId, 'scripts');
+        return next;
+      });
     });
-  }, [handleCloseSidePanel]);
+  }, [handleCloseSidePanel, markSidePanelSubTabOpened, setSidePanelOpenTabs, sidePanelOpenTabsRef]);
 
   // Toggle the whole side panel (new ⌘/Ctrl+\ shortcut). Close if open; if
   // closed, reopen the tab's last sub-panel, defaulting to SFTP (when a host is
@@ -835,11 +1984,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // If the remembered panel is SFTP but no host is resolvable, use scripts.
     const target: SidePanelTab = intent.tab === 'sftp' && !sftpAvailable ? 'scripts' : intent.tab;
     handleSwitchSidePanelTab(target);
-  }, [handleCloseSidePanel, handleSwitchSidePanelTab, resolveSftpHostForTab]);
+  }, [handleCloseSidePanel, handleSwitchSidePanelTab, resolveSftpHostForTab, sidePanelOpenTabsRef]);
 
   // Open theme side panel (called from Terminal toolbar)
   const handleOpenTheme = useCallback(() => {
     handleSwitchSidePanelTab('theme');
+  }, [handleSwitchSidePanelTab]);
+
+  const handleOpenHistory = useCallback(() => {
+    handleSwitchSidePanelTab('history');
   }, [handleSwitchSidePanelTab]);
 
   // Open AI chat side panel (side-panel rail button: a plain switch that is a
@@ -847,6 +2000,158 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const handleOpenAI = useCallback(() => {
     handleSwitchSidePanelTab('ai');
   }, [handleSwitchSidePanelTab]);
+
+  const handleOpenSystem = useCallback(() => {
+    handleSwitchSidePanelTab('system');
+  }, [handleSwitchSidePanelTab]);
+
+  const handleOpenBrowser = useCallback(() => {
+    handleSwitchSidePanelTab('browser');
+  }, [handleSwitchSidePanelTab]);
+
+  useEffect(() => subscribeHostBrowserPanelRequests(({ host, sessionId, url }) => {
+    const session = sessionsRef.current.find((candidate) => sessionId
+      ? candidate.id === sessionId : !candidate.hiddenFromTabs && candidate.hostId === host.id
+        && (!candidate.protocol || ['ssh', 'mosh', 'local'].includes(candidate.protocol)));
+    let tabId: string | null = null;
+    if (session) {
+      tabId = session.workspaceId ?? session.id;
+      if (session.workspaceId) onSetWorkspaceFocusedSessionRef.current?.(session.workspaceId, session.id);
+      activeTabStore.setActiveTabId(tabId);
+    } else {
+      const opened = onConnectToHost(host);
+      if (typeof opened === 'string') tabId = opened;
+    }
+    if (!tabId) return;
+    if (url) {
+      void openHostBrowserPanelUrl(`${tabId}:${session?.id ?? tabId}`, url)
+        .catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)));
+    }
+    setBrowserMountedTabIds((previous) => addMountedSidePanelTabId(previous, tabId));
+    setSidePanelOpenTabs((previous) => new Map(previous).set(tabId, 'browser'));
+  }), [onConnectToHost, setSidePanelOpenTabs]);
+
+  useEffect(() => {
+    setBrowserMountedTabIds((previous) => {
+      const next = previous.filter((tabId) => validAIScopeTargetIds.has(tabId));
+      return next.length === previous.length ? previous : next;
+    });
+  }, [validAIScopeTargetIds]);
+
+  const handleOpenNotes = useCallback(() => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const currentPanel = sidePanelOpenTabsRef.current.get(tabId) ?? null;
+    if (currentPanel && currentPanel !== 'notes') {
+      notesReturnTabRef.current.set(tabId, currentPanel);
+    }
+    handleSwitchSidePanelTab('notes');
+  }, [handleSwitchSidePanelTab, sidePanelOpenTabsRef]);
+
+  const handleBackFromNotes = useCallback(() => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const fallback: SidePanelTab = resolveSftpHostForTab(tabId) ? 'sftp' : 'scripts';
+    const remembered = notesReturnTabRef.current.get(tabId) ?? fallback;
+    const target = remembered === 'notes'
+      ? fallback
+      : (remembered === 'sftp' && !resolveSftpHostForTab(tabId) ? 'scripts' : remembered);
+    handleSwitchSidePanelTab(target);
+  }, [handleSwitchSidePanelTab, resolveSftpHostForTab]);
+
+  const openNotesPanelForSourceNote = useCallback((tabId: string, noteId: string) => {
+    notesOpenRequestIdRef.current += 1;
+    const requestId = notesOpenRequestIdRef.current;
+    setNotesOpenNoteByTab((prev) => {
+      const next = new Map(prev);
+      next.set(tabId, { noteId, requestId });
+      return next;
+    });
+    setNotesMountedTabIds((prev) => addMountedSidePanelTabId(prev, tabId));
+    setSidePanelOpenTabs((prev) => {
+      const next = new Map(prev);
+      next.set(tabId, 'notes');
+      return next;
+    });
+  }, [setSidePanelOpenTabs]);
+
+  const handleOpenHostFromNotes = useCallback((host: Host, source?: { noteId?: string }) => {
+    const sourceNoteId = source?.noteId;
+    const previousTabId = activeTabStore.getActiveTabId();
+    const connectedTabId = onConnectToHost(host);
+    if (!sourceNoteId) return;
+
+    if (typeof connectedTabId === 'string' && connectedTabId) {
+      openNotesPanelForSourceNote(connectedTabId, sourceNoteId);
+      return;
+    }
+
+    const openWhenTabIsReady = (attempt = 0) => {
+      const tabId = activeTabStore.getActiveTabId();
+      if (tabId && tabId !== previousTabId) {
+        openNotesPanelForSourceNote(tabId, sourceNoteId);
+        return;
+      }
+      if (attempt >= 8) {
+        if (tabId) openNotesPanelForSourceNote(tabId, sourceNoteId);
+        return;
+      }
+      window.setTimeout(() => openWhenTabIsReady(attempt + 1), 16);
+    };
+
+    openWhenTabIsReady();
+  }, [onConnectToHost, openNotesPanelForSourceNote]);
+
+  useEffect(() => {
+    if (!openNoteRequest) return;
+    openNotesPanelForSourceNote(openNoteRequest.tabId, openNoteRequest.noteId);
+  }, [openNoteRequest, openNotesPanelForSourceNote]);
+
+  const handleOpenVaultNoteFromAiPanel = useCallback((noteId: string) => {
+    const intent = resolveAiNoteArtifactPanelIntent({
+      activeTabId: activeTabIdRef.current,
+      currentPanel: activeTabIdRef.current
+        ? sidePanelOpenTabsRef.current.get(activeTabIdRef.current) ?? null
+        : null,
+      noteId,
+    });
+
+    if (intent.kind === 'fallback') {
+      onOpenVaultNoteFromChat?.(intent.noteId);
+      return;
+    }
+
+    if (intent.returnPanel) {
+      notesReturnTabRef.current.set(intent.tabId, intent.returnPanel);
+    }
+    openNotesPanelForSourceNote(intent.tabId, intent.noteId);
+  }, [onOpenVaultNoteFromChat, openNotesPanelForSourceNote, sidePanelOpenTabsRef]);
+
+  const handleAddSelectionToAI = useCallback((sourceSessionId: string, selection: string) => {
+    const text = selection.trim();
+    if (!text) return;
+
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+
+    const ws = activeWorkspaceRef.current;
+    if (ws && ws.focusedSessionId !== sourceSessionId) {
+      onSetWorkspaceFocusedSessionRef.current?.(ws.id, sourceSessionId);
+    }
+
+    setPendingTerminalSelectionForAI({
+      requestId: crypto.randomUUID(),
+      tabId,
+      text,
+    });
+    handleSwitchSidePanelTab('ai');
+  }, [handleSwitchSidePanelTab]);
+
+  const handlePendingTerminalSelectionConsumed = useCallback((requestId: string) => {
+    setPendingTerminalSelectionForAI((current) => (
+      current?.requestId === requestId ? null : current
+    ));
+  }, []);
 
   // Toggle the AI chat side panel from the top-bar button: open it (or switch
   // to it from another sub-panel), and close the side panel when AI is already
@@ -866,145 +2171,665 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
 
     handleSwitchSidePanelTab('ai');
-  }, [handleCloseSidePanel, handleSwitchSidePanelTab]);
+  }, [handleCloseSidePanel, handleSwitchSidePanelTab, sidePanelOpenTabsRef]);
 
   // Execute snippet on the focused terminal session
-  const handleSnippetClickForFocusedSession = useCallback((command: string, noAutoRun?: boolean) => {
-    const sessionId = activeWorkspace?.focusedSessionId ?? activeSession?.id;
+  const handleSnippetClickForFocusedSession = useCallback((
+    command: string,
+    noAutoRun?: boolean,
+    options?: { multiLineRunMode?: Snippet["multiLineRunMode"] },
+  ) => {
+    const sessionId = activeWorkspaceRef.current?.focusedSessionId ?? activeSessionRef.current?.id;
     if (!sessionId) return;
     const executor = snippetExecutorsRef.current.get(sessionId);
     if (executor) {
-      executor(command, noAutoRun);
+      executor(command, noAutoRun, options);
       return;
     }
 
+    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
+    if (!session || !canUseDirectSessionWriteFallback(session)) return;
+
     let data = normalizeLineEndings(command);
     if (!noAutoRun) data = `${data}\r`;
-    terminalBackend.writeToSession(sessionId, data);
+    const lineDelayMs = shouldDelayAutoRunSnippetInput(data, {
+      noAutoRun,
+      multiLineRunMode: options?.multiLineRunMode,
+    })
+      ? AUTO_RUN_SNIPPET_LINE_DELAY_MS
+      : undefined;
+    terminalBackend.writeToSession(sessionId, data, {
+      automated: true,
+      sensitive: isTerminalSensitiveInputActive(sessionId),
+      ...(lineDelayMs ? { lineDelayMs } : {}),
+    });
     // Re-focus the terminal so the user can interact immediately
     const pane = document.querySelector(`[data-session-id="${sessionId}"]`);
     const textarea = pane?.querySelector('textarea.xterm-helper-textarea') as HTMLTextAreaElement | null;
     textarea?.focus();
-  }, [activeWorkspace?.focusedSessionId, activeSession?.id, terminalBackend]);
+  }, [terminalBackend]);
+
+  const handleHistoryPaste = useCallback(
+    (command: string) => handleSnippetClickForFocusedSession(command, true),
+    [handleSnippetClickForFocusedSession],
+  );
+  const handleHistoryRun = useCallback(
+    (command: string) => handleSnippetClickForFocusedSession(command, false),
+    [handleSnippetClickForFocusedSession],
+  );
 
   const handleSnippetFromPanel = useCallback(async (snippet: Snippet) => {
+    const sessionId = getActiveTerminalSessionId();
+    if (!sessionId) return;
+    if (isScriptSnippet(snippet)) {
+      try {
+        await runAutomationScript({
+          snippet,
+          sessionId,
+          initiatedBy: 'user',
+          sessionMeta: buildScriptSessionMeta(sessionId, sessionsRef.current, hosts),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        toast.error(message.includes('Observer mode') ? t('scripts.observer.blocked') : message);
+      }
+      return;
+    }
     const command = await resolveSnippetCommand(snippet);
     if (command === null) return;
-    handleSnippetClickForFocusedSession(command, snippet.noAutoRun);
-  }, [handleSnippetClickForFocusedSession]);
-  const {
-    activeTopTabsThemeId,
-    appliedPreviewSessionRef,
-    applyTerminalPreviewVars,
-    applyTopTabsPreviewVars,
-    composeBarThemeColors,
-    focusedFontFamilyId,
-    focusedFontFamilyOverridden,
-    focusedFontSize,
-    focusedFontSizeOverridden,
-    focusedFontWeight,
-    focusedFontWeightOverridden,
-    focusedThemeOverridden,
-    handleFontFamilyChangeForFocusedSession,
-    handleFontFamilyResetForFocusedSession,
-    handleFontSizeChangeForFocusedSession,
-    handleFontSizeResetForFocusedSession,
-    handleFontWeightChangeForFocusedSession,
-    handleFontWeightResetForFocusedSession,
-    handleThemeChangeForFocusedSession,
-    handleThemeResetForFocusedSession,
-    previewedOrVisibleThemeId,
-    previewTargetSessionId,
-    resolvedPreviewTheme,
-    setThemePreview,
-    themeCommitTimerRef,
-    themePreview,
-    visibleFocusedThemeId,
-  } = useTerminalThemePanelState({
-    accentMode,
-    activeSession,
-    activeSidePanelTab,
-    activeWorkspace,
-    customAccent,
-    followAppTerminalTheme,
-    focusedSessionId,
-    fontSize,
-    hostMap,
-    isVisible,
-    onUpdateHost,
-    onUpdateTerminalFontFamilyId,
-    onUpdateTerminalFontSize,
-    onUpdateTerminalFontWeight,
-    onUpdateTerminalThemeId,
-    sessionHostsMap,
-    terminalFontFamilyId,
-    terminalSettings,
-    terminalTheme,
-  });
-  const { aiContextsByTabId, resolveAIExecutorContext } = useTerminalAiContexts({
-    hostsRef,
-    mountedAiTabIds,
-    sessionHostsMap,
-    sessions,
-    sessionsRef,
-    workspaces,
-    workspacesRef,
-  });
+    handleSnippetClickForFocusedSession(command, snippet.noAutoRun, {
+      multiLineRunMode: snippet.multiLineRunMode,
+    });
+  }, [getActiveTerminalSessionId, handleSnippetClickForFocusedSession, hosts, t]);
 
-  const sessionLogConfig = useMemo(
-    () =>
-      sessionLogsEnabled && sessionLogsDir
-        ? { enabled: true as const, directory: sessionLogsDir, format: sessionLogsFormat || 'txt' }
-        : undefined,
-    [sessionLogsDir, sessionLogsEnabled, sessionLogsFormat],
-  );
-  const { renderFocusModeSidebar } = useTerminalFocusSidebar({
-    activeWorkspace,
-    focusedSessionId,
-    isFocusMode,
-    onReorderWorkspaceSessions,
-    onRequestAddToWorkspace,
-    onSetWorkspaceFocusedSession,
-    onToggleWorkspaceViewMode,
-    resolvedPreviewTheme,
-    sessionHostsMap,
-    sessions,
-    t,
-  });
+  const handleRunScriptFromPanel = useCallback(async (snippet: Snippet) => {
+    const sessionId = getActiveTerminalSessionId();
+    if (!sessionId) {
+      toast.error(t('scripts.recording.noSession'));
+      return;
+    }
+    try {
+      await runAutomationScript({
+        snippet,
+        sessionId,
+        initiatedBy: 'user',
+        sessionMeta: buildScriptSessionMeta(sessionId, sessionsRef.current, hosts),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(message.includes('Observer mode') ? t('scripts.observer.blocked') : message);
+    }
+  }, [getActiveTerminalSessionId, hosts, t]);
 
+  const sendCommandSnippetToSession = useCallback(async (
+    sessionId: string,
+    command: string,
+    snippet: Snippet,
+    options?: { focus?: boolean },
+  ): Promise<boolean> => {
+    // Never inject into a peer tab sitting on a password/sensitive prompt.
+    if (isTerminalSensitiveInputActive(sessionId)) return false;
 
-  // Handle compose bar send for workspace mode
-  const handleComposeSend = useCallback((text: string) => {
-    if (!activeWorkspace) return;
+    const executor = snippetExecutorsRef.current.get(sessionId);
+    if (executor) {
+      // Executor may wake a hibernated pane first so bracketed-paste mode and
+      // encoding match the normal single-pane path.
+      const wrote = await executor(command, snippet.noAutoRun, {
+        multiLineRunMode: snippet.multiLineRunMode,
+        broadcast: false,
+        // Multi-tab fan-out must not call term.focus() on every peer.
+        focus: options?.focus !== false,
+      });
+      // Wake can surface a password prompt from buffered output — recheck.
+      if (isTerminalSensitiveInputActive(sessionId)) return false;
+      if (wrote) return true;
+    }
+
+    // Recheck before last-resort backend write as well.
+    if (isTerminalSensitiveInputActive(sessionId)) return false;
+
+    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
+    if (!session || !canUseDirectSessionWriteFallback(session)) return false;
+
+    // Last-resort fallback when the executor could not write (rare). Prefer the
+    // executor path so terminal modes (bracketed paste) stay authoritative.
+    // Do not invent bracketed-paste markers without live term.modes.
+    let data = normalizeLineEndings(command);
+    const lineDelayMs = shouldDelayAutoRunSnippetInput(data, {
+      noAutoRun: snippet.noAutoRun,
+      multiLineRunMode: snippet.multiLineRunMode,
+    })
+      ? AUTO_RUN_SNIPPET_LINE_DELAY_MS
+      : undefined;
+    if (!snippet.noAutoRun) data = `${data}\r`;
+    terminalBackend.writeToSession(sessionId, data, {
+      automated: true,
+      sensitive: false,
+      ...(lineDelayMs ? { lineDelayMs } : {}),
+    });
+    return true;
+  }, [terminalBackend]);
+
+  const handleRunScriptOnWorkspace = useCallback(async (
+    snippet: Snippet,
+    mode: 'sequential' | 'parallel' = 'parallel',
+  ) => {
+    const workspace = activeWorkspaceRef.current;
+    if (!workspace) {
+      // Single terminal tab (no workspace): fall back to focused session.
+      const sessionId = getActiveTerminalSessionId();
+      if (!sessionId) {
+        toast.error(t('scripts.recording.noSession'));
+        return;
+      }
+      if (isTerminalSensitiveInputActive(sessionId)) {
+        toast.info(t('scripts.actions.skippedSensitiveSessions', { count: 1 }));
+        return;
+      }
+      if (!isScriptSnippet(snippet)) {
+        const command = await resolveSnippetCommand(snippet);
+        if (command === null) return;
+        handleSnippetClickForFocusedSession(command, snippet.noAutoRun, {
+          multiLineRunMode: snippet.multiLineRunMode,
+        });
+        return;
+      }
+      try {
+        await runAutomationScript({
+          snippet,
+          sessionId,
+          initiatedBy: 'user',
+          sessionMeta: buildScriptSessionMeta(sessionId, sessionsRef.current, hosts),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        toast.error(message.includes('Observer mode') ? t('scripts.observer.blocked') : message);
+      }
+      return;
+    }
+    const workspaceSessions = sessionsRef.current.filter((session) => session.workspaceId === workspace.id);
+    const sessionIds = workspaceSessions
+      .filter((session) => session.status === 'connected')
+      .map((session) => session.id);
+    const skippedConnecting = workspaceSessions.filter((session) => session.status === 'connecting').length;
+    if (sessionIds.length === 0) {
+      if (skippedConnecting > 0) {
+        toast.info(t('scripts.actions.skippedConnectingSessions', { count: skippedConnecting }));
+      } else {
+        toast.error(t('scripts.recording.noSession'));
+      }
+      return;
+    }
+    if (skippedConnecting > 0) {
+      toast.info(t('scripts.actions.skippedConnectingSessions', { count: skippedConnecting }));
+    }
+
+    // Code snippets: paste/send the resolved command to every connected tab.
+    // Sequential vs parallel only affects automation scripts (which await run
+    // completion); plain snippets are fire-and-forget writes.
+    if (!isScriptSnippet(snippet)) {
+      const command = await resolveSnippetCommand(snippet);
+      if (command === null) return;
+      const focusedBefore = workspace.focusedSessionId
+        ?? getActiveTerminalSessionId()
+        ?? null;
+      let sent = 0;
+      let skippedSensitive = 0;
+      for (const sid of sessionIds) {
+        if (isTerminalSensitiveInputActive(sid)) {
+          skippedSensitive += 1;
+          continue;
+        }
+        // Never steal focus from peer panes during fan-out; restore below.
+        if (await sendCommandSnippetToSession(sid, command, snippet, { focus: false })) sent += 1;
+      }
+      if (skippedSensitive > 0) {
+        toast.info(t('scripts.actions.skippedSensitiveSessions', { count: skippedSensitive }));
+      }
+      if (sent === 0 && skippedSensitive === 0) {
+        toast.error(t('scripts.recording.noSession'));
+      } else if (focusedBefore) {
+        focusTerminalSessionInput(focusedBefore);
+      }
+      return;
+    }
+
+    const runnableSessionIds = sessionIds.filter((sid) => !isTerminalSensitiveInputActive(sid));
+    const skippedSensitive = sessionIds.length - runnableSessionIds.length;
+    if (skippedSensitive > 0) {
+      toast.info(t('scripts.actions.skippedSensitiveSessions', { count: skippedSensitive }));
+    }
+    if (runnableSessionIds.length === 0) {
+      // Connected sessions all sensitive — do not claim "no session".
+      return;
+    }
+
+    try {
+      const runOnSession = (sid: string) => runAutomationScript({
+        snippet,
+        sessionId: sid,
+        initiatedBy: 'user',
+        sessionMeta: buildScriptSessionMeta(sid, sessionsRef.current, hosts),
+      });
+      if (mode === 'sequential') {
+        for (const sid of runnableSessionIds) {
+          const { runId } = await runOnSession(sid);
+          await waitForScriptRun(runId);
+        }
+      } else {
+        await Promise.all(runnableSessionIds.map((sid) => runOnSession(sid)));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(message.includes('Observer mode') ? t('scripts.observer.blocked') : message);
+    }
+  }, [getActiveTerminalSessionId, handleSnippetClickForFocusedSession, hosts, sendCommandSnippetToSession, t]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const snippet = (event as CustomEvent<{ snippet: Snippet }>).detail?.snippet;
+      if (!snippet) return;
+      void handleRunScriptFromPanel(snippet);
+    };
+    window.addEventListener('netcatty:scripts:run-on-focused', handler);
+    return () => window.removeEventListener('netcatty:scripts:run-on-focused', handler);
+  }, [handleRunScriptFromPanel]);
+
+  const handleStartRecordingFromPanel = useCallback(() => {
+    const sessionId = getActiveTerminalSessionId();
+    if (!sessionId) {
+      toast.error(t('scripts.recording.noSession'));
+      return;
+    }
+    const recording = getScriptRecordingSnapshot();
+    if (recording.sessionId === sessionId) {
+      window.dispatchEvent(new CustomEvent('netcatty:script:recording:stop', { detail: { sessionId } }));
+      return;
+    }
+    if (recording.sessionId) {
+      toast.error(t('scripts.recording.alreadyActive'));
+      return;
+    }
+    window.dispatchEvent(new CustomEvent('netcatty:script:recording:start', { detail: { sessionId } }));
+    toast.info(t('scripts.recording.started'));
+  }, [getActiveTerminalSessionId, t]);
+
+  const handleComposeSend = useCallback(async (text: string) => {
+    const activeWorkspace = activeWorkspaceRef.current;
+    if (!activeWorkspace) return false;
+    let recordHistory = false;
+    // Any recipient at a sensitive prompt turns the fan-out into a secret
+    // delivery: the payload is that peer's password/MFA input and must not be
+    // recallable from compose history, even if the focused session itself is
+    // non-sensitive.
+    let anyRecipientSensitive = false;
+    const pendingSends: Promise<boolean>[] = [];
     const payload = text + '\r';
-    const broadcastEnabled = isBroadcastEnabled?.(activeWorkspace.id);
+    // Compose Enter follows the compose-bar target. Toolbar broadcast stays
+    // the keystroke switch and is only the fallback when no compose target
+    // has been published (older callers).
+    const composeSendToAll = isComposeSendToAll
+      ? isComposeSendToAll(activeWorkspace.id) === true
+      : Boolean(isBroadcastEnabled?.(activeWorkspace.id));
+    const focusedSessionId = activeWorkspace.focusedSessionId;
+    const broadcastPasswordBypass = broadcastPasswordBypassRef.current;
+    const focusedSensitive = focusedSessionId
+      ? isTerminalSensitiveInputActive(focusedSessionId)
+      : false;
 
-    if (broadcastEnabled) {
-      // Send to all sessions in the workspace
-      const allSessionIds = sessions
-        .filter(s => s.workspaceId === activeWorkspace.id)
-        .map(s => s.id);
+    if (composeSendToAll && (broadcastPasswordBypass || !focusedSensitive)) {
+      const allSessionIds = sessionsRef.current
+        .filter((session) => session.workspaceId === activeWorkspace.id)
+        .map((session) => session.id);
       for (const sid of allSessionIds) {
-        terminalBackend.writeToSession(sid, payload);
+        const recipientSensitive = isTerminalSensitiveInputActive(sid);
+        if (!broadcastPasswordBypass && recipientSensitive) continue;
+        const executor = snippetExecutorsRef.current.get(sid);
+        if (executor) {
+          pendingSends.push(Promise.resolve(executor(text, false, {
+            broadcast: false,
+            // Preserve both prompt snapshots across an asynchronous wake: the
+            // peer may clear its prompt classification before the actual write.
+            ...(focusedSensitive || recipientSensitive ? { sensitive: true } : {}),
+          })).then(
+            (sent) => {
+              // A lagging peer can reach its password prompt by delivery time;
+              // anything it receives there is its secret input, so mark the
+              // whole fan-out as history-ineligible.
+              if (sent && (recipientSensitive || isTerminalSensitiveInputActive(sid))) anyRecipientSensitive = true;
+              return sent && (broadcastPasswordBypass || !isTerminalSensitiveInputActive(sid));
+            },
+          ));
+        } else {
+          const session = sessionsRef.current.find((candidate) => candidate.id === sid);
+          if (!session || !canUseDirectSessionWriteFallback(session)) continue;
+          // Keep the source-sensitive marker when the #3488 bypass let a
+          // password-prompt payload through, so interceptors stay skipped.
+          // A non-sensitive focused pane can still fan into a sensitive peer
+          // (its password/MFA input): mark the peer's write sensitive too,
+          // like the broadcast dispatcher does for its executor writes.
+          terminalBackend.writeToSession(sid, payload, {
+            sensitive: focusedSensitive || recipientSensitive,
+          });
+          if (recipientSensitive) anyRecipientSensitive = true;
+          recordHistory = recordHistory || session.status === 'connected';
+        }
       }
     } else {
-      // Validate focusedSessionId is a live session, then fallback to first available
-      const workspaceSessions = sessions.filter(s => s.workspaceId === activeWorkspace.id);
-      const validFocusedId = focusedSessionId && workspaceSessions.some(s => s.id === focusedSessionId)
+      const workspaceSessions = sessionsRef.current.filter((session) => session.workspaceId === activeWorkspace.id);
+      const validFocusedId = focusedSessionId && workspaceSessions.some((session) => session.id === focusedSessionId)
         ? focusedSessionId
         : undefined;
       const targetId = validFocusedId ?? workspaceSessions[0]?.id;
       if (targetId) {
-        terminalBackend.writeToSession(targetId, payload);
+        const executor = snippetExecutorsRef.current.get(targetId);
+        if (executor) {
+          const sensitive = isTerminalSensitiveInputActive(targetId);
+          // Explicitly local: an omitted broadcast option falls back to the
+          // toolbar switch, which can still be on while compose is active-only.
+          pendingSends.push(Promise.resolve(executor(text, false, { broadcast: false })).then(
+            (sent) => sent && !sensitive && !isTerminalSensitiveInputActive(targetId),
+          ));
+        } else {
+          const session = sessionsRef.current.find((candidate) => candidate.id === targetId);
+          if (!session || !canUseDirectSessionWriteFallback(session)) return false;
+          recordHistory = session.status === 'connected' && !isTerminalSensitiveInputActive(targetId);
+          terminalBackend.writeToSession(targetId, payload, {
+            sensitive: isTerminalSensitiveInputActive(targetId),
+          });
+        }
       }
     }
-  }, [activeWorkspace, focusedSessionId, sessions, terminalBackend, isBroadcastEnabled]);
+    const results = await Promise.allSettled(pendingSends);
+    const delivered = recordHistory || results.some((result) => result.status === 'fulfilled' && result.value);
+    // A bypassed send typed at a sensitive prompt (#3488), or delivered into
+    // any recipient's sensitive prompt, was delivered but must not be
+    // recallable from compose history via ArrowUp, so report no history
+    // eligibility for it.
+    if (focusedSensitive || anyRecipientSensitive) return false;
+    return delivered;
+  }, [isBroadcastEnabled, isComposeSendToAll, terminalBackend]);
 
-  // Track previous focusedSessionId to detect changes
-  const prevFocusedSessionIdRef = useRef<string | undefined>(undefined);
+  const sessionLogConfig = useMemo(
+    () => ({
+      enabled: Boolean(sessionLogsEnabled && sessionLogsDir),
+      directory: sessionLogsDir,
+      format: sessionLogsFormat || 'txt',
+      timestampsEnabled: sessionLogsTimestampsEnabled,
+    }),
+    [sessionLogsDir, sessionLogsEnabled, sessionLogsFormat, sessionLogsTimestampsEnabled],
+  );
 
-  useTerminalLayerEffects({ activeSidePanelTab, activeTabId, activeTabIdRef, activeTopTabsThemeId, activeWorkspace, activityTrackedSessions, appliedPreviewSessionRef, applyTerminalPreviewVars, applyTopTabsPreviewVars, cancelAnimationFrame, ChunkedEscapeFilter, clearTerminalPreviewVars, clearTimeout, clearTopTabsPreviewVars, document, dropHint, filterTabsMap, focusedSessionId, followAppTerminalTheme, getSessionActivityIdsToClear, handleToggleAiFromTopBar, handleToggleScriptsSidePanel, handleToggleSidePanel, hasNotifiableTerminalOutput, isFocusMode, isTerminalLayerVisible, lastSidePanelTabRef, Map, Math, onSessionData, onSplitSessionRef, onToggleBroadcastRef, onToggleWorkspaceViewModeRef, onUpdateSplitSizes, prevFocusedSessionIdRef, previewTargetSessionId, requestAnimationFrame, ResizeObserver, resizing, sessionActivityStore, sessions, Set, setDropHint, setResizing, setSftpHostForTab, setSftpInitialLocationForTab, setSftpPendingUploadsForTab, setSidePanelOpenTabs, setThemePreview, setTimeout, setupMcpApprovalBridge, setWorkspaceArea, sftpActiveHost, sftpHostForTab, shouldMarkSessionActivity, sidePanelOpenTabs, splitHorizontalHandlersRef, splitVerticalHandlersRef, terminalRendererCwdBySessionRef, themeCommitTimerRef, themePreview, toggleScriptsSidePanelRef, toggleSidePanelRef, validAIScopeTargetIds, validSessionActivityIds, visibleFocusedThemeId, window, workspaceBroadcastHandlersRef, workspaceFocusHandlersRef, workspaceInnerRef, workspaces });
-  return <TerminalLayerView ctx={{ accentMode, activeResizers, activeSidePanelTab, activeTabId, activeWorkspace, AIChatPanelsHost, aiContextsByTabId, AIStateMaintenanceHost, AIStateProvider, Array, Button, cn, composeBarThemeColors, computeSplitHint, customAccent, draggingSessionId, dropHint, editorWordWrap, effectiveHosts, findSplitNode, focusedFontFamilyId, focusedFontFamilyOverridden, focusedFontSize, focusedFontSizeOverridden, focusedFontWeight, focusedFontWeightOverridden, focusedSessionId, focusedThemeOverridden, FolderTree, followAppTerminalTheme, fontSize, getTerminalCwd, handleAddKnownHost, handleBroadcastInput, handleCloseSession, handleCloseSidePanel, handleCommandExecuted, handleComposeSend, handleFontFamilyChangeForFocusedSession, handleFontFamilyResetForFocusedSession, handleFontSizeChangeForFocusedSession, handleFontSizeResetForFocusedSession, handleFontWeightChangeForFocusedSession, handleFontWeightResetForFocusedSession, handleOpenAI, handleOpenScripts, handleOpenSftp, handleOpenTheme, handleOsDetected, handlePendingUploadHandled, handleSessionExit, handleSftpInitialLocationApplied, handleSidePanelResizeStart, handleSnippetClickForFocusedSession, handleSnippetFromPanel, handleSnippetExecutorChange, handleStatusChange, handleTerminalCwdChange, handleTerminalDataCapture, handleTerminalFontSizeChange, handleThemeChangeForFocusedSession, handleThemeResetForFocusedSession, handleToggleSftpFromBar, handleToggleWorkspaceComposeBar, handleUpdateHost, handleWorkspaceDrop, hosts, hotkeyScheme, identities, isBroadcastEnabled, isComposeBarOpen, isFocusMode, isSidePanelOpenForCurrentTab, isTerminalLayerVisible, keyBindings, keys, knownHosts, MessageSquare, mountedAiTabIds, mountedSftpTabIds, onHotkeyAction, onSetWorkspaceFocusedSession, onSplitSession, Palette, PanelLeft, PanelRight, previewedOrVisibleThemeId, refocusActiveTerminalSession, refocusTerminalSession, renderFocusModeSidebar, resizing, resolveAIExecutorContext, resolvedPreviewTheme, ScriptsSidePanel, sessionChainHostsMap, sessionHostsMap, sessionLogConfig, sessions, setDropHint, setEditorWordWrap, setIsComposeBarOpen, setResizing, setSidePanelPosition, sftpActiveHost, sftpAutoSync, sftpDefaultViewMode, sftpDoubleClickBehavior, sftpInitialLocationForTab, sftpPendingUploadsForTab, sftpShowHiddenFiles, SftpSidePanel, sftpUseCompressedUpload, sidePanelPosition, sidePanelWidth, snippetPackages, snippets, splitHorizontalHandlersRef, splitVerticalHandlersRef, sshDebugLogsEnabled, t, TerminalComposeBar, terminalFontFamilyId, TerminalPanesHost, terminalSettings, terminalTheme, themePreview, ThemeSidePanel, Tooltip, TooltipContent, TooltipTrigger, updateHosts, validAIScopeTargetIds, workspaceBroadcastHandlersRef, workspaceById, workspaceFocusHandlersRef, workspaceInnerRef, workspaceOuterRef, workspaceOverlayRef, workspaceRectsById, X, Zap }} />;
+  stableRef.current = {
+    accentMode,
+    activityTrackedSessions,
+    AIChatPanelsHost,
+    AISidePanelStateRoot,
+    AIStateMaintenanceHost,
+    AIStateProvider,
+    Array,
+    Button,
+    ChunkedEscapeFilter,
+    clearHostTreePreviewVars,
+    clearTerminalPreviewVars,
+    clearTopTabsPreviewVars,
+    FolderTree,
+    History,
+    HistorySidePanel,
+    MessageSquare,
+    NotesManager,
+    Palette,
+    PanelLeft,
+    PanelRight,
+    cn,
+    collectSessionIds,
+    customAccent,
+    customGroups,
+    draggingSessionId,
+    editorWordWrap,
+    effectiveHosts,
+    filterTabsMap,
+    followAppTerminalTheme,
+    pickTerminalTheme,
+    clearThemeIntent,
+    settleManualThemeIntent,
+    resolveSessionAppearance,
+    fontSize,
+    getSessionActivityIdsToClear,
+    getTerminalCwd,
+    handleAddKnownHost,
+    handleAddSelectionToAI,
+    handleBroadcastInput,
+    handleBroadcastInterruptPriorityChange,
+    handleCloseSession,
+    handleCloseSidePanel,
+    handleCommandExecuted,
+    handleHistoryDelete: onDeleteShellHistoryEntry,
+    handleHistoryClear: onClearCommandHistory,
+    handleCommandSubmitted,
+    handleComposeSend,
+    handleHistoryPaste,
+    handleHistoryRun,
+    handleOpenHistory,
+    handleOpenSftp,
+    handleOpenScripts,
+    handleOpenTheme,
+    handleOpenAI,
+    handleOpenSystem,
+    handleOpenNotes,
+    handleOpenBrowser,
+    handleFocusSidePanelPane,
+    handleMagnifySidePanelPane,
+    handleRestoreMagnifiedPane,
+    handleMagnifyTerminalPane,
+    handleTerminalPaneInteraction,
+    handleSplitSidePanelPane,
+    handleCloseSidePanelPane,
+    handleResizeSidePanelSplit,
+    handleBackFromNotes,
+    handleOpenHostFromNotes,
+    handleOsDetected,
+    handlePendingTerminalSelectionConsumed,
+    handlePendingUploadHandled,
+    handleSessionExit,
+    handleSftpCurrentPathChange,
+    handleSftpActiveTransfersChange,
+    handleSftpActiveExternalEditsChange,
+    handleSftpInitialLocationApplied,
+    persistSidePanelWidth,
+    persistSidePanelHeight,
+    handleSnippetClickForFocusedSession,
+    handleSnippetFromPanel,
+    handleRunScriptFromPanel,
+    handleRunScriptOnWorkspace,
+    handleStartRecordingFromPanel,
+    // scriptRuns live in scriptRunsStore; Scripts side panel subscribes directly.
+    handleStopScriptRun: stopScriptRun,
+    handlePauseScriptRun: pauseScriptRun,
+    handleResumeScriptRun: resumeScriptRun,
+    handleSnippetExecutorChange,
+    handleProgrammaticCommandLogRewriteChange,
+    handleStatusChange,
+    handleTerminalCwdChange,
+    handleTerminalTitleChange,
+    handleTerminalBell,
+    handleTerminalOutput,
+    handleTerminalDataCapture,
+    handleTerminalFontSizeChange,
+    handleToggleAiFromTopBar,
+    handleToggleScriptsSidePanel,
+    handleToggleSidePanel,
+    handleToggleSftpFromBar,
+    handleToggleWorkspaceComposeBar,
+    handleUpdateHost,
+    hasNotifiableTerminalOutput,
+    hostMap,
+    hosts,
+    hostsRef,
+    portForwardingRules,
+    portForwardingRulesRef,
+    hotkeyScheme,
+    disableTerminalFontZoom,
+    restoreTerminalCwd,
+    identities,
+    isBroadcastEnabled,
+    isComposeSendToAll,
+    onToggleComposeSendTarget,
+    isGlobalBroadcastEnabled,
+    isGlobalComposeSendToAll,
+    onToggleGlobalComposeSendTarget,
+    canUseGlobalBroadcast,
+    isComposeBarOpen,
+    keyBindings,
+    keys,
+    knownHosts,
+    lastSidePanelTabRef,
+    mountedAiTabIds: aiMountedTabIds,
+    mountedSftpTabIds,
+    magnifiedPane,
+    notesMountedTabIds,
+    browserMountedTabIds,
+    notesOpenNoteByTab,
+    scriptsMountedTabIds,
+    systemMountedTabIds,
+    themeMountedTabIds,
+    onAddSessionToWorkspace,
+    onConnectToHost,
+    onCreateLocalTerminal,
+    onCreateWorkspaceFromSessions,
+    onHotkeyAction,
+    onReorderWorkspaceSessions,
+    onReorderTabs,
+    onCopySession,
+    onDuplicateSession,
+    onCopySessionToNewWindow,
+    onRequestAddToWorkspace,
+    onAppendHostToWorkspace,
+    onSessionData,
+    onSetDraggingSessionId,
+    onSetWorkspaceFocusedSession,
+    onStartSessionRename,
+    onSubmitSessionRename,
+    onRemoveSessionFromWorkspace,
+    onStartSessionDrag: onSetDraggingSessionId,
+    onEndSessionDrag: handleEndSessionDrag,
+    onSplitSession,
+    onSplitSessionRef,
+    onToggleBroadcastRef,
+    onToggleGlobalBroadcastRef,
+    onToggleWorkspaceViewMode,
+    onToggleWorkspaceViewModeRef,
+    onUpdateHost,
+    onUpdateSplitSizes,
+    onUpdateTerminalFontFamilyId,
+    onUpdateTerminalFontSize,
+    onUpdateTerminalFontWeight,
+    onUpdateSessionFontSize,
+    onUpdateSessionRestoreCwd,
+    onUpdateSessionDynamicTitle,
+    onUpdateSessionCodingCliProvider,
+    onClearSessionFontSizeOverride,
+    onUpdateTerminalThemeId,
+    pendingTerminalSelectionForAI,
+    refocusActiveTerminalSession,
+    refocusTerminalSession,
+    resolveSftpHostForTab,
+    ScriptsSidePanel,
+    sessionActivityStore,
+    sessionChainHostsMap,
+    sessionHostsMap,
+    resolvedSessionHostIds,
+    sessionLogConfig,
+    sessionSudoAutofillPasswordsMap,
+    sessionSudoAutofillCandidatesMap,
+    sessions,
+    sessionsRef,
+    setEditorWordWrap,
+    setIsComposeBarOpen,
+    setPendingTerminalSelectionForAI,
+    setAiMountedTabIds,
+    setNotesMountedTabIds,
+    setNotesOpenNoteByTab,
+    setScriptsMountedTabIds,
+    setSystemMountedTabIds,
+    setThemeMountedTabIds,
+    setSidePanelOpenTabs,
+    setSidePanelLayouts,
+    setSidePanelWidth,
+    setSidePanelHeight,
+    setSftpFollowTerminalCwd,
+    setSftpHostForTab,
+    setSftpHostSourceSessionForTab,
+    setSftpInitialLocationForTab,
+    onSaveWorkspaceLayoutAsDefault: handleSaveWorkspaceLayoutAsDefault,
+    setSftpPendingUploadsForTab,
+    showHostTreeSidebar,
+    sidePanelOpenTabs,
+    sidePanelLayouts,
+    sidePanelPosition,
+    sidePanelWidth,
+    sidePanelHeight,
+    sftpAutoSync,
+    sftpDefaultViewMode,
+    sftpDoubleClickBehavior,
+    sftpFollowTerminalCwd,
+    sftpHostForTab,
+    sftpHostSourceSessionForTab,
+    sftpAuthHostBySessionId,
+    sftpInitialLocationForTab,
+    sftpPendingUploadsForTab,
+    sftpPaneClosedTabIdsRef,
+    sftpRetainedAfterCloseTabIdsRef,
+    sftpShowHiddenFiles,
+    SftpSidePanel,
+    sftpUseCompressedUpload,
+    shouldMarkSessionActivity,
+    snippetExecutorsRef,
+    programmaticCommandLogRewriteHandlersRef,
+    snippetPackages,
+    snippets,
+    onOpenVaultHostFromChat,
+    onOpenVaultNoteFromChat: handleOpenVaultNoteFromAiPanel,
+    onOpenVaultSectionFromChat,
+    onOpenVaultSnippetFromChat,
+    splitHorizontalHandlersRef,
+    splitVerticalHandlersRef,
+    sshDebugLogsEnabled,
+    t,
+    TerminalComposeBar,
+    TerminalPanesHost,
+    terminalFontFamilyId,
+    terminalRendererCwdBySessionRef,
+    terminalRendererCwdSourceBySessionRef,
+    terminalSettings,
+    terminalTheme,
+    terminalThemeId,
+    ThemeSidePanel,
+    toggleScriptsSidePanelRef,
+    toggleSidePanelRef,
+    Tooltip,
+    TooltipContent,
+    TooltipTrigger,
+    updateHosts,
+    updateSnippetPackages,
+    updateSnippets,
+    X,
+    Zap,
+    validAIScopeTargetIds,
+    validSessionActivityIds,
+    workspaceBroadcastHandlersRef,
+    workspaceById,
+    workspaceFocusHandlersRef,
+    workspaces,
+    workspacesRef,
+    activeTabIdRef,
+    activeWorkspaceRef,
+    activeSessionRef,
+    focusedSessionIdRef,
+    setSidePanelPosition,
+  };
+
+  return <TerminalLayerTabBridge stableRef={stableRef} />;
 };
 
 export const TerminalLayer = memo(TerminalLayerInner, terminalLayerAreEqual);

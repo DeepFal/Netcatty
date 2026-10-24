@@ -10,6 +10,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 export interface TerminalSearchBarProps {
     isOpen: boolean;
+    /**
+     * Incremented each time the search hotkey fires while the bar is already
+     * open. Watched by the focus effect so Cmd/Ctrl+F re-grabs focus when it
+     * has moved elsewhere (issue #1789). Ignored while `isOpen` is false.
+     */
+    focusToken?: number;
     onClose: () => void;
     onSearch: (term: string) => boolean;
     onFindNext: () => boolean;
@@ -17,8 +23,19 @@ export interface TerminalSearchBarProps {
     matchCount?: { current: number; total: number } | null;
 }
 
+export const notifyTerminalSearchTermChange = (
+    searchTerm: string,
+    previousSearchTerm: string,
+    onSearch: (term: string) => boolean,
+): string => {
+    if (searchTerm === previousSearchTerm) return previousSearchTerm;
+    onSearch(searchTerm);
+    return searchTerm;
+};
+
 export const TerminalSearchBar: React.FC<TerminalSearchBarProps> = ({
     isOpen,
+    focusToken,
     onClose,
     onSearch,
     onFindNext,
@@ -30,22 +47,24 @@ export const TerminalSearchBar: React.FC<TerminalSearchBarProps> = ({
     const inputRef = useRef<HTMLInputElement>(null);
     const prevSearchTermRef = useRef('');
 
-    // Focus input when opened
+    // Focus input when opened, or when the search hotkey re-fires while open
+    // (focusToken bumps) so focus returns to the input after it moved elsewhere.
     useEffect(() => {
         if (isOpen && inputRef.current) {
             inputRef.current.focus();
             inputRef.current.select();
         }
-    }, [isOpen]);
+    }, [isOpen, focusToken]);
 
-    // Trigger search when term changes
+    // Trigger search when term changes. When the term is cleared we still call
+    // onSearch('') so the underlying search addon clears its highlights;
+    // otherwise the last match decorations linger after emptying the input.
     useEffect(() => {
-        if (searchTerm !== prevSearchTermRef.current) {
-            prevSearchTermRef.current = searchTerm;
-            if (searchTerm.length > 0) {
-                onSearch(searchTerm);
-            }
-        }
+        prevSearchTermRef.current = notifyTerminalSearchTermChange(
+            searchTerm,
+            prevSearchTermRef.current,
+            onSearch,
+        );
     }, [searchTerm, onSearch]);
 
     const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -95,6 +114,7 @@ export const TerminalSearchBar: React.FC<TerminalSearchBarProps> = ({
                     onKeyDown={handleKeyDown}
                     onClick={(e) => e.stopPropagation()}
                     onMouseDown={(e) => e.stopPropagation()}
+                    data-terminal-search-input=""
                     placeholder={t("terminal.search.placeholder")}
                     className="w-full h-6 pl-7 pr-2 text-[11px] border-none rounded placeholder:opacity-40 focus:outline-none"
                     style={{

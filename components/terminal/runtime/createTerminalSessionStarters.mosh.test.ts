@@ -6,7 +6,103 @@ import {
 } from "./createTerminalSessionStarters";
 
 const noop = () => undefined;
-const ENCRYPTED_CREDENTIAL_PLACEHOLDER = "enc:v1:djEwAAAA";
+const ENCRYPTED_CREDENTIAL_PLACEHOLDER = "enc:v1:djEwdGVzdAAAAAAAAAAAAAAAAA==";
+
+const armSudoPrompt = (
+  autofill: { armForCommand: (command: string) => void } | null,
+): string => {
+  autofill?.armForCommand("sudo whoami");
+  return "[sudo] password for alice: ";
+};
+
+test("startMosh enables sudo autofill with the host saved password", async () => {
+  let detected = "";
+  let probes = 0;
+  let ready: (() => void) | undefined;
+  let resolveDetected!: () => void;
+  const detectionDone = new Promise<void>((resolve) => { resolveDetected = resolve; });
+  let onData: ((data: string) => void) | null = null;
+  const sent: string[] = [];
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => "mosh-session",
+    onMoshSessionReady: (_id: string, callback: () => void) => { ready = callback; return noop; },
+    getSessionDistroInfo: async () => { probes++; return { success: true, stdout: "ID=ubuntu" }; },
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: (_id: string, cb: (data: string) => void) => {
+      onData = cb;
+      return noop;
+    },
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: (_id: string, data: string) => sent.push(data),
+    resizeSession: noop,
+  };
+  const sudoAutofillRef = { current: null };
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Target",
+      hostname: "target.example.test",
+      username: "alice",
+      password: "saved-secret",
+    },
+    onOsDetected: (_id: string, distro: string) => { detected = distro; resolveDetected(); },
+    keys: [],
+    identities: [],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    terminalSettings: {},
+    terminalBackend,
+    sudoAutofillPassword: "saved-secret",
+    onSudoHint: () => true,
+    sessionRef: { current: null },
+    hasConnectedRef: { current: true },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null },
+    disposeExitRef: { current: null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    sudoAutofillRef,
+    updateStatus: noop,
+    setStatus: noop,
+    setError: noop,
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+  assert.equal(probes, 0, "wait for the Mosh handshake before probing");
+  ready?.();
+  await detectionDone;
+  assert.equal(detected, "ubuntu");
+  assert.equal(probes, 1);
+  onData?.(armSudoPrompt(sudoAutofillRef.current));
+  sudoAutofillRef.current?.confirmFill();
+
+  assert.deepEqual(sent, ["saved-secret\n"]);
+});
 
 test("startSSH accepts jump host local identity file paths with unreadable saved passwords", async () => {
   let capturedOptions: Record<string, unknown> | null = null;
@@ -535,7 +631,7 @@ test("startMosh asks for credential re-entry when saved key material cannot be d
     keys: [{
       id: "key-1",
       label: "Deploy key",
-      privateKey: "enc:v1:djEwAAAA",
+      privateKey: "enc:v1:djEwdGVzdAAAAAAAAAAAAAAAAA==",
     }],
     resolvedChainHosts: [],
     sessionId: "session-1",
@@ -616,7 +712,7 @@ test("startMosh does not use stale local key paths when selected key material is
     keys: [{
       id: "key-1",
       label: "Deploy key",
-      privateKey: "enc:v1:djEwAAAA",
+      privateKey: "enc:v1:djEwdGVzdAAAAAAAAAAAAAAAAA==",
     }],
     resolvedChainHosts: [],
     sessionId: "session-1",
@@ -688,6 +784,7 @@ test("startMosh omits identity file paths when password auth is explicit", async
       hostname: "example.test",
       username: "alice",
       authMethod: "password",
+      requiresMfa: true,
       password: "saved-secret",
       identityFilePaths: ["/should/not/be/used"],
       port: 2200,
@@ -728,6 +825,7 @@ test("startMosh omits identity file paths when password auth is explicit", async
 
   assert.ok(capturedOptions);
   assert.equal(capturedOptions.password, "saved-secret");
+  assert.equal(capturedOptions.requiresMfa, true);
   assert.equal(capturedOptions.identityFilePaths, undefined);
 });
 
@@ -803,6 +901,261 @@ test("startMosh rejects missing saved proxy profiles", async () => {
 
   assert.equal(started, false);
   assert.match(error, /Saved proxy/);
+});
+
+test("startMosh rejects missing proxy identities before the unsupported proxy guard", async () => {
+  let started = false;
+  let error = "";
+
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => {
+      started = true;
+      return "mosh-session";
+    },
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Example",
+      hostname: "example.test",
+      username: "alice",
+      port: 2200,
+      proxyConfig: {
+        type: "http",
+        host: "proxy.example.com",
+        port: 3128,
+        identityId: "missing-identity",
+      },
+    },
+    keys: [],
+    identities: [],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    terminalSettings: {},
+    terminalBackend,
+    sessionRef: { current: null },
+    hasConnectedRef: { current: false },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null },
+    disposeExitRef: { current: null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    updateStatus: noop,
+    setStatus: noop,
+    setError: (message: string) => { error = message; },
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+
+  assert.equal(started, false);
+  assert.match(error, /Proxy identity/);
+  assert.match(error, /missing/);
+});
+
+test("startMosh rejects incomplete proxy identities before the unsupported proxy guard", async () => {
+  let started = false;
+  let error = "";
+
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => {
+      started = true;
+      return "mosh-session";
+    },
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Example",
+      hostname: "example.test",
+      username: "alice",
+      port: 2200,
+      proxyConfig: {
+        type: "http",
+        host: "proxy.example.com",
+        port: 3128,
+        identityId: "identity-1",
+      },
+    },
+    keys: [],
+    identities: [{
+      id: "identity-1",
+      label: "Proxy login",
+      username: "proxy-user",
+      authMethod: "password",
+      created: 1,
+    }],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    terminalSettings: {},
+    terminalBackend,
+    sessionRef: { current: null },
+    hasConnectedRef: { current: false },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null },
+    disposeExitRef: { current: null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    updateStatus: noop,
+    setStatus: noop,
+    setError: (message: string) => { error = message; },
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+
+  assert.equal(started, false);
+  assert.match(error, /Proxy identity/);
+  assert.match(error, /incomplete/);
+});
+
+test("startMosh does not connect when a proxy identity password is encrypted", async () => {
+  let started = false;
+  let error = "";
+
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => {
+      started = true;
+      return "mosh-session";
+    },
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Example",
+      hostname: "example.test",
+      username: "alice",
+      port: 2200,
+      proxyConfig: {
+        type: "http",
+        host: "proxy.example.com",
+        port: 3128,
+        identityId: "identity-1",
+      },
+    },
+    keys: [],
+    identities: [{
+      id: "identity-1",
+      label: "Proxy login",
+      username: "proxy-user",
+      authMethod: "password",
+      password: ENCRYPTED_CREDENTIAL_PLACEHOLDER,
+      created: 1,
+    }],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    terminalSettings: {},
+    terminalBackend,
+    sessionRef: { current: null },
+    hasConnectedRef: { current: false },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null },
+    disposeExitRef: { current: null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    updateStatus: noop,
+    setStatus: noop,
+    setError: (message: string) => { error = message; },
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+
+  assert.equal(started, false);
+  assert.match(error, /Mosh does not support proxy/);
 });
 
 test("startMosh rejects configured proxies instead of connecting directly", async () => {
@@ -954,3 +1307,255 @@ test("startMosh rejects jump host chains instead of connecting directly", async 
   assert.match(error, /Mosh does not support jump host chains/);
 });
 
+test("startMosh defers startup commands until mosh-client is ready", async () => {
+  const sent: string[] = [];
+  let readyCb: ((evt: { sessionId: string }) => void) | null = null;
+  let readyDisposed = false;
+  let dataCb: ((data: string, meta?: { moshHandshake?: boolean }) => void) | null = null;
+
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => "mosh-session",
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: (_id: string, cb: (data: string, meta?: { moshHandshake?: boolean }) => void) => {
+      dataCb = cb;
+      return noop;
+    },
+    onSessionExit: () => noop,
+    onMoshSessionReady: (_id: string, cb: (evt: { sessionId: string }) => void) => {
+      readyCb = cb;
+      return () => {
+        readyDisposed = true;
+      };
+    },
+    onChainProgress: () => noop,
+    writeToSession: (_id: string, data: string) => sent.push(data),
+    resizeSession: noop,
+  };
+
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Example",
+      hostname: "example.test",
+      username: "alice",
+    },
+    keys: [],
+    identities: [],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    startupCommand: "echo from-snippet",
+    terminalSettings: { startupCommandDelayMs: 0 },
+    terminalBackend,
+    sessionRef: { current: null as string | null },
+    hasConnectedRef: { current: false },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null as (() => void) | null },
+    disposeExitRef: { current: null as (() => void) | null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    updateStatus: (status: string) => {
+      if (status === "connected") ctx.hasConnectedRef.current = true;
+    },
+    setStatus: noop,
+    setError: noop,
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+    modes: {},
+    options: {},
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+
+  // Ordinary handshake output must not dismiss the connection overlay before
+  // the interactive Mosh client is ready.
+  dataCb?.("ssh login banner\r\n", { moshHandshake: true });
+  assert.equal(ctx.hasConnectedRef.current, false);
+  assert.deepEqual(sent, []);
+  assert.ok(readyCb, "expected onMoshSessionReady subscription");
+
+  // Hibernate detaches exit listeners without closing the session — ready work
+  // must survive that dispose so startup can still run after wake.
+  ctx.disposeExitRef.current?.();
+  assert.equal(readyDisposed, false);
+
+  readyCb?.({ sessionId: "mosh-session" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(ctx.hasConnectedRef.current, true);
+  assert.ok(sent.some((chunk) => chunk.includes("echo from-snippet")));
+});
+
+test("startMosh disposes ready subscription when startMoshSession rejects", async () => {
+  let readyDisposed = false;
+
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => {
+      throw new Error("mosh-client missing");
+    },
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onMoshSessionReady: () => () => {
+      readyDisposed = true;
+    },
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Example",
+      hostname: "example.test",
+      username: "alice",
+    },
+    keys: [],
+    identities: [],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    startupCommand: "echo startup",
+    terminalSettings: {},
+    terminalBackend,
+    sessionRef: { current: null as string | null },
+    hasConnectedRef: { current: false },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null as (() => void) | null },
+    disposeExitRef: { current: null as (() => void) | null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    updateStatus: noop,
+    setStatus: noop,
+    setError: noop,
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+  assert.equal(readyDisposed, true);
+});
+
+test("startMosh still runs startup when ready fires during startMoshSession await", async () => {
+  const sent: string[] = [];
+  let readyCb: ((evt: { sessionId: string }) => void) | null = null;
+
+  const terminalBackend = {
+    backendAvailable: () => true,
+    telnetAvailable: () => true,
+    moshAvailable: () => true,
+    localAvailable: () => true,
+    serialAvailable: () => true,
+    execAvailable: () => true,
+    startSSHSession: async () => "ssh-session",
+    startTelnetSession: async () => "telnet-session",
+    startMoshSession: async () => {
+      // Simulate a fast handshake that emits ready before the await resumes.
+      readyCb?.({ sessionId: "session-1" });
+      return "session-1";
+    },
+    startLocalSession: async () => "local-session",
+    startSerialSession: async () => "serial-session",
+    execCommand: async () => ({}),
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onMoshSessionReady: (_id: string, cb: (evt: { sessionId: string }) => void) => {
+      readyCb = cb;
+      return noop;
+    },
+    onChainProgress: () => noop,
+    writeToSession: (_id: string, data: string) => sent.push(data),
+    resizeSession: noop,
+  };
+
+  const ctx = {
+    host: {
+      id: "host-1",
+      label: "Example",
+      hostname: "example.test",
+      username: "alice",
+    },
+    keys: [],
+    identities: [],
+    resolvedChainHosts: [],
+    sessionId: "session-1",
+    startupCommand: "echo startup",
+    terminalSettings: { startupCommandDelayMs: 0 },
+    terminalBackend,
+    sessionRef: { current: null as string | null },
+    hasConnectedRef: { current: false },
+    hasRunStartupCommandRef: { current: false },
+    disposeDataRef: { current: null as (() => void) | null },
+    disposeExitRef: { current: null as (() => void) | null },
+    fitAddonRef: { current: null },
+    serializeAddonRef: { current: null },
+    pendingAuthRef: { current: null },
+    updateStatus: noop,
+    setStatus: noop,
+    setError: noop,
+    setNeedsAuth: noop,
+    setAuthRetryMessage: noop,
+    setAuthPassword: noop,
+    setProgressLogs: noop,
+    setProgressValue: noop,
+    setChainProgress: noop,
+  };
+
+  const term = {
+    cols: 120,
+    rows: 32,
+    write: noop,
+    writeln: noop,
+    scrollToBottom: noop,
+    modes: {},
+    options: {},
+  };
+
+  await createTerminalSessionStarters(ctx as never).startMosh(term as never);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(sent.some((chunk) => chunk.includes("echo startup")));
+});

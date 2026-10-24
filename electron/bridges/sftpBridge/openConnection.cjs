@@ -1,21 +1,207 @@
 /* eslint-disable no-undef */
+const { resolveSshConnectionTimeouts } = require("../sshBridge/startSession.cjs");
+const { runWhenProxyConnectionReady } = require("../proxyUtils.cjs");
+const { normalizeFileProtocol } = require("./scpShell.cjs");
+const { getScpBackendForClient } = require("./scpBackend.cjs");
+const {
+  executeBoundedSshCommand,
+  openBoundedSshExecStreamCallback,
+  terminateSshExecStream,
+} = require("../boundedSshExec.cjs");
+const { openBoundedSftpChannel } = require("../boundedSftpOpen.cjs");
+const { enableSshNoDelay } = require("../tcpNoDelay.cjs");
+const { openBoundedForwardOutCallback } = require("../boundedSshChannelOpen.cjs");
+const { remoteSoftwareRequiresSingleChannel } = require("../../../domain/singleChannelSshBanner.shared.cjs");
+
+/** Bound shell/scp probes so a hung remote exec cannot leave the panel connecting forever. */
+const SCP_PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * AbortSignal that fires on parent abort or after timeoutMs.
+ * Caller must dispose() to clear the timer.
+ */
+function createBoundedProbeSignal(parentSignal = null, timeoutMs = SCP_PROBE_TIMEOUT_MS) {
+  const ac = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  const onParentAbort = () => {
+    try { ac.abort(); } catch { /* ignore */ }
+  };
+  if (parentSignal?.aborted) {
+    ac.abort();
+  } else {
+    if (parentSignal && typeof parentSignal.addEventListener === "function") {
+      parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    }
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { ac.abort(); } catch { /* ignore */ }
+    }, Math.max(1, Number(timeoutMs) || SCP_PROBE_TIMEOUT_MS));
+    if (typeof timer.unref === "function") timer.unref();
+  }
+  return {
+    signal: ac.signal,
+    get timedOut() {
+      return timedOut;
+    },
+    dispose: () => {
+      if (timer) clearTimeout(timer);
+      if (parentSignal && typeof parentSignal.removeEventListener === "function") {
+        try { parentSignal.removeEventListener("abort", onParentAbort); } catch { /* ignore */ }
+      }
+    },
+  };
+}
+
+/** Return true when ssh2 reports an authentication-stage failure. */
+function isSftpAuthError(err) {
+  const level = String(err?.level || "").toLowerCase();
+  const message = String(err?.message || "").toLowerCase();
+  return level.includes("authentication") || message.includes("authentication");
+}
+
+/** Decide whether the SFTP target should retry with keyboard-interactive before password. */
+function shouldRetrySftpKeyboardInteractiveFirst(options, authConfig, err) {
+  return Boolean(
+    options?.password &&
+    !options?._skipPasswordMethod &&
+    isSftpAuthError(err) &&
+    authConfig?.authPhase?.retryKeyboardInteractiveFirst,
+  );
+}
+
+function allowsSharedSftpTransport(options) {
+  return options?.reuseTransport !== false && !options?.sudo && options?.singleChannelSsh !== true;
+}
+
+function shouldRegisterFreshSftpTransport(options) {
+  return allowsSharedSftpTransport(options);
+}
+
+function sftpChannelIsLive(sftp) {
+  // A closed ssh2 SFTP stream still has readdir/stat/open. readable/destroyed
+  // are what change when the subsystem or the socket has already ended.
+  return !!sftp
+    && sftp.readable !== false
+    && sftp.destroyed !== true
+    && typeof sftp.readdir === "function"
+    && typeof sftp.stat === "function"
+    && typeof sftp.open === "function";
+}
+
+/** Sudo is part of the requested connection contract; never downgrade it. */
+async function openRequiredSudoSftp({
+  connectSudoSftp,
+  sshClient,
+  password,
+  closeFreshClient,
+}) {
+  try {
+    return await connectSudoSftp(sshClient, password);
+  } catch (error) {
+    closeFreshClient();
+    throw error;
+  }
+}
+
 function createOpenConnectionApi(ctx) {
   with (ctx) {
-    async function connectThroughChainForSftp(event, options, jumpHosts, targetHost, targetPort, connId, agentSocket) {
+    /**
+     * Mark a session client as SCP-mode and optionally probe shell access.
+     */
+    async function activateScpMode(client, { probe = true, signal = null, timeoutMs = SCP_PROBE_TIMEOUT_MS } = {}) {
+      client.__netcattyFileProtocol = "scp";
+      client.sftp = null;
+      // Ensure closeSftp can tear down owned SSH sockets even when sftp is null.
+      // Never end a shared terminal session socket.
+      if (typeof client.end === "function" && !client.__netcattyScpEndWrapped) {
+        const prevEnd = client.end.bind(client);
+        client.end = async (...args) => {
+          const ownsSocket = !client.__netcattySessionBacked
+            && !client.__netcattySourceSessionId
+            && !client.__netcattyTransportManaged;
+          if (ownsSocket) {
+            try { client.client?.end?.(); } catch { /* ignore */ }
+            try { client.client?.destroy?.(); } catch { /* ignore */ }
+          }
+          return prevEnd(...args);
+        };
+        client.__netcattyScpEndWrapped = true;
+      }
+      if (probe) {
+        const bounded = createBoundedProbeSignal(signal, timeoutMs);
+        try {
+          const backend = getScpBackendForClient(client);
+          // Require a working shell AND scp binary — transfers need `scp -t/-f`.
+          await backend.homeDir({ signal: bounded.signal }).catch(async () => {
+            if (bounded.signal.aborted) throw new Error("SCP mode shell probe aborted");
+            const adapters = require("./scpBackend.cjs").createSshExecAdapters(client.client);
+            const pwd = await adapters.exec("pwd", { signal: bounded.signal });
+            if (pwd.code !== 0 || !(pwd.stdout || "").trim()) {
+              throw new Error("SCP mode shell probe failed");
+            }
+          });
+          const adapters = require("./scpBackend.cjs").createSshExecAdapters(client.client);
+          const scpProbe = await adapters.exec(
+            "command -v scp >/dev/null 2>&1 || which scp >/dev/null 2>&1",
+            { signal: bounded.signal },
+          );
+          if (scpProbe.code !== 0) {
+            throw new Error("SCP binary not available on remote host (command -v scp failed)");
+          }
+        } catch (err) {
+          if (bounded.timedOut && !signal?.aborted) {
+            throw new Error(`SCP mode probe timed out after ${timeoutMs}ms`);
+          }
+          throw err;
+        } finally {
+          bounded.dispose();
+        }
+      }
+      return client;
+    }
+
+    const hasUsableProxy = (proxy) => {
+      if (!proxy) return false;
+      if (proxy.type === "command") return !!proxy.command?.trim();
+      return !!(proxy.host && proxy.port);
+    };
+
+    async function connectThroughChainForSftp(event, options, jumpHosts, targetHost, targetPort, connId) {
       const sender = event.sender;
       const connections = [];
       let currentSocket = null;
       let activeConn = null;
+      const signal = options.abortSignal;
+      let rejectPending = null;
     
       const cleanupSocket = (socket) => {
         if (!socket) return;
         try { socket.end?.(); } catch { /* ignore */ }
         try { socket.destroy?.(); } catch { /* ignore */ }
       };
+      const onAbort = () => {
+        cleanupSocket(currentSocket);
+        for (const conn of new Set([...connections, activeConn])) {
+          if (!conn) continue;
+          try { conn.end?.(); } catch { /* ignore */ }
+          try { conn.destroy?.(); } catch { /* ignore */ }
+        }
+        rejectPending?.(new DOMException("SFTP jump connection cancelled", "AbortError"));
+      };
+      const checkCancelled = () => {
+        if (!signal?.aborted) return;
+        onAbort();
+        throw new DOMException("SFTP jump connection cancelled", "AbortError");
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
     
       try {
+        checkCancelled();
+        const defaultAgentSocket = await getAvailableAgentSocket();
         // Connect through each jump host
         for (let i = 0; i < jumpHosts.length; i++) {
+          checkCancelled();
           const jump = jumpHosts[i];
           const isFirst = i === 0;
           const isLast = i === jumpHosts.length - 1;
@@ -49,12 +235,14 @@ function createOpenConnectionApi(ctx) {
           const hopCountMaxEffective = hopInterval == null
             ? 3
             : (hopInterval > 0 ? (hopCountMax ?? 3) : 0);
+          const hopConnectionTimeouts = resolveSshConnectionTimeouts(jump);
           // Build connection options
           const connOpts = {
             host: jump.hostname,
             port: jump.port || 22,
             username: jump.username || 'root',
-            readyTimeout: 120000, // 2 minutes to allow for keyboard-interactive (2FA/MFA)
+            timeout: hopConnectionTimeouts.tcpConnectTimeoutMs,
+            readyTimeout: 0,
             keepaliveInterval: hopIntervalMs,
             keepaliveCountMax: hopCountMaxEffective,
             // Enable keyboard-interactive authentication (required for 2FA/MFA)
@@ -75,17 +263,42 @@ function createOpenConnectionApi(ctx) {
               },
             ),
           };
+          connOpts.hostVerifier = hostKeyVerifier.createHostVerifier({
+            sender,
+            sessionId: connId,
+            hostname: jump.hostname,
+            port: jump.port || 22,
+            knownHosts: options.knownHosts,
+            verifyHostKeys: jump.verifyHostKeys ?? options.verifyHostKeys,
+            unattended: options.hostKeyUnattended === true,
+            onAccepted: (info) => {
+              if (!info) return;
+              if (!Array.isArray(options._acceptedHostKeys)) options._acceptedHostKeys = [];
+              options._acceptedHostKeys.push(info);
+            },
+          });
     
           // Auth - support agent (certificate), key, and password fallback
           const hasCertificate =
             typeof jump.certificate === "string" && jump.certificate.trim().length > 0;
+
+          const { enhanceAuthOptionsForFido, looksLikeSkOpenSshMaterial } = require("../sshAuthHelper.cjs");
+          const prep = await enhanceAuthOptionsForFido(jump, sender);
+          const isFido = prep.useFidoAgent === true;
+          const systemAuthAgent = (hasCertificate && !isFido)
+            ? null
+            : await prepareSystemSshAgentForAuth(
+              prep,
+              `[SFTP Chain] Hop ${i + 1}:`,
+            );
     
-          const identityFile = !jump.privateKey
+          const identityFile = !jump.privateKey && !systemAuthAgent
             ? await loadFirstIdentityFileForAuth({
               sender,
               identityFilePaths: jump.identityFilePaths,
               hostname: hopLabel,
               initialPassphrase: jump.passphrase,
+              sessionId: connId, passphraseSignal: options.abortSignal,
               logPrefix: `[SFTP Chain] Hop ${i + 1}:`,
               onLoaded: (loaded) => {
                 console.log(`[SFTP Chain] Hop ${i + 1}: loaded identity file ${loaded.keyPath}`);
@@ -96,6 +309,8 @@ function createOpenConnectionApi(ctx) {
             })
             : null;
           const inlineKey = jump.privateKey
+            && !systemAuthAgent
+            && !looksLikeSkOpenSshMaterial(jump.privateKey)
             ? await preparePrivateKeyForAuth({
               sender,
               privateKey: jump.privateKey,
@@ -103,6 +318,7 @@ function createOpenConnectionApi(ctx) {
               keyName: jump.keyId || jump.label || jump.username,
               hostname: hopLabel,
               initialPassphrase: jump.passphrase,
+              sessionId: connId, passphraseSignal: options.abortSignal,
               logPrefix: `[SFTP Chain] Hop ${i + 1}:`,
             })
             : null;
@@ -110,7 +326,11 @@ function createOpenConnectionApi(ctx) {
           const effectivePassphrase = inlineKey?.passphrase || identityFile?.passphrase;
     
           let authAgent = null;
-          if (hasCertificate) {
+          if (systemAuthAgent) {
+            connOpts.agent = systemAuthAgent;
+            require("../attachFidoAgentRelease.cjs").attachFidoAgentRelease(conn, systemAuthAgent);
+          }
+          if (hasCertificate && !isFido) {
             authAgent = new NetcattyAgent({
               mode: "certificate",
               webContents: event.sender,
@@ -122,11 +342,11 @@ function createOpenConnectionApi(ctx) {
               },
             });
             connOpts.agent = authAgent;
-          } else if (effectivePrivateKey) {
+          } else if (effectivePrivateKey && !isFido) {
             connOpts.privateKey = effectivePrivateKey;
             if (effectivePassphrase) {
               connOpts.passphrase = effectivePassphrase;
-            } else if (jump.privateKey && isKeyEncrypted(jump.privateKey)) {
+            } else if (isKeyEncrypted(effectivePrivateKey)) {
               // Key is encrypted but no passphrase provided — prompt the user
               console.log(`[SFTP Chain] Hop ${i + 1}: key is encrypted, requesting passphrase`);
               const keyLabel = jump.label || hopLabel;
@@ -134,7 +354,8 @@ function createOpenConnectionApi(ctx) {
                 sender,
                 `SSH key for ${keyLabel}`,
                 keyLabel,
-                hopLabel
+                hopLabel,
+                false, { sessionId: connId, signal: options.abortSignal }
               );
               if (result?.passphrase) {
                 connOpts.passphrase = result.passphrase;
@@ -150,31 +371,42 @@ function createOpenConnectionApi(ctx) {
           if (jump.password) connOpts.password = jump.password;
     
           // Get default keys (either from options if pre-fetched, or fetch them now)
-          const defaultKeys = options._defaultKeys || await findAllDefaultPrivateKeysFromHelper();
+          const defaultKeys = systemAuthAgent && jump.identitiesOnly
+            ? []
+            : options._defaultKeys || await findAllDefaultPrivateKeysFromHelper();
     
           // Build auth handler using shared helper
           // Pass unlocked encrypted keys from options so jump hosts can use them for retry
           const authConfig = buildAuthHandler({
+            authMethod: jump.authMethod,
+            requiresMfa: !!jump.requiresMfa,
             privateKey: connOpts.privateKey,
             password: connOpts.password,
             passphrase: connOpts.passphrase,
             agent: connOpts.agent,
             username: connOpts.username,
             logPrefix: `[SFTP Chain] Hop ${i + 1}`,
-            unlockedEncryptedKeys: options._unlockedEncryptedKeys || [],
+            unlockedEncryptedKeys: systemAuthAgent && jump.identitiesOnly
+              ? []
+              : options._unlockedEncryptedKeys || [],
             defaultKeys,
-            sshAgentSocketOverride: agentSocket,
+            sshAgentSocketOverride: defaultAgentSocket,
+            allowAgentFallback: jump.useSshAgent !== false,
             onAuthAttempt: (method) => {
               sendSftpProgress(sender, connId, hopLabel, 'auth-attempt', method);
             },
           });
           applyAuthToConnOpts(connOpts, authConfig);
+          const hopAuthPhase = authConfig.authPhase || { hadPartialSuccess: false };
     
           // If first hop and proxy is configured, connect through proxy
-          const hasUsableJumpProxy = !!(jump.proxy?.host && jump.proxy?.port);
+          const hasUsableJumpProxy = hasUsableProxy(jump.proxy);
           const effectiveHopProxy = isFirst ? ((hasUsableJumpProxy ? jump.proxy : null) || options.proxy) : null;
           if (effectiveHopProxy) {
-            currentSocket = await createProxySocket(effectiveHopProxy, jump.hostname, jump.port || 22);
+            currentSocket = await createProxySocket(effectiveHopProxy, jump.hostname, jump.port || 22, {
+              timeoutMs: hopConnectionTimeouts.tcpConnectTimeoutMs,
+              onSocket: (socket) => { currentSocket = socket; if (signal?.aborted) cleanupSocket(socket); },
+            });
             connOpts.sock = currentSocket;
             delete connOpts.host;
             delete connOpts.port;
@@ -186,11 +418,38 @@ function createOpenConnectionApi(ctx) {
           }
     
           // Connect this hop
+          checkCancelled();
           await new Promise((resolve, reject) => {
+            rejectPending = reject;
+            let settled = false;
+            let authReadyTimer = null;
+            const clearAuthReadyTimer = () => {
+              if (!authReadyTimer) return;
+              clearTimeout(authReadyTimer);
+              authReadyTimer = null;
+            };
+            conn.once('connect', () => {
+              runWhenProxyConnectionReady(conn._sock, () => {
+                try { conn._sock?.setTimeout?.(0); } catch { /* ignore */ }
+                clearAuthReadyTimer();
+                authReadyTimer = setTimeout(
+                  () => conn.emit('timeout'),
+                  hopConnectionTimeouts.authReadyTimeoutMs,
+                );
+                authReadyTimer.unref?.();
+              });
+            });
             conn.once('handshake', () => {
               sendSftpProgress(sender, connId, hopLabel, 'authenticating');
             });
             conn.once('ready', () => {
+              if (settled) return;
+              settled = true;
+              clearAuthReadyTimer();
+              // SFTP RPCs are small request/response packets; with Nagle on, a
+              // second request behind an unacked one waits for the peer's
+              // delayed ACK (~40 ms per round trip on Linux, up to 200 ms on Windows).
+              enableSshNoDelay(conn);
               console.log(`[SFTP Chain] Hop ${i + 1}/${jumpHosts.length}: ${hopLabel} connected`);
               sendSftpProgress(sender, connId, hopLabel, 'connected');
               resolve();
@@ -201,21 +460,42 @@ function createOpenConnectionApi(ctx) {
                 console.log(`[SFTP Chain] Hop ${i + 1} non-fatal agent auth error (will try next method):`, err.message);
                 return;
               }
+              if (settled) return;
+              settled = true;
+              clearAuthReadyTimer();
               console.error(`[SFTP Chain] Hop ${i + 1}/${jumpHosts.length}: ${hopLabel} error:`, err.message);
               sendSftpProgress(sender, connId, hopLabel, 'error', err.message);
               reject(err);
             });
             conn.once('timeout', () => {
+              if (settled) return;
+              settled = true;
+              clearAuthReadyTimer();
               console.error(`[SFTP Chain] Hop ${i + 1}/${jumpHosts.length}: ${hopLabel} timeout`);
               reject(new Error(`Connection timeout to ${hopLabel}`));
+            });
+            conn.once('close', () => {
+              if (settled) return;
+              settled = true;
+              clearAuthReadyTimer();
+              reject(new Error(`Connection closed before authentication completed for ${hopLabel}`));
+            });
+            let authBanner = "";
+            conn.on('banner', (message) => {
+              authBanner = String(message || "").trim();
             });
             // Handle keyboard-interactive authentication for jump hosts (2FA/MFA)
             const sftpChainKiHandler = createKeyboardInteractiveHandler({
               sender,
               sessionId: connId,
+              hostId: jump.hostId,
               hostname: hopLabel,
               password: jump.password,
+              totp: jump.totp,
               logPrefix: `[SFTP Chain] Hop ${i + 1}/${jumpHosts.length}`,
+              scope: "external",
+              getAuthBanner: () => authBanner,
+              shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(hopAuthPhase),
             });
             conn.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
               if (prompts && prompts.length > 0) {
@@ -234,22 +514,40 @@ function createOpenConnectionApi(ctx) {
           activeConn = null;
     
           // Determine next target
-          let nextHost, nextPort;
+          let nextHost, nextPort, nextConnectionTimeouts;
           if (isLast) {
             // Last jump host, forward to final target
             nextHost = targetHost;
             nextPort = targetPort;
+            nextConnectionTimeouts = resolveSshConnectionTimeouts(options);
           } else {
             // Forward to next jump host
             const nextJump = jumpHosts[i + 1];
             nextHost = nextJump.hostname;
             nextPort = nextJump.port || 22;
+            nextConnectionTimeouts = resolveSshConnectionTimeouts(nextJump);
           }
     
           // Create forward stream to next hop
           console.log(`[SFTP Chain] Hop ${i + 1}/${jumpHosts.length}: Forwarding to ${nextHost}:${nextPort}...`);
+          checkCancelled();
           currentSocket = await new Promise((resolve, reject) => {
-            conn.forwardOut('127.0.0.1', 0, nextHost, nextPort, (err, stream) => {
+            rejectPending = reject;
+            let settled = false;
+            const timeout = setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              reject(new Error(`Connection timeout to ${nextHost}:${nextPort}`));
+            }, nextConnectionTimeouts.tcpConnectTimeoutMs);
+            timeout.unref?.();
+            openBoundedForwardOutCallback(conn, '127.0.0.1', 0, nextHost, nextPort, (err, stream) => {
+              if (settled || signal?.aborted) {
+                clearTimeout(timeout);
+                try { stream?.end?.(); } catch { /* ignore */ }
+                return;
+              }
+              settled = true;
+              clearTimeout(timeout);
               if (err) {
                 console.error(`[SFTP Chain] Hop ${i + 1}/${jumpHosts.length}: forwardOut failed:`, err.message);
                 reject(err);
@@ -261,6 +559,7 @@ function createOpenConnectionApi(ctx) {
           });
         }
     
+        checkCancelled();
         // Return the final forwarded stream and all connections for cleanup
         return {
           socket: currentSocket,
@@ -276,6 +575,8 @@ function createOpenConnectionApi(ctx) {
           try { conn.end(); } catch (cleanupErr) { console.warn('[SFTP Chain] Cleanup error:', cleanupErr.message); }
         }
         throw err;
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
       }
     }
     
@@ -305,15 +606,12 @@ function createOpenConnectionApi(ctx) {
       // Try to find the path
       for (const p of sftpPaths) {
         try {
-          await new Promise((resolve, reject) => {
-            client.exec(`test -x ${p}`, (err, stream) => {
-              if (err) return reject(err);
-              stream.on('exit', (code) => {
-                if (code === 0) resolve();
-                else reject(new Error('Not found'));
-              });
-            });
+          const result = await executeBoundedSshCommand(client, `test -x ${p}`, {
+            openingTimeoutMs: SCP_PROBE_TIMEOUT_MS,
+            runTimeoutMs: SCP_PROBE_TIMEOUT_MS,
+            maxOutputBytes: 16 * 1024,
           });
+          if (result.code !== 0) throw new Error('Not found');
           serverPath = p;
           break;
         } catch (e) {
@@ -341,9 +639,8 @@ function createOpenConnectionApi(ctx) {
         const cmd = `sudo -S -p '${prompt}' sh -c 'printf ${readyMarker}; exec ${serverPath} -e'`;
     
         console.log(`[SFTP] Executing sudo command: ${cmd}`);
-    
         // Disable pty to ensure clean binary stream for SFTP
-        client.exec(cmd, { pty: false }, (err, stream) => {
+        openBoundedSshExecStreamCallback(client, cmd, { pty: false }, (err, stream) => {
           if (err) return reject(err);
     
           // Add stream lifecycle logging
@@ -358,23 +655,32 @@ function createOpenConnectionApi(ctx) {
           let stderrBuffer = "";
           let pendingAfterMarker = null;
           let sftpCreated = false;
+          let initDelayId = null;
           const timeoutMs = 20000;
           const timeoutId = setTimeout(() => {
             if (sftpInitialized || settled) return;
             settled = true;
             stream.stderr?.removeListener('data', onStderr);
             stream.removeListener('data', onStdout);
+            if (initDelayId) clearTimeout(initDelayId);
+            terminateSshExecStream(stream);
             const error = new Error("SFTP sudo handshake timed out. This may happen if: (1) the password is incorrect, (2) sudo requires a TTY, or (3) the user does not have sudo privileges.");
             reject(error);
           }, timeoutMs);
+          timeoutId.unref?.();
     
           const finalize = (err, result) => {
             if (settled) return;
             settled = true;
             clearTimeout(timeoutId);
+            if (initDelayId) clearTimeout(initDelayId);
+            initDelayId = null;
             stream.stderr?.removeListener('data', onStderr);
             stream.removeListener('data', onStdout);
-            if (err) reject(err);
+            if (err) {
+              terminateSshExecStream(stream);
+              reject(err);
+            }
             else resolve(result);
           };
     
@@ -457,18 +763,21 @@ function createOpenConnectionApi(ctx) {
     
               // Delay SFTP initialization to ensure sftp-server is fully started and stream is clean
               // Increased timeout to 1000ms to be safe
-              setTimeout(() => {
+              initDelayId = setTimeout(() => {
+                initDelayId = null;
                 initSftp();
               }, 1000);
+              initDelayId.unref?.();
             } else if (stdoutBuffer.length > 256) {
               stdoutBuffer = stdoutBuffer.subarray(stdoutBuffer.length - 256);
             }
           };
     
           const onStderr = (data) => {
-            const chunk = data.toString();
+            const raw = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+            const chunk = raw.subarray(Math.max(0, raw.length - 1024)).toString();
             // Only log that we received stderr data, not the content (may contain sensitive prompts)
-            stderrBuffer += chunk;
+            stderrBuffer = (stderrBuffer + chunk).slice(-1024);
             if (stderrBuffer.includes(prompt)) {
               console.log("[SFTP] Sudo requested password, sending...");
               // Send password
@@ -479,9 +788,7 @@ function createOpenConnectionApi(ctx) {
                 stream.write('\n');
               }
               stderrBuffer = "";
-            } else if (stderrBuffer.length > 256) {
-              stderrBuffer = stderrBuffer.slice(-256);
-            }
+            } else if (stderrBuffer.length > 256) stderrBuffer = stderrBuffer.slice(-256);
           };
     
           stream.on('data', onStdout);
@@ -501,25 +808,360 @@ function createOpenConnectionApi(ctx) {
               finalize(error);
             }
           });
-        });
+          stream.on('error', (error) => {
+            if (!sftpInitialized) finalize(error);
+          });
+          stream.on('close', () => {
+            if (!sftpInitialized) finalize(new Error("SFTP sudo stream closed before protocol initialization"));
+          });
+          stream.on('end', () => {
+            if (!sftpInitialized) finalize(new Error("SFTP sudo stream ended before protocol initialization"));
+          });
+          }, { openingTimeoutMs: 20_000 });
       });
     }
     
+    /**
+     * A live SFTP channel that was not parked in the SSH transport registry
+     * (single-channel bastion, or sudo elevation). Another open must borrow
+     * that channel. A second subsystem drops TERM-SSHD / similar logins, and
+     * a fresh SSH dial would ask for OTP again.
+     */
+    function hopsRequiringHostKeyCheck(request) {
+      const hops = [];
+      const add = (hostname, port) => {
+        const normalized = String(hostname || "").trim().toLowerCase();
+        if (!normalized) return;
+        hops.push({ hostname: normalized, port: Number(port) || 22 });
+      };
+      if (request?.verifyHostKeys !== false) add(request?.hostname, request?.port);
+      for (const hop of Array.isArray(request?.jumpHosts) ? request.jumpHosts : []) {
+        if ((hop?.verifyHostKeys ?? request?.verifyHostKeys) === false) continue;
+        add(hop?.hostname, hop?.port);
+      }
+      return hops;
+    }
+
+    function acceptedHostKeysStillTrusted(source, request) {
+      // Every hop whose effective policy still verifies must have an accepted
+      // key that classifies as trusted. Disabling the target does not skip a
+      // jump host that explicitly verifies.
+      const required = hopsRequiringHostKeyCheck(request);
+      if (required.length === 0) return true;
+      const keys = source?.__netcattyAcceptedHostKeys;
+      if (!Array.isArray(keys) || keys.length === 0) return false;
+      const knownHosts = Array.isArray(request?.knownHosts) ? request.knownHosts : [];
+      return required.every((hop) => keys.some((key) => {
+        const hostname = String(key?.hostname || "").trim().toLowerCase();
+        const port = Number(key?.port) || 22;
+        if (hostname !== hop.hostname || port !== hop.port) return false;
+        return hostKeyVerifier.classifyHostKey({
+          knownHosts,
+          hostname: key.hostname,
+          port: key.port || 22,
+          keyType: key.keyType,
+          fingerprint: key.fingerprint,
+        }).status === "trusted";
+      }));
+    }
+
+    function authenticatedChannelMatches(client, endpoint, request) {
+      const exact = buildEndpointKey(endpoint);
+      const exactMatch = !!(exact && client.__netcattyEndpointKey === exact);
+      if (!exactMatch) {
+        // The known-host digest can change when a still-valid key is saved, or
+        // when an unrelated record is added. That may reuse the live channel.
+        if (typeof buildChannelAdoptionKey !== "function") return false;
+        const adoption = buildChannelAdoptionKey(endpoint);
+        if (!adoption || client.__netcattyChannelAdoptionKey !== adoption) return false;
+      }
+      // Exact endpoint keys are not enough. A session trusted from an empty
+      // list and a later open that is also empty (the key was removed) share
+      // a digest, and must still be checked against the caller's records.
+      return acceptedHostKeysStillTrusted(client, request);
+    }
+
+    function channelContractMatches(options, source) {
+      if (Boolean(options?.sudo) !== Boolean(source?.__netcattySudoMode)) return false;
+      const requested = normalizeFileProtocol(options?.fileProtocol);
+      const owner = source?.__netcattyFileProtocol === "scp" ? "scp" : "sftp";
+      // auto follows the live channel. A forced protocol must be the same one
+      // already open, or SCP would silently come back as SFTP.
+      if (requested === "auto") return true;
+      return requested === owner;
+    }
+
+    function findAuthenticatedChannelOwner(endpoint, request) {
+      if (!endpoint || !sftpClients || typeof sftpClients.entries !== "function") return null;
+      for (const [sftpId, client] of sftpClients.entries()) {
+        if (!sftpId || !client || client.__netcattyDisposed || client.__netcattySharedChannelAlias) continue;
+        if (client.__netcattyTransportManaged) continue;
+        if (!authenticatedChannelMatches(client, endpoint, request)) continue;
+        if (!client.__netcattySingleChannelSsh && !client.__netcattySudoMode) continue;
+        if (!sftpChannelIsLive(client.sftp)) continue;
+        return { sftpId, client };
+      }
+      return null;
+    }
+
+    function adoptAuthenticatedSftpChannel(endpoint, connId, options) {
+      const found = findAuthenticatedChannelOwner(endpoint, options);
+      if (!found || typeof createSessionBackedSftpClient !== "function") return null;
+      const { sftpId: ownerId, client: source } = found;
+      if (!channelContractMatches(options, source)) return null;
+      // A pane reconnect can ask for the owner's own id while a transfer still
+      // holds that soft-closed session. Storing the alias under that id would
+      // drop the SSH client and lease the id to itself, so closeSftp could
+      // never hard-close it.
+      const aliasId = connId === ownerId ? `${ownerId}:reconnect:${randomUUID()}` : connId;
+      let leaseStore = null;
+      let leaseId = null;
+      try {
+        const lease = require("../sftpTransferSessionLease.cjs");
+        leaseStore = lease.sftpTransferSessionLeaseStore;
+        leaseId = lease.channelAliasLeaseId(aliasId);
+        // Hold the owner until this alias is torn down. closeSftp(owner) then
+        // soft-closes instead of ending the only SFTP channel mid-transfer.
+        if (!leaseStore.acquire(ownerId, leaseId)) return null;
+      } catch {
+        return null;
+      }
+      try {
+        const alias = createSessionBackedSftpClient(aliasId, source.client, {
+          singleChannelSsh: true,
+        });
+        alias.sftp = source.sftp;
+        alias.__netcattyFileProtocol = source.__netcattyFileProtocol || "sftp";
+        alias.__netcattySudoMode = !!source.__netcattySudoMode;
+        // Keep uploads on this channel. A disposable subsystem would either drop
+        // the single-channel login or bypass sudo elevation.
+        alias.__netcattySingleChannelSsh = true;
+        alias.__netcattySharedChannelAlias = true;
+        alias.__netcattySharedChannelOwnerId = ownerId;
+        alias.__netcattySharedChannelAliasId = aliasId;
+        alias.__netcattyEndpointKey = source.__netcattyEndpointKey;
+        alias.__netcattyChannelAdoptionKey = source.__netcattyChannelAdoptionKey;
+        alias.__netcattyTransportManaged = false;
+        alias.end = async () => {
+          alias.__netcattyDisposed = true;
+          alias.sftp = null;
+        };
+        sftpClients.set(aliasId, alias);
+        return {
+          sftpId: aliasId,
+          fileProtocol: alias.__netcattyFileProtocol === "scp" ? "scp" : "sftp",
+        };
+      } catch (err) {
+        try { leaseStore?.release(ownerId, leaseId); } catch { /* ignore */ }
+        throw err;
+      }
+    }
+
     /**
      * Open a new SFTP connection
      * Supports jump host connections when options.jumpHosts is provided
      */
     async function openSftp(event, options) {
-      const client = new SftpClient();
       const connId = options.sessionId || randomUUID();
-    
-      // Get default keys early to use for both chain and target
-      const defaultKeys = await findAllDefaultPrivateKeysFromHelper();
+      const reuseEndpoint = buildConnectionReuseEndpoint(options, {
+        sftpSudo: Boolean(options.sudo),
+      });
+      let pendingDialCoordination = options._pendingDialCoordination || null;
+
+      // Same rejection as openSftpForSession / the post-ready fresh path.
+      // Doing it before adoption stops {sudo, fileProtocol:'scp'} from
+      // borrowing an elevated SFTP channel and reporting success.
+      if (Boolean(options.sudo) && normalizeFileProtocol(options.fileProtocol) === "scp") {
+        throw new Error(
+          "Sudo Mode is not supported with File Protocol set to SCP. Disable Sudo Mode or use Auto/SFTP.",
+        );
+      }
+
+      // Do this before dial coordination. An in-flight single-channel login is
+      // the dial leader and never registers a transport; joining it waits
+      // forever and never shows keyboard-interactive.
+      if (options.reuseTransport !== false && !pendingDialCoordination) {
+        const adopted = adoptAuthenticatedSftpChannel(reuseEndpoint, connId, options);
+        if (adopted) {
+          sendSftpProgress(
+            event.sender,
+            connId,
+            options.hostname,
+            "connected",
+            "reused authenticated SFTP session",
+          );
+          return adopted;
+        }
+      }
+
+      const openOnSharedTransport = async (transport, detail = "reusing shared SSH transport") => {
+        if (
+          options.singleChannelSsh
+          || transport.endpoint?.singleChannelSsh
+          || remoteSoftwareRequiresSingleChannel(transport?.conn?._remoteVer)
+        ) {
+          const err = new Error(
+            "This host is configured for single-channel SSH. Opening SFTP on the terminal connection would disconnect it.",
+          );
+          err.code = "ERR_SFTP_SINGLE_CHANNEL_BASTION";
+          throw err;
+        }
+        const refHolder = {
+          id: connId,
+          __sshLeaseKind: "sftp",
+          webContentsId: event.sender?.id,
+        };
+        acquireConnectionRef?.(refHolder, transport);
+        const reusedClient = createSessionBackedSftpClient(connId, transport.conn, {
+          refHolder,
+          sourceSessionId: options.sourceSessionId || null,
+          singleChannelSsh: !!(options.singleChannelSsh || transport.endpoint?.singleChannelSsh),
+        });
+        reusedClient.__netcattyEndpointKey = transport.endpointKey || buildEndpointKey(reuseEndpoint);
+        reusedClient.__netcattyTransportManaged = true;
+        const fileProtocol = normalizeFileProtocol(options.fileProtocol);
+        try {
+          sendSftpProgress(event.sender, connId, options.hostname, "connecting", detail);
+          if (fileProtocol === "scp") {
+            await activateScpMode(reusedClient);
+            reusedClient.__netcattySudoMode = false;
+            sftpClients.set(connId, reusedClient);
+            sendSftpProgress(event.sender, connId, options.hostname, "connected", `${detail} (SCP mode)`);
+            return { sftpId: connId, fileProtocol: "scp" };
+          }
+          try {
+            await requireSftpChannel(reusedClient);
+            reusedClient.__netcattyFileProtocol = "sftp";
+            reusedClient.__netcattySudoMode = false;
+            sftpClients.set(connId, reusedClient);
+            sendSftpProgress(event.sender, connId, options.hostname, "connected", detail);
+            return { sftpId: connId, fileProtocol: "sftp" };
+          } catch (sftpErr) {
+            if (fileProtocol === "sftp") throw sftpErr;
+            await activateScpMode(reusedClient);
+            reusedClient.__netcattySudoMode = false;
+            sftpClients.set(connId, reusedClient);
+            sendSftpProgress(event.sender, connId, options.hostname, "connected", `${detail} (SCP mode)`);
+            return { sftpId: connId, fileProtocol: "scp" };
+          }
+        } catch (err) {
+          try { await reusedClient.end(); } catch { /* ignore */ }
+          throw err;
+        }
+      };
+
+      // Parked / shared transport without a live terminal session: open an SFTP
+      // channel on the registry transport (no second MFA).
+      // Dedicated bulk transfer / restart-resume passes reuseTransport:false so
+      // a transfer never silently attaches to a terminal/parked conn.
+      if (
+        !pendingDialCoordination
+        && allowsSharedSftpTransport(options)
+        && typeof findTransportByEndpoint === "function"
+        && typeof createSessionBackedSftpClient === "function"
+      ) {
+        const transport = findTransportByEndpoint(reuseEndpoint);
+        if (transport?.conn) {
+          try {
+            return await openOnSharedTransport(transport, "reused parked transport");
+          } catch (parkErr) {
+            console.warn(
+              `[SFTP] Parked transport reuse failed for ${connId}; connecting fresh:`,
+              parkErr?.message || String(parkErr),
+            );
+          }
+        }
+      }
+
+      if (
+        !pendingDialCoordination
+        && allowsSharedSftpTransport(options)
+        && typeof beginTransportDial === "function"
+      ) {
+        const coordination = beginTransportDial(reuseEndpoint, { kind: "channel" });
+        if (coordination.role === "reuse" || coordination.role === "join") {
+          try {
+            const transport = coordination.role === "reuse"
+              ? coordination.transport
+              : await waitForTransportDial(coordination);
+            return await openOnSharedTransport(transport, "reused coordinated transport");
+          } catch (coordinationErr) {
+            // The leader may have published a live channel and then rejected
+            // this dial (single-channel bastion, or sudo which is not parked).
+            // Adopt that channel before failing the transfer or dialing again.
+            const adopted = adoptAuthenticatedSftpChannel(reuseEndpoint, connId, options);
+            if (adopted) {
+              sendSftpProgress(
+                event.sender,
+                connId,
+                options.hostname,
+                "connected",
+                "reused authenticated SFTP session",
+              );
+              return adopted;
+            }
+            if (
+              coordination.role === "join"
+              && coordinationErr?.code !== "ERR_SFTP_SINGLE_CHANNEL_BASTION"
+            ) {
+              throw coordinationErr;
+            }
+            console.warn(
+              `[SFTP] Coordinated transport reuse failed for ${connId}; connecting fresh:`,
+              coordinationErr?.message || String(coordinationErr),
+            );
+          }
+        } else {
+          pendingDialCoordination = coordination;
+        }
+      }
+
+      const signal = options.abortSignal;
+      let cancelFresh = () => {};
+      let rejectCancelled;
+      const cancelled = new Promise((_resolve, reject) => { rejectCancelled = reject; });
+      const throwIfCancelled = () => {
+        if (signal?.aborted) throw new DOMException("SFTP open cancelled", "AbortError");
+      };
+      const onAbort = () => {
+        cancelFresh();
+        rejectCancelled(new DOMException("SFTP open cancelled", "AbortError"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        throwIfCancelled();
+        return await Promise.race([openFreshSftp(), cancelled]);
+      } catch (err) {
+        if (pendingDialCoordination) failTransportDial(pendingDialCoordination, err);
+        throw err;
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
+
+      async function openFreshSftp() {
+      const client = new SftpClient();
+      let peerSingleChannelSsh = options.singleChannelSsh === true;
+      client.__netcattyEndpointKey = buildEndpointKey(reuseEndpoint);
+      if (typeof buildChannelAdoptionKey === "function") {
+        client.__netcattyChannelAdoptionKey = buildChannelAdoptionKey(reuseEndpoint);
+      }
+      let freshClientClosed = false;
+      const closeFreshClient = () => {
+        if (freshClientClosed) return;
+        freshClientClosed = true;
+        // A failure after SSH authentication but before registration in
+        // sftpClients/the transport pool otherwise leaves an unreachable live
+        // socket. This is deliberately low-level: there may be no SFTP channel
+        // for ssh2-sftp-client.end() to close yet.
+        try { client.client?.end?.(); } catch { /* ignore */ }
+        try { client.client?.destroy?.(); } catch { /* ignore */ }
+      };
     
       // Check if we need to connect through jump hosts
       const jumpHosts = options.jumpHosts || [];
       const hasJumpHosts = jumpHosts.length > 0;
-      const hasProxy = !!options.proxy;
+      const hasProxy = hasUsableProxy(options.proxy);
+      const targetConnectionTimeouts = resolveSshConnectionTimeouts(options);
     
       let chainConnections = [];
       let connectionSocket = null;
@@ -532,10 +1174,27 @@ function createOpenConnectionApi(ctx) {
           try { connectionSocket.destroy?.(); } catch { /* ignore */ }
         }
       };
+      cancelFresh = () => {
+        cleanupPendingConnection();
+        closeFreshClient();
+        require("../keyboardInteractiveHandler.cjs").cancelRequestsForSession(connId);
+        require("../passphraseHandler.cjs").cancelPassphraseRequestsForSession(connId);
+        require("../hostKeyVerifier.cjs").cancelRequestsForSession(connId);
+      };
+      // Abort can race an awaited proxy, jump chain or authentication prompt.
+      // A late socket must be disposed before it can start another login.
+      const checkCancelled = () => {
+        if (!signal?.aborted) return;
+        cancelFresh();
+        throwIfCancelled();
+      };
+      const defaultKeys = await findAllDefaultPrivateKeysFromHelper();
+      checkCancelled();
     
       // Pre-fetch agent socket (async check for Windows SSH Agent service)
       // This is used by both jump host chain auth and final host auth
-      const agentSocket = await getAvailableAgentSocket();
+      const agentSocket = await getAvailableAgentSocket(options.identityAgent);
+      checkCancelled();
     
       // Handle chain/proxy connections
       if (hasJumpHosts) {
@@ -550,8 +1209,7 @@ function createOpenConnectionApi(ctx) {
           jumpHosts,
           options.hostname,
           options.port || 22,
-          connId,
-          agentSocket
+          connId
         );
         connectionSocket = chainResult.socket;
         chainConnections = chainResult.connections;
@@ -560,17 +1218,26 @@ function createOpenConnectionApi(ctx) {
         connectionSocket = await createProxySocket(
           options.proxy,
           options.hostname,
-          options.port || 22
+          options.port || 22,
+          {
+            timeoutMs: targetConnectionTimeouts.tcpConnectTimeoutMs,
+            onSocket: (socket) => {
+              connectionSocket = socket;
+              if (signal?.aborted) cleanupPendingConnection();
+            },
+          },
         );
       }
-    
+      checkCancelled();
+      const keepalivePolicy = resolveConnectionKeepalivePolicy(options);
       const connectOpts = {
         host: options.hostname,
         port: options.port || 22,
         username: options.username || "root",
         // Enable keyboard-interactive authentication (required for 2FA/MFA)
         tryKeyboard: true,
-        readyTimeout: 120000, // 2 minutes for 2FA input
+        timeout: targetConnectionTimeouts.tcpConnectTimeoutMs,
+        readyTimeout: 0,
         // Keepalive policy:
         //   - positive value: honor it (in seconds, convert to ms)
         //   - explicit 0: truly disabled (host opted out via per-host override —
@@ -579,17 +1246,28 @@ function createOpenConnectionApi(ctx) {
         //     unanswered probes)
         //   - undefined: legacy caller path, fall back to 10s/3 so an idle SFTP
         //     browse over a NAT doesn't drop (the original #669 protection)
-        keepaliveInterval: options.keepaliveInterval == null
-          ? 10000
-          : (options.keepaliveInterval > 0 ? options.keepaliveInterval * 1000 : 0),
-        keepaliveCountMax: options.keepaliveInterval == null
-          ? 3
-          : (options.keepaliveInterval > 0 ? (options.keepaliveCountMax ?? 3) : 0),
+        keepaliveInterval: keepalivePolicy.keepaliveIntervalMs,
+        keepaliveCountMax: keepalivePolicy.keepaliveCountMax,
         algorithms: buildSftpAlgorithms(options.legacyAlgorithms, {
           skipEcdsaHostKey: options.skipEcdsaHostKey,
           algorithmOverrides: options.algorithmOverrides,
         }),
       };
+      connectOpts.hostVerifier = hostKeyVerifier.createHostVerifier({
+        sender: event.sender,
+        sessionId: connId,
+        hostId: options.hostId,
+        hostname: options.hostname,
+        port: options.port || 22,
+        knownHosts: options.knownHosts,
+        verifyHostKeys: options.verifyHostKeys,
+        unattended: options.hostKeyUnattended === true,
+        onAccepted: (info) => {
+          if (!info) return;
+          if (!Array.isArray(options._acceptedHostKeys)) options._acceptedHostKeys = [];
+          options._acceptedHostKeys.push(info);
+        },
+      });
     
       // Use the tunneled socket if we have one
       if (connectionSocket) {
@@ -603,13 +1281,25 @@ function createOpenConnectionApi(ctx) {
     
       let identityFile = null;
       let inlineKey = null;
+      let systemAuthAgent = null;
+      let isFido = false;
       try {
-        identityFile = !options.privateKey
+        const { enhanceAuthOptionsForFido, looksLikeSkOpenSshMaterial } = require("../sshAuthHelper.cjs");
+        const prep = await enhanceAuthOptionsForFido(options, event.sender);
+        isFido = prep.useFidoAgent === true;
+        systemAuthAgent = (hasCertificate && !isFido)
+          ? null
+          : await prepareSystemSshAgentForAuth(
+            prep,
+            "[SFTP]",
+          );
+        identityFile = !options.privateKey && !systemAuthAgent
           ? await loadFirstIdentityFileForAuth({
             sender: event.sender,
             identityFilePaths: options.identityFilePaths,
             hostname: options.hostname,
             initialPassphrase: options.passphrase,
+              sessionId: connId, passphraseSignal: options.abortSignal,
             logPrefix: "[SFTP]",
             onLoaded: (loaded) => {
               console.log(`[SFTP] Loaded identity file ${loaded.keyPath}`);
@@ -620,6 +1310,8 @@ function createOpenConnectionApi(ctx) {
           })
           : null;
         inlineKey = options.privateKey
+          && !systemAuthAgent
+          && !looksLikeSkOpenSshMaterial(options.privateKey)
           ? await preparePrivateKeyForAuth({
             sender: event.sender,
             privateKey: options.privateKey,
@@ -627,6 +1319,7 @@ function createOpenConnectionApi(ctx) {
             keyName: options.keyId || options.username,
             hostname: options.hostname,
             initialPassphrase: options.passphrase,
+              sessionId: connId, passphraseSignal: options.abortSignal,
             logPrefix: "[SFTP]",
           })
           : null;
@@ -638,7 +1331,10 @@ function createOpenConnectionApi(ctx) {
       const effectivePassphrase = inlineKey?.passphrase || identityFile?.passphrase;
     
       let authAgent = null;
-      if (hasCertificate) {
+      if (systemAuthAgent) {
+        connectOpts.agent = systemAuthAgent;
+      }
+      if (hasCertificate && !isFido) {
         authAgent = new NetcattyAgent({
           mode: "certificate",
           webContents: event.sender,
@@ -650,18 +1346,19 @@ function createOpenConnectionApi(ctx) {
           },
         });
         connectOpts.agent = authAgent;
-      } else if (effectivePrivateKey) {
+      } else if (effectivePrivateKey && !isFido) {
         connectOpts.privateKey = effectivePrivateKey;
         if (effectivePassphrase) {
           connectOpts.passphrase = effectivePassphrase;
-        } else if (options.privateKey && isKeyEncrypted(options.privateKey)) {
+        } else if (isKeyEncrypted(effectivePrivateKey)) {
           // Key is encrypted but no passphrase provided — prompt the user
           console.log(`[SFTP] Key is encrypted, requesting passphrase for ${options.hostname}`);
           const result = await passphraseHandler.requestPassphrase(
             event.sender,
             `SSH key for ${options.hostname}`,
             options.hostname,
-            options.hostname
+            options.hostname,
+            false, { sessionId: connId, signal: options.abortSignal }
           );
           if (result?.passphrase) {
             connectOpts.passphrase = result.passphrase;
@@ -690,31 +1387,45 @@ function createOpenConnectionApi(ctx) {
       // Build auth handler using shared helper
       // Use pre-fetched agentSocket (validated async, including Windows service check)
       const authConfig = buildAuthHandler({
+        authMethod: options.authMethod,
+        requiresMfa: !!options.requiresMfa,
         privateKey: connectOpts.privateKey,
         password: connectOpts.password,
         passphrase: connectOpts.passphrase,
         agent: connectOpts.agent,
         username: connectOpts.username,
         logPrefix: "[SFTP]",
-        defaultKeys,
+        skipPasswordMethod: options._skipPasswordMethod === true,
+        defaultKeys: systemAuthAgent && options.identitiesOnly ? [] : defaultKeys,
         sshAgentSocketOverride: agentSocket,
+        allowAgentFallback: options.useSshAgent !== false,
         onAuthAttempt: (method) => {
           sendSftpProgress(event.sender, connId, options.hostname, 'auth-attempt', method);
         },
       });
       applyAuthToConnOpts(connectOpts, authConfig);
+      const sftpAuthPhase = authConfig.authPhase || { hadPartialSuccess: false };
+      let authBanner = "";
     
       // Create keyboard-interactive handler using shared helper
       const kiHandler = createKeyboardInteractiveHandler({
         sender: event.sender,
         sessionId: connId,
+        hostId: options.hostId,
         hostname: options.hostname,
         password: options.password,
+        totp: options.totp,
         logPrefix: "[SFTP]",
+        scope: "external",
+        getAuthBanner: () => authBanner,
+        shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(sftpAuthPhase),
       });
     
       // Add keyboard-interactive listener BEFORE connecting
       // Wrap to emit progress events for the SFTP connection log
+      client.on("banner", (message) => {
+        authBanner = String(message || "").trim();
+      });
       client.on("keyboard-interactive", (name, instructions, lang, prompts, finish) => {
         if (prompts && prompts.length > 0) {
           sendSftpProgress(event.sender, connId, options.hostname, 'auth-attempt', 'waiting for user input...');
@@ -726,9 +1437,6 @@ function createOpenConnectionApi(ctx) {
         kiHandler(name, instructions, lang, prompts, wrappedFinish);
       });
     
-      // Increase timeout to allow for keyboard-interactive auth
-      connectOpts.readyTimeout = 120000; // 2 minutes for 2FA input
-    
       try {
         // IMPORTANT: We bypass ssh2-sftp-client's connect() method and use the
         // underlying ssh2 Client directly. This is because ssh2-sftp-client adds
@@ -738,12 +1446,22 @@ function createOpenConnectionApi(ctx) {
         // By connecting directly, we can filter these non-fatal errors and allow
         // the auth flow to continue to keyboard-interactive/password/etc.
         const sshClient = client.client;
-    
+        if (systemAuthAgent) {
+          require("../attachFidoAgentRelease.cjs").attachFidoAgentRelease(sshClient, systemAuthAgent);
+        }
+
         await new Promise((resolve, reject) => {
           let settled = false;
+          let authReadyTimer = null;
+          const clearAuthReadyTimer = () => {
+            if (!authReadyTimer) return;
+            clearTimeout(authReadyTimer);
+            authReadyTimer = null;
+          };
           const settle = (fn, val) => {
             if (settled) return;
             settled = true;
+            clearAuthReadyTimer();
             cleanup();
             fn(val);
           };
@@ -772,6 +1490,7 @@ function createOpenConnectionApi(ctx) {
             sshClient.removeListener('error', onError);
             sshClient.removeListener('end', onEnd);
             sshClient.removeListener('close', onClose);
+            sshClient.removeListener('timeout', onTimeout);
             // Keep a catch-all error listener so post-ready errors (e.g. connection
             // drops during an active SFTP session) don't become uncaught exceptions.
             sshClient.on('error', (err) => {
@@ -782,63 +1501,129 @@ function createOpenConnectionApi(ctx) {
           sshClient.on('error', onError);
           sshClient.on('end', onEnd);
           sshClient.on('close', onClose);
+          const onTimeout = () => {
+            settle(reject, new Error(`Connection timeout to ${options.hostname}`));
+            try { sshClient.end?.(); } catch { /* ignore */ }
+            try { sshClient.destroy?.(); } catch { /* ignore */ }
+          };
+          sshClient.on('timeout', onTimeout);
+          sshClient.once('connect', () => {
+            runWhenProxyConnectionReady(sshClient._sock, () => {
+              try { sshClient._sock?.setTimeout?.(0); } catch { /* ignore */ }
+              clearAuthReadyTimer();
+              authReadyTimer = setTimeout(
+                () => sshClient.emit('timeout'),
+                targetConnectionTimeouts.authReadyTimeoutMs,
+              );
+              authReadyTimer.unref?.();
+            });
+          });
     
           sshClient.once('handshake', () => {
             sendSftpProgress(event.sender, connId, options.hostname, 'authenticating');
           });
     
           sshClient.once('ready', () => {
+            clearAuthReadyTimer();
             cleanup();
+            // See jump-hop note above: SFTP is RPC-bound, so disable Nagle.
+            enableSshNoDelay(sshClient);
+            if (signal?.aborted) {
+              cancelFresh();
+              reject(new DOMException("SFTP open cancelled", "AbortError"));
+              return;
+            }
+            if (remoteSoftwareRequiresSingleChannel(sshClient._remoteVer)) {
+              peerSingleChannelSsh = true;
+            }
             sendSftpProgress(event.sender, connId, options.hostname, 'connected');
-    
+
+            const fileProtocol = normalizeFileProtocol(options.fileProtocol);
+
+            const finishSftp = (sftp) => {
+              client.sftp = sftp;
+              client.__netcattyFileProtocol = "sftp";
+              resolve();
+            };
+
+            const finishScp = async (reason) => {
+              try {
+                if (reason) {
+                  console.warn(`[SFTP] ${reason}; activating SCP mode for ${connId}`);
+                }
+                await activateScpMode(client);
+                resolve();
+              } catch (scpErr) {
+                closeFreshClient();
+                reject(scpErr);
+              }
+            };
+
+            if (fileProtocol === "scp") {
+              if (options.sudo) {
+                // Forced SCP cannot provide sudo elevation; reject contradictory host data.
+                closeFreshClient();
+                reject(new Error(
+                  "Sudo Mode is not supported with File Protocol set to SCP. Disable Sudo Mode or use Auto/SFTP.",
+                ));
+                return;
+              }
+              console.log(`[SFTP] Forced SCP mode for connection: ${connId}`);
+              void finishScp(null);
+              return;
+            }
+
+            // When the host asks for sudo SFTP, never silently fall through to
+            // unprivileged SCP on Auto — that would look "connected" without elevation.
             if (options.sudo) {
               console.log(`[SFTP] Using sudo mode for connection: ${connId}`);
               (async () => {
                 try {
                   const sudoPass = options.password || "";
-                  const sftpWrapper = await connectSudoSftp(sshClient, sudoPass);
-                  client.sftp = sftpWrapper;
-                  client.sftp.on('close', () => client.end());
-                  resolve();
+                  const sftpWrapper = await openRequiredSudoSftp({
+                    connectSudoSftp,
+                    sshClient,
+                    password: sudoPass,
+                    closeFreshClient,
+                  });
+                  sftpWrapper.on('close', () => client.end());
+                  finishSftp(sftpWrapper);
                 } catch (e) {
-                  // Fallback: if sftp-server binary is missing (exit code 127),
-                  // try standard SFTP subsystem instead of failing completely.
-                  // This handles systems like ESXi that don't have sftp-server
-                  // but support the SFTP subsystem natively.
-                  if (e.message && e.message.includes('exit code 127')) {
-                    console.warn('[SFTP] sftp-server not found, falling back to standard SFTP subsystem');
-                    options.sudo = false; // Mark as non-sudo for downstream logic
-                    sshClient.sftp((sftpErr, sftp) => {
-                      if (sftpErr) {
-                        sshClient.end();
-                        return reject(sftpErr);
-                      }
-                      client.sftp = sftp;
-                      resolve();
-                    });
-                  } else {
-                    sshClient.end();
-                    reject(e);
-                  }
+                  // Elevation is part of the requested connection contract. A
+                  // standard SFTP fallback would look successful while silently
+                  // losing access to the requested destination.
+                  reject(e);
                 }
               })();
             } else {
               // Open standard SFTP subsystem channel
-              sshClient.sftp((err, sftp) => {
-                if (err) return reject(err);
-                client.sftp = sftp;
-                resolve();
+              openBoundedSftpChannel(sshClient).then((sftp) => {
+                finishSftp(sftp);
+              }).catch((err) => {
+                  if (fileProtocol === "auto") {
+                    if (peerSingleChannelSsh) {
+                      reject(new Error(
+                        `SFTP subsystem unavailable (${err.message}). This host is configured for single-channel SSH, so SCP fallback is disabled.`,
+                      ));
+                      return;
+                    }
+                    void finishScp(`SFTP subsystem unavailable (${err.message})`);
+                    return;
+                  }
+                  reject(err);
               });
             }
           });
     
           sendSftpProgress(event.sender, connId, options.hostname, 'connecting');
           try {
+            checkCancelled();
             sshClient.connect(connectOpts);
           } catch (e) {
             settle(reject, e);
           }
         });
+        checkCancelled();
         // Increase max listeners AFTER connect, when the internal ssh2 Client exists
         // This prevents Node.js MaxListenersExceededWarning when performing many operations
         // ssh2-sftp-client adds temporary listeners for each operation, so we need a high limit
@@ -847,27 +1632,124 @@ function createOpenConnectionApi(ctx) {
         }
     
         // Used by transferBridge to decide whether isolated fast-transfer channels are safe.
-        client.__netcattySudoMode = !!options.sudo;
+        client.__netcattySudoMode = !!options.sudo && client.__netcattyFileProtocol !== "scp";
+        if (!client.__netcattyFileProtocol) {
+          client.__netcattyFileProtocol = "sftp";
+        }
+
+        // Register dedicated dials in the shared SSH transport registry so
+        // later terminal/SFTP/transfer/port-forward work can borrow without MFA.
+        const sshConn = client.client;
+        if (
+          sshConn
+          && shouldRegisterFreshSftpTransport({ ...options, singleChannelSsh: peerSingleChannelSsh })
+          && typeof createTransport === "function"
+          && typeof borrowTransport === "function"
+        ) {
+          try {
+            const refHolder = {
+              id: connId,
+              __sshLeaseKind: "sftp",
+              webContentsId: event.sender?.id,
+            };
+            const transport = createTransport({
+              conn: sshConn,
+              chainConnections,
+              endpoint: reuseEndpoint,
+            });
+            borrowTransport(transport, {
+              kind: "sftp",
+              holder: refHolder,
+              leaseId: `sftp:${connId}`,
+              meta: { source: "openSftp-dedicated" },
+            });
+            client.__netcattyRefHolder = refHolder;
+            client.__netcattyTransportManaged = true;
+            if (pendingDialCoordination) {
+              completeTransportDial(pendingDialCoordination, transport);
+            }
+            // Chain lifetime is owned by the transport; do not double-end on close.
+            chainConnections = [];
+          } catch (regErr) {
+            if (pendingDialCoordination) {
+              failTransportDial(pendingDialCoordination, regErr);
+            }
+            console.warn(
+              `[SFTP] Failed to register dedicated transport for ${connId}:`,
+              regErr?.message || String(regErr),
+            );
+          }
+        }
+
+        client.__netcattySingleChannelSsh = peerSingleChannelSsh;
+        if (client.client) {
+          client.client.__netcattySingleChannelSsh = peerSingleChannelSsh;
+        }
+        if (Array.isArray(options._acceptedHostKeys) && options._acceptedHostKeys.length > 0) {
+          client.__netcattyAcceptedHostKeys = options._acceptedHostKeys.slice();
+        }
         sftpClients.set(connId, client);
+
+        // Publish the live channel before rejecting waiters. A single-channel
+        // login cannot join the transport registry; leaving the dial pending
+        // makes the next SFTP-page transfer wait forever with no OTP prompt.
+        if (pendingDialCoordination && !client.__netcattyTransportManaged) {
+          const unshared = new Error(
+            peerSingleChannelSsh || options.singleChannelSsh === true
+              ? "This host allows one SSH channel. Reuse the authenticated SFTP session instead of opening another."
+              : "SFTP connection was not added to the shared SSH transport registry",
+          );
+          if (peerSingleChannelSsh || options.singleChannelSsh === true) {
+            unshared.code = "ERR_SFTP_SINGLE_CHANNEL_BASTION";
+          }
+          failTransportDial(pendingDialCoordination, unshared);
+        }
     
-        // Store jump connections for cleanup when SFTP is closed
-        if (chainConnections.length > 0) {
+        // Store jump connections for cleanup when SFTP is closed (legacy path
+        // only — transport-managed connections park chain on the registry).
+        if (chainConnections.length > 0 && !client.__netcattyTransportManaged) {
           jumpConnectionsMap.set(connId, {
             connections: chainConnections,
             socket: connectionSocket
           });
         }
     
-        console.log(`[SFTP] Connection established: ${connId}`);
-        return { sftpId: connId };
+        console.log(`[SFTP] Connection established: ${connId} (protocol=${client.__netcattyFileProtocol})`);
+        return { sftpId: connId, fileProtocol: client.__netcattyFileProtocol };
       } catch (err) {
         // Cleanup jump connections on error
         cleanupPendingConnection();
+        closeFreshClient();
+        if (
+          options.hostKeyUnattended === true
+          && /Host denied \(verification failed\)|Host key rejected/i.test(String(err?.message || ""))
+        ) {
+          const denied = new Error(`Host key verification required for ${options.hostname || "host"}`);
+          denied.code = "ERR_HOST_KEY_UNVERIFIED";
+          denied.cause = err;
+          if (pendingDialCoordination) failTransportDial(pendingDialCoordination, denied);
+          throw denied;
+        }
+        if (shouldRetrySftpKeyboardInteractiveFirst(options, authConfig, err)) {
+          console.log("[SFTP] Password auth removed keyboard-interactive; retrying with keyboard-interactive first...");
+          return openSftp(event, {
+            ...options,
+            _skipPasswordMethod: true,
+            _pendingDialCoordination: pendingDialCoordination,
+          });
+        }
+        if (pendingDialCoordination) failTransportDial(pendingDialCoordination, err);
         throw err;
+      }
       }
     }
     return { connectThroughChainForSftp, connectSudoSftp, openSftp };
   }
 }
 
-module.exports = { createOpenConnectionApi };
+module.exports = {
+  createOpenConnectionApi,
+  createBoundedProbeSignal,
+  shouldRegisterFreshSftpTransport,
+  SCP_PROBE_TIMEOUT_MS,
+};

@@ -1,3 +1,4 @@
+import { activeTabStore } from "../application/state/activeTabStore";
 import type { Workspace } from "../types";
 
 export const HIDDEN_TERMINAL_PANE_SNAPSHOT = "hidden";
@@ -5,8 +6,96 @@ export const HIDDEN_TERMINAL_PANE_SNAPSHOT = "hidden";
 export type TerminalPaneSnapshot =
   | typeof HIDDEN_TERMINAL_PANE_SNAPSHOT
   | `solo|${string}`
-  | `workspace|split|${string}|${string}`
+  | `workspace|split|${string}`
   | `workspace|focus|${string}|${string}`;
+
+export type TerminalPaneFocusSnapshot = "na" | "focused" | "unfocused";
+
+export type TerminalPaneHiddenSize = {
+  width: number;
+  height: number;
+};
+
+export type TerminalPaneStyle = {
+  left?: string | number;
+  top?: string | number;
+  width?: string | number;
+  height?: string | number;
+  visibility?: string;
+  transform?: string;
+  pointerEvents?: string;
+  zIndex?: number;
+};
+
+export function shouldUseTerminalPaneSplitLayout({
+  workspace,
+}: {
+  workspace: Workspace | undefined;
+  sessionId: string;
+  isVisible: boolean;
+  hibernateHiddenTabs: boolean;
+}): boolean {
+  if (!workspace) return false;
+  // Default viewMode is tiled split (including undefined from createWorkspaceFromSessions).
+  // Focus mode never uses split geometry: every pane is viewed full-size, so hidden
+  // panes must keep full-size geometry too. Laying continuously rendered background
+  // panes out at their split rects shrank the live xterm and the remote PTY to a
+  // 1/N-width fragment, so \r-refresh progress output (e.g. rsync --info=progress2)
+  // soft-wrapped and left one scrollback line per refresh (#3046).
+  return workspace.viewMode !== "focus";
+}
+
+export function shouldMeasureTerminalLayerLayout({
+  isTerminalLayerVisible,
+  keepHiddenLayoutActive,
+  workspaceArea,
+}: {
+  isTerminalLayerVisible: boolean;
+  keepHiddenLayoutActive: boolean;
+  workspaceArea: TerminalPaneHiddenSize;
+}): boolean {
+  return isTerminalLayerVisible
+    || (keepHiddenLayoutActive && (workspaceArea.width <= 0 || workspaceArea.height <= 0));
+}
+
+export function resolveInactiveTerminalPaneStyle<T extends TerminalPaneStyle>(
+  layoutStyle: T,
+  lastVisibleSize: TerminalPaneHiddenSize | null,
+  hibernateHiddenTabs: boolean,
+  preserveLastVisibleSize = false,
+): T {
+  return {
+    ...layoutStyle,
+    // Keep the measured box and live parser, but move the screen outside the
+    // viewport so xterm's IntersectionObserver pauses rendering. Occlusion and
+    // visibility:hidden alone do not stop xterm's WebGL refreshes.
+    // Reset cached split offsets before translating: they can exceed the current
+    // viewport after a window shrinks. Translate by both pane and viewport width,
+    // including pinned panes wider than a window resized in the background.
+    left: 0,
+    transform: "translateX(calc(-100vw - 100%))",
+    visibility: hibernateHiddenTabs ? "hidden" : "visible",
+    pointerEvents: "none",
+    zIndex: 0,
+    ...((hibernateHiddenTabs || preserveLastVisibleSize) && lastVisibleSize
+      ? {
+        width: `${lastVisibleSize.width}px`,
+        height: `${lastVisibleSize.height}px`,
+      }
+      : {}),
+  };
+}
+
+export function resolveTerminalLayerSurfaceStyle(
+  isActive: boolean,
+  hibernateHiddenTabs: boolean,
+): { visibility: "visible" | "hidden"; pointerEvents: "auto" | "none"; zIndex: number } {
+  return {
+    visibility: isActive || !hibernateHiddenTabs ? "visible" : "hidden",
+    pointerEvents: isActive ? "auto" : "none",
+    zIndex: isActive ? 10 : 0,
+  };
+}
 
 interface GetTerminalPaneSnapshotOptions {
   activeTabId: string | null;
@@ -40,7 +129,7 @@ export function getTerminalPaneSnapshot({
         : HIDDEN_TERMINAL_PANE_SNAPSHOT;
     }
 
-    return `workspace|split|${activeWorkspace.id}|${focusedSessionId}`;
+    return `workspace|split|${activeWorkspace.id}`;
   }
 
   return activeTabId === sessionId
@@ -73,10 +162,79 @@ export function parseTerminalPaneSnapshot(snapshot: TerminalPaneSnapshot): {
     };
   }
 
+  if (parts[1] === "focus") {
+    return {
+      isVisible: true,
+      mode: "focus",
+      workspaceId: parts[2] || null,
+      focusedSessionId: parts[3] || null,
+    };
+  }
+
   return {
     isVisible: true,
-    mode: parts[1] === "focus" ? "focus" : "split",
+    mode: "split",
     workspaceId: parts[2] || null,
-    focusedSessionId: parts[3] || null,
+    focusedSessionId: null,
+  };
+}
+
+export function getTerminalPaneFocusSnapshot({
+  activeTabId: activeTabIdOverride,
+  sessionId,
+  sessionWorkspaceId,
+  workspaceById,
+}: {
+  activeTabId?: string | null;
+  sessionId: string;
+  sessionWorkspaceId?: string;
+  workspaceById: Map<string, Workspace>;
+}): TerminalPaneFocusSnapshot {
+  const activeTabId = activeTabIdOverride ?? activeTabStore.getActiveTabId();
+  if (!activeTabId) return "na";
+
+  const activeWorkspace = workspaceById.get(activeTabId);
+  if (!activeWorkspace || activeWorkspace.viewMode === "focus") return "na";
+  if (sessionWorkspaceId !== activeWorkspace.id) return "na";
+
+  return activeWorkspace.focusedSessionId === sessionId ? "focused" : "unfocused";
+}
+
+/** Combined visibility + focus snapshot for a single useSyncExternalStore subscription. */
+export function getTerminalPaneRenderSnapshot(
+  options: GetTerminalPaneSnapshotOptions,
+): string {
+  const pane = getTerminalPaneSnapshot(options);
+  if (pane === HIDDEN_TERMINAL_PANE_SNAPSHOT) {
+    return HIDDEN_TERMINAL_PANE_SNAPSHOT;
+  }
+  const focus = getTerminalPaneFocusSnapshot({
+    activeTabId: options.activeTabId,
+    sessionId: options.sessionId,
+    sessionWorkspaceId: options.sessionWorkspaceId,
+    workspaceById: options.workspaceById,
+  });
+  return `${pane}|${focus}`;
+}
+
+export function parseTerminalPaneRenderSnapshot(snapshot: string): {
+  paneState: ReturnType<typeof parseTerminalPaneSnapshot>;
+  isFocusedPane: boolean;
+} {
+  if (snapshot === HIDDEN_TERMINAL_PANE_SNAPSHOT) {
+    return {
+      paneState: parseTerminalPaneSnapshot(HIDDEN_TERMINAL_PANE_SNAPSHOT),
+      isFocusedPane: false,
+    };
+  }
+
+  const focusSep = snapshot.lastIndexOf("|");
+  const focusToken = snapshot.slice(focusSep + 1);
+  const paneSnapshot = snapshot.slice(0, focusSep) as TerminalPaneSnapshot;
+  const paneState = parseTerminalPaneSnapshot(paneSnapshot);
+
+  return {
+    paneState,
+    isFocusedPane: focusToken === "focused",
   };
 }

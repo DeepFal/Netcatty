@@ -5,10 +5,14 @@
  * Colors are derived from the active terminal theme for visual consistency.
  */
 
-import React, { useEffect, useRef, useState, memo } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState, memo } from "react";
 import { Folder, File, Link } from "lucide-react";
 import type { CompletionSuggestion, SuggestionSource } from "./completionEngine";
-import { computeAutocompletePopupPlacement } from "./terminalAutocompleteLayout";
+import {
+  clampAutocompletePopupGeometry,
+  computeAutocompletePopupPlacement,
+  resolveAutocompleteClampViewport,
+} from "./terminalAutocompleteLayout";
 
 export interface AutocompleteThemeColors {
   background: string;
@@ -31,11 +35,8 @@ export interface SubDirPanel {
 interface AutocompletePopupProps {
   suggestions: CompletionSuggestion[];
   selectedIndex: number;
-  /** Position relative to the terminal container (not viewport) */
-  position: { x: number; y: number };
-  /** Current input line bounds relative to the terminal container */
-  cursorLineTop: number;
-  cursorLineBottom: number;
+  /** Cursor anchor in viewport coordinates */
+  anchorViewport: { left: number; top: number; bottom: number };
   visible: boolean;
   expandUpward?: boolean;
   themeColors?: AutocompleteThemeColors;
@@ -61,6 +62,7 @@ const SOURCE_LABELS: Record<SuggestionSource, { label: string; fullLabel: string
   arg: { label: "a", fullLabel: "Argument", fallbackColor: "#F87171" },
   path: { label: "p", fullLabel: "Path", fallbackColor: "#38BDF8" },
   snippet: { label: "{}", fullLabel: "Snippet", fallbackColor: "#C084FC" },
+  plugin: { label: "P", fullLabel: "Plugin", fallbackColor: "#F472B6" },
 };
 
 /** Lucide icon components for file types in path suggestions */
@@ -122,9 +124,7 @@ const KeyCap: React.FC<{ label: string; color: string; bg: string }> = ({ label,
 const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
   suggestions,
   selectedIndex,
-  position,
-  cursorLineTop,
-  cursorLineBottom,
+  anchorViewport,
   visible,
   expandUpward = false,
   themeColors,
@@ -141,6 +141,7 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
   const listRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<HTMLDivElement>(null);
   const [hoveredIndex, setHoveredIndex] = useState(-1);
+  const [measuredSize, setMeasuredSize] = useState<{ width: number; height: number } | null>(null);
 
   useEffect(() => {
     if (selectedRef.current && listRef.current) {
@@ -179,6 +180,60 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
       window.removeEventListener("resize", requestReposition);
     };
   }, [containerRef, onRequestReposition, visible]);
+
+  useEffect(() => {
+    if (!visible || !onRequestReposition || suggestions.length === 0) return;
+
+    let firstFrame = 0;
+    let secondFrame = 0;
+    firstFrame = requestAnimationFrame(() => {
+      onRequestReposition();
+      secondFrame = requestAnimationFrame(onRequestReposition);
+    });
+
+    return () => {
+      if (firstFrame) cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [onRequestReposition, subDirPanels.length, suggestions, visible]);
+
+  useLayoutEffect(() => {
+    if (!visible || suggestions.length === 0) {
+      setMeasuredSize((current) => (current === null ? current : null));
+      return;
+    }
+
+    let frameId = 0;
+    const measure = () => {
+      const rect = wrapperRef.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      setMeasuredSize((current) => {
+        if (
+          current &&
+          Math.abs(current.width - rect.width) < 0.5 &&
+          Math.abs(current.height - rect.height) < 0.5
+        ) {
+          return current;
+        }
+        return { width: rect.width, height: rect.height };
+      });
+    };
+
+    measure();
+    const wrapper = wrapperRef.current;
+    const observer = wrapper ? new ResizeObserver(measure) : null;
+    observer?.observe(wrapper);
+    frameId = requestAnimationFrame(measure);
+
+    return () => {
+      if (frameId) cancelAnimationFrame(frameId);
+      observer?.disconnect();
+    };
+    // hoveredIndex intentionally not a dependency: the detail panel below has
+    // a fixed box (width/height), so hovering cannot change the wrapper's
+    // size — re-measuring per hover would only feed the resize back into the
+    // position clamp and jitter the popup under the pointer (#3426).
+  }, [selectedIndex, subDirPanels, suggestions, visible]);
 
   // Dismiss popup when clicking outside
   useEffect(() => {
@@ -222,18 +277,25 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
   const setMayShowDetailPanel = suggestions.some(
     (s) => s.source !== "path" && Boolean(s.description && s.description.length > 0),
   );
+  // The tooltip is only visible for the hovered/selected non-path row, but it
+  // is MOUNTED for the whole set with a fixed box (width = the reserved
+  // DETAIL_PANEL_MAX_WIDTH, height = the reserved estimatedDetailHeight) and
+  // toggled with visibility instead of mounting/unmounting. A hover-driven
+  // size change would flow through the measured-size clamp below and move the
+  // popup under a stationary pointer, which flips the hovered row and
+  // self-oscillates — the violent mousemove jitter from #3426.
+  const detailVisible = Boolean(
+    showDetail && detailItem && detailItem.source !== "path",
+  );
 
-  // Calculate fixed viewport position from container rect + relative cursor position.
-  // containerRef already has top offset for toolbar/search bar, so don't add it again.
-  const containerRect = containerRef?.current?.getBoundingClientRect();
-  const fixedLeft = (containerRect?.left ?? 0) + position.x;
-  const fixedLineTop = (containerRect?.top ?? 0) + cursorLineTop;
-  const fixedLineBottom = (containerRect?.top ?? 0) + cursorLineBottom;
+  const fixedLeft = anchorViewport.left;
+  const fixedLineTop = anchorViewport.top;
+  const fixedLineBottom = anchorViewport.bottom;
 
   const viewportPadding = 8;
   const anchorGap = 8;
-  const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 800;
-  const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1200;
+  const clampViewport = resolveAutocompleteClampViewport(containerRef?.current ?? null);
+  const availableWidth = Math.max(0, clampViewport.width - viewportPadding * 2);
   const estimatedPopupHeight = Math.min(maxHeight, suggestions.length * 28 + 8);
   // Reserve the detail height for the whole set (not the hovered row) so the
   // chosen direction/height stays stable while hovering.
@@ -253,24 +315,44 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
     MAIN_LIST_MAX_WIDTH +
     subDirPanels.length * (FLEX_GAP + SUBDIR_PANEL_MAX_WIDTH) +
     (setMayShowDetailPanel ? FLEX_GAP + DETAIL_PANEL_MAX_WIDTH : 0);
+  const clampWidth =
+    MAIN_LIST_MAX_WIDTH +
+    subDirPanels.length * (FLEX_GAP + SUBDIR_PANEL_MAX_WIDTH);
 
   const placement = computeAutocompletePopupPlacement({
     anchorTop: fixedLineTop,
     anchorBottom: fixedLineBottom,
     anchorLeft: fixedLeft,
-    viewportWidth,
-    viewportHeight,
+    viewportWidth: clampViewport.width,
+    viewportHeight: clampViewport.height,
+    clampViewport,
     desiredHeight: desiredContentHeight,
     totalWidth,
+    clampWidth,
     maxHeight,
     anchorGap,
     viewportPadding,
     expandUpwardHint: expandUpward,
+    forceExpandUpward: expandUpward,
   });
   const renderUpward = placement.renderUpward;
   const effectiveMaxHeight = placement.maxHeight;
+  // Fixed tooltip height: matches the 96px the placement pass reserved
+  // (estimatedDetailHeight), capped by the space actually available so the
+  // mounted-but-hidden panel can never push the wrapper past the clamp.
+  const detailPanelHeight = Math.max(0, Math.min(96, effectiveMaxHeight));
   const anchoredTop = placement.top;
   const clampedLeft = placement.left;
+  const finalGeometry = measuredSize
+    ? clampAutocompletePopupGeometry({
+        left: clampedLeft,
+        top: anchoredTop,
+        width: measuredSize.width,
+        height: measuredSize.height,
+        clampViewport,
+        viewportPadding,
+      })
+    : { left: clampedLeft, top: anchoredTop };
 
   const sharedBoxStyle = {
     // border-box so each panel's maxWidth is its true outer width (padding +
@@ -293,17 +375,20 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
       ref={wrapperRef}
       style={{
         position: "fixed",
-        left: `${clampedLeft}px`,
-        top: `${anchoredTop}px`,
+        left: `${finalGeometry.left}px`,
+        top: `${finalGeometry.top}px`,
         zIndex: 10000,
         display: "flex",
+        maxWidth: `${availableWidth}px`,
         alignItems: renderUpward ? "flex-end" : "flex-start",
         gap: "4px",
-        pointerEvents: "auto", // Re-enable on popup itself (parent is pointer-events-none)
-      }}
-      onMouseDown={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
+        // Hit-test transparent: the wrapper's box spans the whole assembly,
+        // including the mounted-but-hidden detail reserve, so leaving it
+        // auto would make the transparent area around a short list a dead
+        // zone (clicks there preventDefault + stopPropagation and never
+        // reach the terminal or the outside-dismiss handler). Children
+        // re-enable pointer events individually. (#3427 review)
+        pointerEvents: "none",
       }}
     >
       {/* Main suggestion list */}
@@ -313,12 +398,19 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
         style={{
           ...sharedBoxStyle,
           maxHeight: `${effectiveMaxHeight}px`,
-          minWidth: "180px",
+          minWidth: `${Math.min(180, setMayShowDetailPanel ? availableWidth / 2 : availableWidth)}px`,
           maxWidth: "400px",
           overflowY: "auto",
           overflowX: "hidden",
           padding: "4px 0",
           userSelect: "none",
+          pointerEvents: "auto",
+        }}
+        // Keep the terminal focused when clicking the list's padding or
+        // scrollbar (row clicks handle this themselves).
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
         }}
       >
         {suggestions.map((suggestion, index) => {
@@ -355,6 +447,9 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
                 <FileTypeIcon fileType={suggestion.fileType} />
               ) : (
                 <span
+                  role="img"
+                  aria-label={sourceInfo.fullLabel}
+                  title={sourceInfo.fullLabel}
                   style={{
                     width: "18px",
                     height: "18px",
@@ -451,6 +546,13 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
             padding: "4px 0",
             userSelect: "none",
             alignSelf: "flex-start",
+            pointerEvents: "auto",
+          }}
+          // Keep the terminal focused when clicking the panel's padding or
+          // scrollbar (row clicks handle this themselves).
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
           }}
         >
           {panel.entries.map((entry, idx) => {
@@ -493,51 +595,70 @@ const AutocompletePopup: React.FC<AutocompletePopupProps> = ({
         </div>
       ))}
 
-      {/* Detail tooltip panel — shows full description for non-path items */}
-      {showDetail && detailItem && detailItem.source !== "path" && (
+      {/* Detail tooltip panel — shows full description for non-path items.
+          Mounted for the whole set with a fixed, hover-independent box and
+          toggled via visibility so hovering rows can never resize (and thus
+          re-clamp the position of) the popup (#3426). */}
+      {setMayShowDetailPanel && (
         <div
           style={{
             ...sharedBoxStyle,
             padding: "10px 12px",
-            maxWidth: "280px",
-            minWidth: "160px",
+            width: "280px",
+            minWidth: 0,
+            height: `${detailPanelHeight}px`,
+            // The width remains independent of content/hover, but can shrink
+            // with the assembly inside a narrow terminal pane.
+            flexShrink: 1,
             // Bound the tooltip too: a long multi-line snippet description must
             // scroll, not push the panel past the viewport edge (#1202).
-            maxHeight: `${effectiveMaxHeight}px`,
             overflowY: "auto",
             alignSelf: renderUpward ? "flex-end" : "flex-start",
+            visibility: detailVisible ? "visible" : "hidden",
+            // visibility:hidden already skips hit testing, but keep the
+            // hidden reserve explicitly non-interactive so the mounted
+            // panel can never swallow clicks meant for the terminal.
+            pointerEvents: detailVisible ? "auto" : "none",
+          }}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" }}>
-            <span style={{ fontWeight: 600, fontSize: "13px" }}>{detailItem.displayText}</span>
-            <span style={{
-              fontSize: "10px",
-              color: SOURCE_LABELS[detailItem.source].fallbackColor,
-              padding: "1px 5px",
-              borderRadius: "3px",
-              backgroundColor: `${SOURCE_LABELS[detailItem.source].fallbackColor}15`,
-            }}>
-              {SOURCE_LABELS[detailItem.source].fullLabel}
-            </span>
-          </div>
-          <div style={{ fontSize: "12px", color: dimTextColor, lineHeight: "1.5", wordBreak: "break-word" }}>
-            {detailItem.source === "snippet" ? (
-              <pre
-                style={{
-                  margin: 0,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                  fontFamily: "var(--terminal-font, monospace)",
-                  fontSize: "11px",
-                  lineHeight: 1.4,
-                }}
-              >
-                {detailItem.description}
-              </pre>
-            ) : (
-              detailItem.description
-            )}
-          </div>
+          {detailVisible && detailItem && (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" }}>
+                <span style={{ fontWeight: 600, fontSize: "13px" }}>{detailItem.displayText}</span>
+                <span style={{
+                  fontSize: "10px",
+                  color: SOURCE_LABELS[detailItem.source].fallbackColor,
+                  padding: "1px 5px",
+                  borderRadius: "3px",
+                  backgroundColor: `${SOURCE_LABELS[detailItem.source].fallbackColor}15`,
+                }}>
+                  {SOURCE_LABELS[detailItem.source].fullLabel}
+                </span>
+              </div>
+              <div style={{ fontSize: "12px", color: dimTextColor, lineHeight: "1.5", wordBreak: "break-word" }}>
+                {detailItem.source === "snippet" ? (
+                  <pre
+                    style={{
+                      margin: 0,
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontFamily: "var(--terminal-font, monospace)",
+                      fontSize: "11px",
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    {detailItem.description}
+                  </pre>
+                ) : (
+                  detailItem.description
+                )}
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

@@ -51,16 +51,21 @@ interface SftpPaneDialogsProps {
   showDeleteConfirm: boolean;
   setShowDeleteConfirm: (open: boolean) => void;
   deleteTargets: string[];
+  deleteError?: string | null;
   handleDelete: () => void;
   isDeleting: boolean;
   // Host picker (connected view)
   showHostPicker: boolean;
   setShowHostPicker: (open: boolean) => void;
   hosts: Host[];
+  connectedHosts?: import("../../domain/sftpConnectedHosts").SftpConnectedHostEntry[];
   side: "left" | "right";
   hostSearch: string;
   setHostSearch: (value: string) => void;
-  onConnect: (host: Host | "local") => void;
+  onConnect: (
+    host: Host | "local",
+    options?: { sourceSessionId?: string },
+  ) => void;
   onDisconnect: () => Promise<boolean>;
 }
 
@@ -100,11 +105,13 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
   showDeleteConfirm,
   setShowDeleteConfirm,
   deleteTargets,
+  deleteError,
   handleDelete,
   isDeleting,
   showHostPicker,
   setShowHostPicker,
   hosts,
+  connectedHosts = [],
   side,
   hostSearch,
   setHostSearch,
@@ -302,60 +309,68 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
 
     <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
       <DialogContent
-        className="max-w-sm"
+        className="max-w-[calc(100vw-2rem)] overflow-hidden sm:max-w-sm"
         onOpenAutoFocus={(e) => {
           e.preventDefault();
           deleteConfirmButtonRef.current?.focus();
         }}
       >
-        <DialogHeader>
-          <DialogTitle>
+        <DialogHeader className="min-w-0 pr-6">
+          <DialogTitle className="truncate">
             {t("sftp.deleteConfirm.title", { count: deleteTargets.length })}
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="break-words [overflow-wrap:anywhere]">
             {t(showDeleteList ? "sftp.deleteConfirm.desc" : "sftp.deleteConfirm.descSingle")}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-3">
+        <div className="min-w-0 space-y-3">
           {hostLabel || deletePath ? (
-            <div className="text-xs text-muted-foreground space-y-1.5">
+            <div className="min-w-0 space-y-1.5 text-xs text-muted-foreground">
               {hostLabel ? (
-                <div className="flex items-start gap-2">
+                <div className="flex min-w-0 items-start gap-2">
                   <span className="font-medium text-foreground/80 shrink-0">{t("sftp.deleteConfirm.host")}:</span>
-                  <span className="break-all">{hostLabel}</span>
+                  <span className="min-w-0 break-words [overflow-wrap:anywhere]">{hostLabel}</span>
                 </div>
               ) : null}
               {deletePath ? (
-                <div className="flex items-start gap-2">
+                <div className="flex min-w-0 items-start gap-2">
                   <span className="font-medium text-foreground/80 shrink-0">{t("sftp.deleteConfirm.path")}:</span>
-                  <span className="break-all">{deletePath}</span>
+                  <span className="min-w-0 break-words [overflow-wrap:anywhere]">{deletePath}</span>
                 </div>
               ) : null}
             </div>
           ) : null}
           {showDeleteList ? (
-            <div className="max-h-32 overflow-auto text-sm space-y-1">
+            <div className="max-h-32 min-w-0 space-y-1 overflow-auto text-sm">
               {deleteListItems.map((name) => (
                 <div
                   key={name}
-                  className="flex items-center gap-2 text-muted-foreground"
+                  className="flex min-w-0 items-center gap-2 text-muted-foreground"
                 >
-                  <Trash2 size={12} />
-                  <span className="truncate">{name}</span>
+                  <Trash2 size={12} className="shrink-0" />
+                  <span className="min-w-0 truncate">{name}</span>
                 </div>
               ))}
             </div>
           ) : null}
+          {deleteError ? (
+            <p className="break-words text-xs text-destructive [overflow-wrap:anywhere]">
+              {deleteError}
+            </p>
+          ) : null}
         </div>
         <DialogFooter>
           <Button
+            type="button"
             variant="outline"
             onClick={() => setShowDeleteConfirm(false)}
+            disabled={isDeleting}
           >
             {t("common.cancel")}
           </Button>
           <Button
             ref={deleteConfirmButtonRef}
+            type="button"
             variant="destructive"
             onClick={handleDelete}
             disabled={isDeleting}
@@ -373,6 +388,7 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
       open={showHostPicker}
       onOpenChange={setShowHostPicker}
       hosts={hosts}
+      connectedHosts={connectedHosts}
       side={side}
       hostSearch={hostSearch}
       onHostSearchChange={setHostSearch}
@@ -383,9 +399,9 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
         const ok = await onDisconnect();
         if (ok) onConnect("local");
       }}
-      onSelectHost={async (host) => {
+      onSelectHost={async (host, options) => {
         const ok = await onDisconnect();
-        if (ok) onConnect(host);
+        if (ok) onConnect(host, options);
       }}
     />
   </>

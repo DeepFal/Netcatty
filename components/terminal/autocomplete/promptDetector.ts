@@ -8,6 +8,8 @@
  */
 
 import type { Terminal as XTerm } from "@xterm/xterm";
+import { isSensitiveTerminalChallenge } from "../../../domain/terminalPromptSecurity";
+import { sliceStringByCellColumns } from "./terminalStringCellWidth";
 import { COMMON_SHELL_COMMANDS, NON_PROMPT_PATTERNS, PROMPT_CHARS } from "./promptDetectorPatterns";
 
 export interface PromptDetectionResult {
@@ -29,10 +31,55 @@ export function isNonPromptLine(lineText: string): boolean {
   return NON_PROMPT_PATTERNS.some((pattern) => pattern.test(lineText));
 }
 
+const PROGRAM_INPUT_LABEL = /^(?=[\p{L}\p{N}])[\p{L}\p{N} ._'()-]{1,60}$/u;
+
+/** Identity prompts this feature targets. A custom PS1 like `dev: ` is not one. */
+const ORDINARY_INPUT_LABEL =
+  /^(?:e-?mail(?: address)?|user(?: ?name| ?id)?|login(?: name)?|(?:full )?name|account(?: name)?|\u90ae\u7bb1|\u7535\u5b50\u90ae\u7bb1|\u7535\u5b50\u90ae\u4ef6|\u7528\u6237\u540d|\u7528\u6237|\u59d3\u540d|\u8d26\u53f7|\u5e10\u6237|\u8d26\u6237|\u767b\u5f55\u540d)$/u;
+
+function colonLabelText(promptText: string): string | null {
+  if (!promptText || promptText.length > 80) return null;
+  if (isSensitiveTerminalChallenge(promptText)) return null;
+  if (/\b(?:secret|passphrase|password|pin)\b/iu.test(promptText)) return null;
+
+  const trimmedEnd = promptText.trimEnd();
+  const marker = trimmedEnd.at(-1);
+  if (marker !== ":" && marker !== "\uFF1A") return null;
+
+  const label = trimmedEnd.slice(0, -1).trim();
+  if (!PROGRAM_INPUT_LABEL.test(label)) return null;
+  if (startsWithCommonShellCommand(label)) return null;
+  return label;
+}
+
+/** Colon label shape, including a custom shell PS1 (`dev: `). */
+function isColonLabelPromptText(promptText: string): boolean {
+  return colonLabelText(promptText) !== null;
+}
+
+/**
+ * A program waiting for ordinary input (`read -p 'Email: '`).
+ * Password, passphrase, PIN, and secret prompts stay closed.
+ * Only the identity-label allowlist matches, so `PS1='dev: '` stays a shell prompt.
+ */
+export function isProgramInputPromptText(promptText: string): boolean {
+  const label = colonLabelText(promptText);
+  if (!label) return false;
+  const normalized = label
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .replace(/^(?:please\s+)?(?:enter|input|type)\s+(?:your\s+)?/u, "")
+    .replace(/^your\s+/u, "")
+    .replace(/^(?:\u8bf7\u8f93\u5165|\u8bf7|\u8f93\u5165)/u, "")
+    .trim();
+  return ORDINARY_INPUT_LABEL.test(normalized);
+}
+
 function isSpecificShellPromptCandidate(
   promptText: string,
   options: { allowGreaterThanTerminator?: boolean } = {},
 ): boolean {
+  if (isProgramInputPromptText(promptText)) return true;
   const trimmed = promptText.trim();
   if (
     !options.allowGreaterThanTerminator &&
@@ -65,6 +112,14 @@ export interface AlignedPromptResult {
    * to record it as the executed command.
    */
   alignedTyped: string | null;
+  /**
+   * When false, `prompt.userInput` was filled from the keystroke buffer
+   * before any shell echo. Empty echo is also what echo-disabled password
+   * prompts look like, so callers must not surface or accept completions
+   * (built-in or external) and must not authorize history recording
+   * (`alignedTyped`). Omitted/true means the live line validated input.
+   */
+  allowExternalProviders?: boolean;
 }
 
 function getCursorLinePrefix(term: XTerm): string | null {
@@ -74,7 +129,8 @@ function getCursorLinePrefix(term: XTerm): string | null {
 
   if (!line) return null;
 
-  return line.translateToString(false).substring(0, Math.max(0, buffer.cursorX));
+  const lineText = line.translateToString(false);
+  return sliceStringByCellColumns(lineText, 0, Math.max(0, buffer.cursorX), term);
 }
 
 function getWrappedCursorPrefix(term: XTerm): string | null {
@@ -103,7 +159,8 @@ function getWrappedCursorPrefix(term: XTerm): string | null {
     prefix += rowLine.translateToString(false);
   }
 
-  return prefix + line.translateToString(false).substring(0, Math.max(0, cursorX));
+  const cursorRowText = line.translateToString(false);
+  return prefix + sliceStringByCellColumns(cursorRowText, 0, Math.max(0, cursorX), term);
 }
 
 function inferPromptTextBeforeTypedInput(
@@ -145,6 +202,9 @@ function inferPromptTextBeforeTypedInput(
     const promptText = cursorPrefix.slice(0, cursorPrefix.length - echoLength);
     if (isLikelyNoSpaceShellPromptText(promptText)) return promptText;
   }
+
+  // `Email: ` with the reply still in the keystroke buffer (echo not painted yet).
+  if (isProgramInputPromptText(cursorPrefix)) return cursorPrefix;
 
   return null;
 }
@@ -376,6 +436,11 @@ function alignTypedInputFromCursorPrefix(
     return null;
   }
 
+  // Program read-prompts are snippet queries only. Do not override a real shell
+  // prompt, and do not authorize Enter history recording.
+  const programInput = isProgramInputPromptText(promptText);
+  if (programInput && raw.isAtPrompt) return null;
+
   return {
     prompt: {
       isAtPrompt: true,
@@ -383,7 +448,7 @@ function alignTypedInputFromCursorPrefix(
       userInput: typedBuffer,
       cursorOffset: typedBuffer.length,
     },
-    alignedTyped: typedBuffer,
+    alignedTyped: programInput ? null : typedBuffer,
   };
 }
 
@@ -391,6 +456,10 @@ function canUseReliablePromptPrefix(
   raw: PromptDetectionResult,
   typedBuffer: string,
 ): boolean {
+  // Empty echo alone is not validation: echo-disabled prompts can look like
+  // a normal shell PS1 (e.g. `read -s -p '$ '`), and treating the keystroke
+  // buffer as alignedTyped would authorize history recording. Pre-echo
+  // autocomplete uses a separate path that keeps alignedTyped null.
   if (!raw.isAtPrompt || typedBuffer.length === 0 || raw.userInput.length === 0) {
     return false;
   }
@@ -411,13 +480,27 @@ function endsWithHostStyleGreaterThanPrompt(promptText: string): boolean {
   return /^[\w.-]+$/.test(promptName) && !isLikelyBareMongoPromptName(promptName);
 }
 
+function endsWithWindowsPathGreaterThanPrompt(promptText: string): boolean {
+  const trimmed = promptText.trimEnd();
+  if (!trimmed.endsWith(">")) return false;
+  const before = trimmed.slice(0, -1).trimEnd();
+  // cmd.exe: `C:\path>` / `C:\>`; PowerShell: `PS C:\path>`
+  if (/^[A-Za-z]:[\\/]/.test(before)) return true;
+  if (/^PS\s+[A-Za-z]:[\\/]/i.test(before)) return true;
+  return false;
+}
+
 function endsWithStandardShellPrompt(promptText: string): boolean {
   const finalChar = promptText.trimEnd().at(-1);
   return finalChar === "$" || finalChar === "#" || finalChar === "%";
 }
 
 function allowsShortPromptEcho(promptText: string): boolean {
-  return endsWithStandardShellPrompt(promptText) || endsWithHostStyleGreaterThanPrompt(promptText);
+  return (
+    endsWithStandardShellPrompt(promptText) ||
+    endsWithHostStyleGreaterThanPrompt(promptText) ||
+    endsWithWindowsPathGreaterThanPrompt(promptText)
+  );
 }
 
 function isReliableTypedPrefix(
@@ -515,34 +598,42 @@ export function detectPrompt(term: XTerm): PromptDetectionResult {
   const lineText = line.translateToString(false);
 
   // Check for non-prompt patterns (pagers, editors, etc.)
-  if (isNonPromptLine(lineText)) return NO_PROMPT;
+  if (isSensitiveTerminalChallenge(lineText) || isNonPromptLine(lineText)) return NO_PROMPT;
   if (line.isWrapped) {
     const wrappedPrefix = getWrappedCursorPrefix(term);
-    if (wrappedPrefix && isNonPromptLine(wrappedPrefix)) return NO_PROMPT;
+    if (wrappedPrefix && (isSensitiveTerminalChallenge(wrappedPrefix) || isNonPromptLine(wrappedPrefix))) {
+      return NO_PROMPT;
+    }
   }
 
   // Empty line
   if (lineText.trim().length === 0) return NO_PROMPT;
 
-  const cursorLinePrefix = lineText.substring(0, Math.max(0, cursorX));
+  // cursorX is a cell column; lineText is characters. Wide glyphs (CJK in a
+  // Windows `C:\Users\用户>` prompt) make substring(cursorX) overshoot into
+  // xterm's empty-cell padding and poison userInput with spaces (#2813 CMD).
+  const cursorLinePrefix = sliceStringByCellColumns(lineText, 0, Math.max(0, cursorX), term);
+  const afterCursor = sliceStringByCellColumns(lineText, Math.max(0, cursorX), undefined, term);
   // Try to find the prompt boundary on the current line. xterm buffer rows are
   // padded with blank cells; when the cursor is at the visible row end, scan
   // only up to the cursor so prompts like "root@host:~#" do not inherit a fake
   // trailing space. If there is command text to the right of the cursor, keep
   // the full line so "$" / ">" inside mid-line edits are validated against
   // their real following character.
-  const promptScanText = lineText.slice(Math.max(0, cursorX)).trim().length > 0
+  const promptScanText = afterCursor.trim().length > 0
     ? lineText
     : cursorLinePrefix;
   const promptEnd = findPromptBoundary(promptScanText);
-  if (promptEnd >= 0) {
+  // Colon read-prompts (`Email: `) stay out of shell prompt detection. Autocomplete
+  // opts in later via alignTypedInputFromCursorPrefix.
+  if (promptEnd >= 0 && !isProgramInputPromptText(lineText.substring(0, promptEnd))) {
     const promptText = lineText.substring(0, promptEnd);
-    // Use cursor position to determine actual input length — don't trim trailing
-    // spaces since they're significant for autocomplete (e.g., "git commit " should
-    // produce an empty trailing token to trigger option suggestions).
-    const rawInput = lineText.substring(promptEnd);
-    const userInput = rawInput.substring(0, Math.max(0, cursorX - promptEnd));
-    const cursorOffset = Math.max(0, cursorX - promptEnd);
+    // Input is whatever sits between the prompt and the cursor on the cell-
+    // accurate prefix — don't use cursorX as a character index.
+    const userInput = cursorLinePrefix.length >= promptEnd
+      ? cursorLinePrefix.substring(promptEnd)
+      : "";
+    const cursorOffset = userInput.length;
 
     return { isAtPrompt: true, promptText, userInput, cursorOffset };
   }
@@ -563,9 +654,9 @@ export function detectPrompt(term: XTerm): PromptDetectionResult {
     const promptLine = buffer.getLine(promptRow);
     if (promptLine) {
       const promptLineText = promptLine.translateToString(false);
-      if (isNonPromptLine(promptLineText)) return NO_PROMPT;
+      if (isSensitiveTerminalChallenge(promptLineText) || isNonPromptLine(promptLineText)) return NO_PROMPT;
       const pEnd = findPromptBoundary(promptLineText);
-      if (pEnd >= 0) {
+      if (pEnd >= 0 && !isProgramInputPromptText(promptLineText.substring(0, pEnd))) {
         const promptText = promptLineText.substring(0, pEnd);
         // Concatenate all rows from promptRow to cursorY to get full input
         let fullInput = promptLineText.substring(pEnd);
@@ -578,7 +669,8 @@ export function detectPrompt(term: XTerm): PromptDetectionResult {
         const charsBeforeCursorRow = (cursorY - promptRow) * totalCols - pEnd;
         const userInput = fullInput.substring(0, charsBeforeCursorRow + cursorX);
         const cursorOffset = userInput.length;
-        if (isNonPromptLine(promptText + userInput)) return NO_PROMPT;
+        if (isSensitiveTerminalChallenge(promptText + userInput)
+          || isNonPromptLine(promptText + userInput)) return NO_PROMPT;
 
         return { isAtPrompt: true, promptText, userInput, cursorOffset };
       }
@@ -780,7 +872,24 @@ function findPromptBoundary(lineText: string): number {
     }
   }
 
-  return lastStandardBoundary >= 0 ? lastStandardBoundary : lastPuaBoundary;
+  if (lastStandardBoundary >= 0) return lastStandardBoundary;
+  if (lastPuaBoundary >= 0) return lastPuaBoundary;
+  return findProgramInputPromptBoundary(lineText);
+}
+
+function findProgramInputPromptBoundary(lineText: string): number {
+  const scanLimit = Math.min(lineText.trimEnd().length, 200);
+  let last = -1;
+  for (let i = 0; i < scanLimit; i++) {
+    const ch = lineText[i];
+    if (ch !== ":" && ch !== "\uFF1A") continue;
+    const next = i + 1 < lineText.length ? lineText[i + 1] : null;
+    if (next !== null && next !== " ") continue;
+    const boundary = next === " " ? i + 2 : i + 1;
+    if (!isColonLabelPromptText(lineText.slice(0, boundary))) continue;
+    last = boundary;
+  }
+  return last;
 }
 
 /**
@@ -903,6 +1012,22 @@ export function getAlignedPrompt(
       return {
         prompt: withTypedUserInput(raw, typedBuffer),
         alignedTyped: typedBuffer,
+      };
+    }
+    // No echo yet (CJK IME / high-latency SSH): surface the keystroke buffer
+    // on prompts detectPrompt already recognizes (#2813), but do not set
+    // alignedTyped. Empty / whitespace-only echo is also what echo-disabled
+    // password prompts and padded themed PS1s look like, so this path must
+    // not authorize history recording, built-in suggestion acceptance, or
+    // third-party completion providers until echo validates the line.
+    if (
+      raw.userInput.trim().length === 0 &&
+      (allowsShortPromptEcho(raw.promptText) || isThemedPromptText(raw.promptText))
+    ) {
+      return {
+        prompt: withTypedUserInput(raw, typedBuffer),
+        alignedTyped: null,
+        allowExternalProviders: false,
       };
     }
   }

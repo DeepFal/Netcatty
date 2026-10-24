@@ -1,5 +1,6 @@
 import {
   CLOUD_SYNC_PAYLOAD_ENTITY_KEYS,
+  withHostsSanitizedForSync,
   type CloudSyncPayloadEntityKey,
   type SyncChangeEntityKey,
   type SyncChangeSummary,
@@ -23,7 +24,10 @@ const OPTIONAL_ENTITY_KEYS = new Set<CloudSyncPayloadEntityKey>([
   'proxyProfiles',
   'snippetPackages',
   'portForwardingRules',
+  'browserBookmarks',
   'groupConfigs',
+  'monitorPanels',
+  'aiSessions',
 ]);
 
 function fingerprint(value: unknown): string {
@@ -69,7 +73,7 @@ function payloadValues(
   if (
     base
     && OPTIONAL_ENTITY_KEYS.has(entityType)
-    && !Object.prototype.hasOwnProperty.call(payload, entityType)
+    && payload[entityType] === undefined
   ) {
     return base[entityType];
   }
@@ -193,7 +197,7 @@ export function summarizeSyncChanges(
   local: SyncPayload,
   remote?: SyncPayload,
 ): SyncChangeSummary {
-  const reference = base ?? {
+  const emptyBase: SyncPayload = {
     hosts: [],
     keys: [],
     identities: [],
@@ -206,6 +210,9 @@ export function summarizeSyncChanges(
     settings: undefined,
     syncedAt: 0,
   };
+  const reference = withHostsSanitizedForSync(base ?? emptyBase);
+  const localPayload = withHostsSanitizedForSync(local);
+  const remotePayload = remote ? withHostsSanitizedForSync(remote) : undefined;
   const summary: SyncChangeSummary = {
     hasLocalChanges: false,
     hasRemoteChanges: false,
@@ -219,11 +226,11 @@ export function summarizeSyncChanges(
       summary,
       entityType,
       reference[entityType],
-      payloadValues(local, entityType, reference),
-      remote ? payloadValues(remote, entityType, reference) : undefined,
+      payloadValues(localPayload, entityType, reference),
+      remotePayload ? payloadValues(remotePayload, entityType, reference) : undefined,
     );
   }
-  recordSettingsChanges(summary, reference, local, remote);
+  recordSettingsChanges(summary, reference, localPayload, remotePayload);
 
   return summary;
 }
@@ -282,10 +289,13 @@ export function withSyncReliabilityMeta(
   const changeSummary = summarizeSyncChanges(base, payload);
   const deletions = mergeDeletionRecords(
     payload,
-    collectSyncDeletions(base, payload, {
-      deletedAt: generatedAt,
-      ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
-    }),
+    [
+      ...(base?.syncMeta?.deletions ?? []),
+      ...collectSyncDeletions(base, payload, {
+        deletedAt: generatedAt,
+        ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
+      }),
+    ],
   );
   const meta: SyncReliabilityMeta = {
     schemaVersion: 1,

@@ -1,13 +1,40 @@
-import type { HotkeyScheme, SessionLogFormat, TerminalSettings } from '../../domain/models';
-import { STORAGE_KEY_TERM_FONT_FAMILY } from '../../infrastructure/config/storageKeys';
-import { isDeprecatedPrimaryFontId } from '../../infrastructure/config/fonts';
+import {
+  DEFAULT_SHIFT_ENTER_NEWLINE_TEXT,
+  isLegacyDefaultShiftEnterNewlineText,
+  type HotkeyScheme,
+  type SessionLogFormat,
+  type TerminalSettings,
+} from '../../domain/models';
+import {
+  STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED,
+  STORAGE_KEY_TERM_FONT_FAMILY,
+  STORAGE_KEY_TERM_SETTINGS,
+  STORAGE_KEY_TERM_SHIFT_ENTER_NEWLINE_MIGRATED,
+} from '../../infrastructure/config/storageKeys';
+import {
+  isDeprecatedPrimaryFontId,
+  TERMINAL_FONT_AUTO,
+} from '../../infrastructure/config/fonts';
 import { DARK_UI_THEMES, LIGHT_UI_THEMES, type UiThemeTokens } from '../../infrastructure/config/uiThemes';
 import { UI_FONTS } from '../../infrastructure/config/uiFonts';
 import { uiFontStore } from './uiFontStore';
 import { localStorageAdapter } from '../../infrastructure/persistence/localStorageAdapter';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
+import { resolveReadableForegroundForHsl } from '../../domain/colorContrast';
 
-export const DEFAULT_THEME: 'light' | 'dark' | 'system' = 'dark';
+export {
+  getContrastRatio,
+  getHslTokenRelativeLuminance,
+  resolveReadableForegroundForHsl,
+} from '../../domain/colorContrast';
+
+export const DEFAULT_THEME: 'light' | 'dark' | 'system' = 'system';
+export const DEFAULT_WINDOW_OPACITY = 1;
+export function clampWindowOpacity(opacity: unknown): number {
+  const value = Number(opacity);
+  if (!Number.isFinite(value)) return DEFAULT_WINDOW_OPACITY;
+  return Math.min(1, Math.max(0.5, value));
+}
 
 /** Resolve the current OS color scheme preference. */
 export const getSystemPreference = (): 'light' | 'dark' =>
@@ -32,16 +59,65 @@ export const DEFAULT_FONT_FAMILY = 'menlo';
  * single point of truth keeps deprecated ids from re-entering state.
  *
  * Returns null when there's nothing to apply (raw is empty); callers
- * fall back to DEFAULT_FONT_FAMILY in that case.
+ * fall back to the TERMINAL_FONT_AUTO sentinel in that case.
  */
 export function migrateIncomingTerminalFontId(raw: string | null | undefined): string | null {
   if (!raw) return null;
   if (isDeprecatedPrimaryFontId(raw)) {
-    localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, DEFAULT_FONT_FAMILY);
-    return DEFAULT_FONT_FAMILY;
+    // Rewrite to the platform-neutral auto sentinel rather than a concrete
+    // id: on Windows/Linux a hard-coded `menlo` would land these upgrade
+    // users right back in the missing-font / cold-start path (#1647), and
+    // syncing a concrete id would leak it across OSes. `auto` resolves to
+    // each device's local default at render time.
+    localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, TERMINAL_FONT_AUTO);
+    return TERMINAL_FONT_AUTO;
   }
   return raw;
 }
+/**
+ * One-time migration for the autoCloseOnExit default flip (tabs now survive
+ * session exits by default; the old default-on silently deleted tabs whenever
+ * a bastion or idle-harvesting server reported a clean exit). Builds before
+ * the flip shipped autoCloseOnExit: true as the default and materialized it
+ * into STORAGE_KEY_TERM_SETTINGS on any settings write, so most upgraders
+ * carry a value they never chose. Leaving it in place would make the new
+ * default unreachable for them. Reset that materialized `true` exactly once
+ * and persist the marker; afterwards every stored value is treated as the
+ * user's own choice and is respected. An inbound cloud or backup payload that
+ * still carries the pre-migration materialized true (no
+ * autoCloseOnExitDefaultMigrated flag) is rewritten to false so sync cannot
+ * resurrect auto-close. The cost: a user who deliberately enabled auto-close
+ * before this release must re-enable it once.
+ */
+export function migrateMaterializedAutoCloseOnExitDefault(): void {
+  if (localStorageAdapter.readBoolean(STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED)) return;
+  const stored = localStorageAdapter.read<Partial<TerminalSettings>>(STORAGE_KEY_TERM_SETTINGS);
+  if (stored?.autoCloseOnExit === true) {
+    localStorageAdapter.write(STORAGE_KEY_TERM_SETTINGS, { ...stored, autoCloseOnExit: false });
+  }
+  localStorageAdapter.writeBoolean(STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED, true);
+}
+
+/**
+ * One-time migration for the Shift+Enter default flip (#3770). Builds before
+ * that change materialized `\\n` into saved settings, so upgraders kept a
+ * bare newline and TUI CLIs still submitted. Rewrite only that old default
+ * (escaped or raw) to ESC+CR, then persist the marker. A later explicit `\\n`
+ * is left alone. Custom text is never rewritten. Sync and import do not
+ * read this marker; an old `\\n` from another device stays as stored.
+ */
+export function migrateMaterializedShiftEnterNewlineDefault(): void {
+  if (localStorageAdapter.readBoolean(STORAGE_KEY_TERM_SHIFT_ENTER_NEWLINE_MIGRATED)) return;
+  const stored = localStorageAdapter.read<Partial<TerminalSettings>>(STORAGE_KEY_TERM_SETTINGS);
+  if (stored && isLegacyDefaultShiftEnterNewlineText(stored.shiftEnterNewlineText)) {
+    localStorageAdapter.write(STORAGE_KEY_TERM_SETTINGS, {
+      ...stored,
+      shiftEnterNewlineText: DEFAULT_SHIFT_ENTER_NEWLINE_TEXT,
+    });
+  }
+  localStorageAdapter.writeBoolean(STORAGE_KEY_TERM_SHIFT_ENTER_NEWLINE_MIGRATED, true);
+}
+
 // Auto-detect default hotkey scheme based on platform
 export const DEFAULT_HOTKEY_SCHEME: HotkeyScheme =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/i.test(navigator.platform)
@@ -52,10 +128,20 @@ export const DEFAULT_SFTP_AUTO_SYNC = false;
 export const DEFAULT_SFTP_SHOW_HIDDEN_FILES = false;
 export const DEFAULT_SFTP_USE_COMPRESSED_UPLOAD = true;
 export const DEFAULT_SFTP_AUTO_OPEN_SIDEBAR = false;
+export const DEFAULT_SFTP_FOLLOW_TERMINAL_CWD = false;
 export const DEFAULT_SFTP_DEFAULT_VIEW_MODE: 'list' | 'tree' = 'list';
 export const DEFAULT_SHOW_RECENT_HOSTS = true;
+export { DEFAULT_HOST_CLICK_BEHAVIOR } from '../../domain/hostClickBehavior';
+export type { HostClickBehavior } from '../../domain/hostClickBehavior';
 export const DEFAULT_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT = false;
 export const DEFAULT_SHOW_SFTP_TAB = true;
+export const DEFAULT_SHOW_HOST_TREE_SIDEBAR = true;
+export const DEFAULT_SHELL_ONLY_TAB_NUMBER_SHORTCUTS = false;
+export const DEFAULT_SHOW_TAB_NUMBER_BADGES = true;
+export const DEFAULT_DISABLE_TERMINAL_FONT_ZOOM = false;
+export { DEFAULT_RESTORE_PREVIOUS_SESSION } from './sessionRestoreSettings';
+export { DEFAULT_STARTUP_LANDING } from '../../domain/startupLanding';
+export type { StartupLanding } from '../../domain/startupLanding';
 
 // Editor defaults
 export const DEFAULT_EDITOR_WORD_WRAP = false;
@@ -63,7 +149,12 @@ export const DEFAULT_EDITOR_WORD_WRAP = false;
 // Session Logs defaults
 export const DEFAULT_SESSION_LOGS_ENABLED = false;
 export const DEFAULT_SESSION_LOGS_FORMAT: SessionLogFormat = 'txt';
+export const DEFAULT_SESSION_LOGS_TIMESTAMPS_ENABLED = false;
 export const DEFAULT_SSH_DEBUG_LOGS_ENABLED = false;
+export const DEFAULT_SSH_DEEP_LINK_ENABLED = true;
+export const DEFAULT_JMS_DEEP_LINK_ENABLED = false;
+/** Windows Explorer context menu; true matches NSIS installer default. */
+export const DEFAULT_EXPLORER_CONTEXT_MENU_ENABLED = true;
 
 export const readStoredString = (key: string): string | null => {
   const raw = localStorageAdapter.readString(key);
@@ -84,6 +175,46 @@ export const isValidTheme = (value: unknown): value is 'light' | 'dark' | 'syste
 export const isValidHslToken = (value: string): boolean => {
   // Expect: "<h> <s>% <l>%", e.g. "221.2 83.2% 53.3%"
   return /^\s*\d+(\.\d+)?\s+\d+(\.\d+)?%\s+\d+(\.\d+)?%\s*$/.test(value);
+};
+
+export const resolveThemeAccentForeground = (
+  tokens: UiThemeTokens,
+  accentMode: 'theme' | 'custom',
+  accentOverride: string,
+): string => {
+  const accentToken = accentMode === 'custom' ? accentOverride : tokens.accent;
+  return resolveReadableForegroundForHsl(accentToken, tokens.primaryForeground);
+};
+
+export const buildAppThemeCssVars = (
+  tokens: UiThemeTokens,
+  accentMode: 'theme' | 'custom',
+  accentOverride: string,
+): Record<string, string> => {
+  const accentToken = accentMode === 'custom' ? accentOverride : tokens.accent;
+  const computedAccentForeground = resolveThemeAccentForeground(tokens, accentMode, accentOverride);
+
+  return {
+    '--background': tokens.background,
+    '--foreground': tokens.foreground,
+    '--card': tokens.card,
+    '--card-foreground': tokens.cardForeground,
+    '--popover': tokens.popover,
+    '--popover-foreground': tokens.popoverForeground,
+    '--primary': accentToken,
+    '--primary-foreground': computedAccentForeground,
+    '--secondary': tokens.secondary,
+    '--secondary-foreground': tokens.secondaryForeground,
+    '--muted': tokens.muted,
+    '--muted-foreground': tokens.mutedForeground,
+    '--accent': accentToken,
+    '--accent-foreground': computedAccentForeground,
+    '--destructive': tokens.destructive,
+    '--destructive-foreground': tokens.destructiveForeground,
+    '--border': tokens.border,
+    '--input': tokens.input,
+    '--ring': accentToken,
+  };
 };
 
 export const isValidUiThemeId = (theme: 'light' | 'dark', value: string): boolean => {
@@ -121,36 +252,12 @@ export const applyThemeTokens = (
   accentOverride: string,
 ) => {
   const root = window.document.documentElement;
-  // If immersive override is active (style tag present), it owns the dark/light class — don't override
-  if (!document.getElementById('netcatty-immersive-override')) {
-    root.classList.remove('light', 'dark');
-    root.classList.add(resolvedTheme);
+  root.classList.remove('light', 'dark');
+  root.classList.add(resolvedTheme);
+  const cssVars = buildAppThemeCssVars(tokens, accentMode, accentOverride);
+  for (const [property, value] of Object.entries(cssVars)) {
+    root.style.setProperty(property, value);
   }
-  root.style.setProperty('--background', tokens.background);
-  root.style.setProperty('--foreground', tokens.foreground);
-  root.style.setProperty('--card', tokens.card);
-  root.style.setProperty('--card-foreground', tokens.cardForeground);
-  root.style.setProperty('--popover', tokens.popover);
-  root.style.setProperty('--popover-foreground', tokens.popoverForeground);
-  const accentToken = accentMode === 'custom' ? accentOverride : tokens.accent;
-  const accentLightness = parseFloat(accentToken.split(/\s+/)[2]?.replace('%', '') || '');
-  const computedAccentForeground = resolvedTheme === 'dark'
-    ? '220 40% 96%'
-    : (!Number.isNaN(accentLightness) && accentLightness < 55 ? '0 0% 98%' : '222 47% 12%');
-
-  root.style.setProperty('--primary', accentToken);
-  root.style.setProperty('--primary-foreground', accentMode === 'custom' ? computedAccentForeground : tokens.primaryForeground);
-  root.style.setProperty('--secondary', tokens.secondary);
-  root.style.setProperty('--secondary-foreground', tokens.secondaryForeground);
-  root.style.setProperty('--muted', tokens.muted);
-  root.style.setProperty('--muted-foreground', tokens.mutedForeground);
-  root.style.setProperty('--accent', accentToken);
-  root.style.setProperty('--accent-foreground', accentMode === 'custom' ? computedAccentForeground : tokens.accentForeground);
-  root.style.setProperty('--destructive', tokens.destructive);
-  root.style.setProperty('--destructive-foreground', tokens.destructiveForeground);
-  root.style.setProperty('--border', tokens.border);
-  root.style.setProperty('--input', tokens.input);
-  root.style.setProperty('--ring', accentToken);
 
   // Sync with native window title bar (Electron)
   netcattyBridge.get()?.setTheme?.(themeSource);

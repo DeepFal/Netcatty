@@ -60,53 +60,66 @@ const renderVault = (sortMode: string | null, hosts: Host[]) => {
   return renderToStaticMarkup(
     React.createElement(
       I18nProvider,
-      { locale: "en" },
-      React.createElement(
-        TooltipProvider,
-        null,
-        React.createElement(VaultView, {
-          hosts,
-          keys: [],
-          identities: [],
-          proxyProfiles: [],
-          snippets: [],
-          snippetPackages: [],
-          customGroups: [],
-          knownHosts: [],
-          shellHistory: [],
-          connectionLogs: [],
-          managedSources: [],
-          sessionCount: 0,
-          hotkeyScheme: "mac",
-          keyBindings: [],
-          terminalThemeId: "default",
-          terminalFontSize: 14,
-          onOpenSettings: noop,
-          onOpenQuickSwitcher: noop,
-          onCreateLocalTerminal: noop,
-          onDeleteHost: noop,
-          onConnect: noop,
-          onUpdateHosts: noop,
-          onUpdateKeys: noop,
-          onImportOrReuseKey: () => fallbackKey,
-          onUpdateIdentities: noop,
-          onUpdateProxyProfiles: noop,
-          onUpdateSnippets: noop,
-          onUpdateSnippetPackages: noop,
-          onUpdateCustomGroups: noop,
-          onUpdateKnownHosts: noop,
-          onUpdateManagedSources: noop,
-          onConvertKnownHost: noop,
-          onToggleConnectionLogSaved: noop,
-          onDeleteConnectionLog: noop,
-          onClearUnsavedConnectionLogs: noop,
-          onOpenLogView: noop,
-          groupConfigs: [],
-          onUpdateGroupConfigs: noop,
-          showRecentHosts: false,
-          showOnlyUngroupedHostsInRoot: false,
-        }),
-      ),
+      {
+        locale: "en",
+        children: React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(VaultView, {
+            hosts,
+            keys: [],
+            identities: [],
+            proxyProfiles: [],
+            snippets: [],
+            snippetPackages: [],
+            customGroups: [],
+            knownHosts: [],
+            managedSources: [],
+            sessionCount: 0,
+            hotkeyScheme: "mac",
+            keyBindings: [],
+            terminalThemeId: "default",
+            terminalFontSize: 14,
+            onOpenSettings: noop,
+            onOpenQuickSwitcher: noop,
+            onCreateLocalTerminal: noop,
+            onDeleteHost: noop,
+            onConnect: noop,
+            onUpdateHosts: noop,
+            onUpdateKeys: noop,
+            onImportOrReuseKey: () => fallbackKey,
+            onUpdateIdentities: noop,
+            onUpdateProxyProfiles: noop,
+            onUpdateSnippets: noop,
+            onUpdateSnippetPackages: noop,
+            onUpdateCustomGroups: noop,
+            onUpdateKnownHosts: noop,
+            onUpdateManagedSources: noop,
+            onReadPersistedHosts: async () => hosts,
+            onReadPersistedManagedSources: () => [],
+            onCommitPluginImporterData: async () => 0,
+            onCommitVaultImportTransaction: async () => ({
+              status: "persisted" as const,
+              groups: [],
+              sources: [],
+              groupConfigs: [],
+            }),
+            onCommitVaultGroupMutation: async (mutate) => mutate({
+              groups: [],
+              configs: [],
+              hosts,
+              managedSources: [],
+              snippets: [],
+            }),
+            onConvertKnownHost: noop,
+            onOpenLogView: noop,
+            groupConfigs: [],
+            onUpdateGroupConfigs: noop,
+            showRecentHosts: false,
+            showOnlyUngroupedHostsInRoot: false,
+          }),
+        ),
+      },
     ),
   );
 };
@@ -134,9 +147,27 @@ test("Hosts grouped sort mode is restored from storage", () => {
 
 test("Hosts sort mode falls back safely when storage contains an invalid value", () => {
   const markup = renderVault("unknown-sort", [
-    host("zulu", "Zulu Host", 2),
-    host("alpha", "Alpha Host", 1),
+    { ...host("zulu", "Zulu Host", 2), order: 1000 },
+    { ...host("alpha", "Alpha Host", 1), order: 2000 },
   ]);
 
-  assert.ok(markup.indexOf("Alpha Host") < markup.indexOf("Zulu Host"));
+  assert.ok(markup.indexOf("Zulu Host") < markup.indexOf("Alpha Host"));
+});
+
+test("Hosts manual sort mode uses saved order", () => {
+  const markup = renderVault("manual", [
+    { ...host("alpha", "Alpha Host", 1), order: 2000 },
+    { ...host("zulu", "Zulu Host", 2), order: 1000 },
+  ]);
+
+  assert.ok(markup.indexOf("Zulu Host") < markup.indexOf("Alpha Host"));
+});
+
+test("Hosts IP sort is restored and compares octets instead of labels", () => {
+  const markup = renderVault("ip", [
+    { ...host("ten", "Alpha Ten", 1), hostname: "10.0.0.10" },
+    { ...host("two", "Zulu Two", 2), hostname: "10.0.0.2" },
+  ]);
+  assert.ok(markup.includes("Zulu Two"));
+  assert.ok(markup.indexOf("Zulu Two") < markup.indexOf("Alpha Ten"));
 });

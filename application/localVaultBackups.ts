@@ -10,6 +10,15 @@ import { getCloudSyncManager } from '../infrastructure/services/CloudSyncManager
 import { netcattyBridge } from '../infrastructure/services/netcattyBridge';
 import { hasMeaningfulSyncData } from './syncPayload';
 
+const BACKUP_APPLY_LOCK = 'netcatty:vault-backup-apply';
+
+export class LocalVaultBackupBusyError extends Error {
+  constructor() {
+    super('Finish restoring or recovering the vault before clearing backups.');
+    this.name = 'LocalVaultBackupBusyError';
+  }
+}
+
 /**
  * Snapshot the current sync data version (the integer that increments
  * on each successful cloud sync). Returns undefined when the value is
@@ -45,6 +54,7 @@ export interface LocalVaultBackupPreview {
     hostCount: number;
     keyCount: number;
     snippetCount: number;
+    noteCount: number;
     identityCount: number;
     portForwardingRuleCount: number;
   };
@@ -83,6 +93,16 @@ export const setLocalVaultBackupMaxCount = (value: number): number => {
 export async function trimLocalVaultBackups(maxCount = getLocalVaultBackupMaxCount()): Promise<void> {
   const bridge = netcattyBridge.get();
   await bridge?.trimVaultBackups?.({ maxCount });
+}
+
+export async function clearLocalVaultBackups(): Promise<void> {
+  const bridge = netcattyBridge.get();
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+  if (!bridge?.clearVaultBackups || !locks) throw new Error('Local backup cleanup is unavailable.');
+  await locks.request(BACKUP_APPLY_LOCK, { mode: 'exclusive', ifAvailable: true }, async (lock) => {
+    if (!lock || readInterruptedVaultApply()) throw new LocalVaultBackupBusyError();
+    await bridge.clearVaultBackups!();
+  });
 }
 
 export async function getLocalVaultBackupCapabilities(): Promise<{
@@ -264,6 +284,15 @@ export async function withRestoreBarrier<T>(
   task: () => Promise<T>,
   holdMs: number = RESTORE_BARRIER_HOLD_MS,
 ): Promise<T> {
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+  // Shared locks allow existing nested restore helpers. Cleanup never queues
+  // an exclusive lock, so a nested helper cannot wait behind its own cleanup.
+  return locks
+    ? locks.request(BACKUP_APPLY_LOCK, { mode: 'shared' }, () => runWithRestoreBarrier(task, holdMs))
+    : runWithRestoreBarrier(task, holdMs);
+}
+
+async function runWithRestoreBarrier<T>(task: () => Promise<T>, holdMs: number): Promise<T> {
   const writeDeadline = () => {
     try {
       localStorageAdapter.writeNumber(
@@ -386,18 +415,35 @@ function writeApplyInProgressSentinel(record: VaultApplyInProgressRecord): void 
  * current vault. Callers pass their own React-closure builder (hosts,
  * keys, port-forwarding rules) because the caller owns that state.
  *
+ * `prepareApply`, when provided, runs while the restore barrier is held but
+ * before the protective backup and apply-in-progress sentinel. It must not
+ * mutate local vault state; it returns the callback that performs the actual
+ * apply. This lets callers validate external state without leaving a false
+ * partial-apply sentinel when validation fails.
+ *
  * `translateProtectiveBackupFailure` converts the
  * `ProtectiveBackupUnavailableError` into a user-visible message in the
  * caller's locale. It runs only on the thrown-and-caught path.
  */
-export function applyProtectedSyncPayload(options: {
-  buildPreApplyPayload: () => SyncPayload;
-  applyPayload: () => void | Promise<void>;
+type ProtectedApplyCallback = () => void | Promise<void>;
+
+export type ApplyProtectedSyncPayloadOptions = {
+  buildPreApplyPayload: () => SyncPayload | Promise<SyncPayload>;
   translateProtectiveBackupFailure: (message: string) => string;
-}): Promise<void> {
-  const { buildPreApplyPayload, applyPayload, translateProtectiveBackupFailure } = options;
+} & (
+  | { applyPayload: ProtectedApplyCallback; prepareApply?: never }
+  | { applyPayload?: never; prepareApply: () => Promise<ProtectedApplyCallback> }
+);
+
+export function applyProtectedSyncPayload(
+  options: ApplyProtectedSyncPayloadOptions,
+): Promise<void> {
+  const { buildPreApplyPayload, translateProtectiveBackupFailure } = options;
   return withRestoreBarrier(async () => {
-    const pre = buildPreApplyPayload();
+    const applyPayload = options.prepareApply
+      ? await options.prepareApply()
+      : options.applyPayload;
+    const pre = await buildPreApplyPayload();
     let protectiveBackupId: string | null = null;
     try {
       const backup = await createRequiredProtectiveLocalVaultBackup(pre);
