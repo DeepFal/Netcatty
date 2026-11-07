@@ -2,14 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import type {
-  AIPanelView,
   AISession,
 } from "../../infrastructure/ai/types.ts";
-import { createEmptyDraft } from "./aiDraftState.ts";
-import {
-  pruneInactiveScopedSessions,
-  pruneInactiveScopedTransientState,
-} from "./aiScopeCleanup.ts";
+import { pruneInactiveScopedSessions } from "./aiScopeCleanup.ts";
 
 function createSession(id: string, scope: AISession["scope"], externalSessionId?: string): AISession {
   return {
@@ -24,48 +19,7 @@ function createSession(id: string, scope: AISession["scope"], externalSessionId?
   };
 }
 
-test("pruneInactiveScopedTransientState removes closed workspace and terminal scope state", () => {
-  const activeSessionIdMap = {
-    "terminal:open-terminal": "session-open",
-    "terminal:closed-terminal": "session-closed-terminal",
-    "workspace:open-workspace": "session-open-workspace",
-    "workspace:closed-workspace": "session-closed-workspace",
-  };
-  const draftsByScope = {
-    "terminal:open-terminal": createEmptyDraft("catty"),
-    "terminal:closed-terminal": createEmptyDraft("catty"),
-    "workspace:open-workspace": createEmptyDraft("catty"),
-    "workspace:closed-workspace": createEmptyDraft("catty"),
-  };
-  const panelViewByScope = {
-    "terminal:open-terminal": { mode: "draft" },
-    "terminal:closed-terminal": { mode: "session", sessionId: "session-closed-terminal" },
-    "workspace:open-workspace": { mode: "draft" },
-    "workspace:closed-workspace": { mode: "session", sessionId: "session-closed-workspace" },
-  } satisfies Record<string, AIPanelView>;
-
-  const next = pruneInactiveScopedTransientState(
-    activeSessionIdMap,
-    draftsByScope,
-    panelViewByScope,
-    new Set(["open-terminal", "open-workspace"]),
-  );
-
-  assert.deepEqual(next.activeSessionIdMap, {
-    "terminal:open-terminal": "session-open",
-    "workspace:open-workspace": "session-open-workspace",
-  });
-  assert.deepEqual(next.draftsByScope, {
-    "terminal:open-terminal": draftsByScope["terminal:open-terminal"],
-    "workspace:open-workspace": draftsByScope["workspace:open-workspace"],
-  });
-  assert.deepEqual(next.panelViewByScope, {
-    "terminal:open-terminal": panelViewByScope["terminal:open-terminal"],
-    "workspace:open-workspace": panelViewByScope["workspace:open-workspace"],
-  });
-});
-
-test("pruneInactiveScopedSessions preserves restorable terminal ACP ids across reconnects", () => {
+test("pruneInactiveScopedSessions reports inactive targets without deleting persisted history", () => {
   const sessions = [
     createSession("terminal-restorable", {
       type: "terminal",
@@ -98,10 +52,32 @@ test("pruneInactiveScopedSessions preserves restorable terminal ACP ids across r
     "terminal-local",
     "workspace-closed",
   ]);
-  assert.deepEqual(next.sessions, [
-    sessions[0],
-    sessions[3],
+  assert.equal(next.sessions, sessions);
+});
+
+test("pruneInactiveScopedSessions preserves inactive workspace and local terminal history after restart", () => {
+  const sessions = [
+    createSession("terminal-local", {
+      type: "terminal",
+      targetId: "closed-local",
+      hostIds: ["local-shell"],
+    }, "ext-local"),
+    createSession("workspace-closed", {
+      type: "workspace",
+      targetId: "closed-workspace",
+    }, "ext-workspace"),
+  ];
+
+  const next = pruneInactiveScopedSessions(
+    sessions,
+    new Set(),
+  );
+
+  assert.deepEqual(next.orphanedSessionIds, [
+    "terminal-local",
+    "workspace-closed",
   ]);
+  assert.equal(next.sessions, sessions);
 });
 
 test("pruneInactiveScopedSessions preserves original sessions when orphaned restorable chats are already detached", () => {
@@ -131,7 +107,7 @@ test("pruneInactiveScopedSessions treats sessions displayed elsewhere as in-use,
   // terminal-restorable's original scope (terminal-closed-A) is gone, but
   // the user resumed it into terminal-open-B from history. The session's
   // externalSessionId must be preserved and it must not appear in the
-  // orphaned list, otherwise the active chat loses ACP continuity.
+  // orphaned list, otherwise the active chat loses external agent continuity.
   const resumedElsewhere = createSession("terminal-restorable", {
     type: "terminal",
     targetId: "terminal-closed-A",

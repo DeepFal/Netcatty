@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { classifyError, sanitizeErrorMessage } from "./errorClassifier.ts";
+import { classifyError, isInvalidAnthropicThinkingSignatureError, isRequestTooLargeError, sanitizeErrorMessage } from "./errorClassifier.ts";
 
 // -------------------------------------------------------------------
 // sanitizeErrorMessage — regression guard for pre-existing behavior
@@ -54,6 +54,81 @@ test("classifyError handles 413 via the message when no statusCode field is set"
   assert.match(info.message, /Request too large/i);
 });
 
+test("isRequestTooLargeError detects structured and textual 413 errors", () => {
+  assert.equal(isRequestTooLargeError(Object.assign(new Error("blocked"), { statusCode: 413 })), true);
+  assert.equal(isRequestTooLargeError("413 Request Entity Too Large"), true);
+  assert.equal(isRequestTooLargeError(new Error("AI_APICallError: 413 payload rejected")), true);
+  assert.equal(isRequestTooLargeError(Object.assign(new Error("bad gateway"), { statusCode: 502 })), false);
+});
+
+test("isRequestTooLargeError detects 413 hidden in an HTML response body", () => {
+  const err = Object.assign(new Error("Failed to parse provider response"), {
+    responseBody: "<html><body><center><h1>413 Request Entity Too Large</h1></center></body></html>",
+  });
+
+  assert.equal(isRequestTooLargeError(err), true);
+});
+
+test("isRequestTooLargeError does not treat timing text as HTTP 413", () => {
+  assert.equal(isRequestTooLargeError("upstream timed out in 413 ms"), false);
+  assert.equal(isRequestTooLargeError("413 ms"), false);
+});
+
+
+// -------------------------------------------------------------------
+// isInvalidAnthropicThinkingSignatureError — #4073 prefix binding
+// -------------------------------------------------------------------
+
+test("isInvalidAnthropicThinkingSignatureError matches Anthropic 400 signature text", () => {
+  const err = Object.assign(
+    new Error("Invalid signature in thinking block. The block is bound to a different conversation."),
+    { statusCode: 400 },
+  );
+  assert.equal(isInvalidAnthropicThinkingSignatureError(err), true);
+});
+
+test("isInvalidAnthropicThinkingSignatureError matches responseBody-only signature errors", () => {
+  const err = Object.assign(new Error("AI_APICallError"), {
+    statusCode: 400,
+    responseBody: JSON.stringify({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: "Invalid signature in thinking block. The block is bound to a different conversation.",
+      },
+    }),
+  });
+  assert.equal(isInvalidAnthropicThinkingSignatureError(err), true);
+});
+
+test("isInvalidAnthropicThinkingSignatureError matches text without statusCode", () => {
+  assert.equal(
+    isInvalidAnthropicThinkingSignatureError(
+      new Error("bound to a different conversation"),
+    ),
+    true,
+  );
+});
+
+test("isInvalidAnthropicThinkingSignatureError rejects unrelated 400s and non-400 signature-ish text", () => {
+  assert.equal(
+    isInvalidAnthropicThinkingSignatureError(
+      Object.assign(new Error("Invalid request: missing field"), { statusCode: 400 }),
+    ),
+    false,
+  );
+  assert.equal(
+    isInvalidAnthropicThinkingSignatureError(
+      Object.assign(
+        new Error("Invalid signature in thinking block. The block is bound to a different conversation."),
+        { statusCode: 500 },
+      ),
+    ),
+    false,
+  );
+  assert.equal(isInvalidAnthropicThinkingSignatureError(new Error("plain failure")), false);
+});
+
 // -------------------------------------------------------------------
 // classifyError — 502 / 503 / 504 upstream gateway
 // -------------------------------------------------------------------
@@ -65,6 +140,14 @@ test("classifyError marks 502/503/504 as network+retryable", () => {
     assert.equal(info.retryable, true, `code ${code} should be retryable`);
     assert.match(info.message, new RegExp(String(code)));
   }
+});
+
+test("classifyError does not treat timing text as a gateway status", () => {
+  const info = classifyError("retry after 502 ms");
+  const leadingInfo = classifyError("502 ms");
+
+  assert.equal(info.type, "unknown");
+  assert.equal(leadingInfo.type, "unknown");
 });
 
 // -------------------------------------------------------------------

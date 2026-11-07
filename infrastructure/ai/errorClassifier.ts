@@ -36,10 +36,16 @@ function extractStatusCode(error: unknown, message: string): number | undefined 
       if (typeof causeStatus === 'number') return causeStatus;
     }
   }
-  // Last resort: look for a standalone 3-digit HTTP status in the message.
-  // Bound by word boundaries to avoid picking up "in 413 ms" etc.
-  const match = message.match(/\b(4\d{2}|5\d{2})\b/);
-  if (match) return Number(match[1]);
+  const statusPatterns = [
+    /\bHTTP\s*(4\d{2}|5\d{2})\b/i,
+    /\bstatus(?:Code)?\s*[:=]?\s*(4\d{2}|5\d{2})\b/i,
+    /\bcode\s*[:=]\s*(4\d{2}|5\d{2})\b/i,
+    /^\s*(4\d{2}|5\d{2})\b(?!\s*ms\b)/i,
+  ];
+  for (const pattern of statusPatterns) {
+    const match = message.match(pattern);
+    if (match) return Number(match[1]);
+  }
   return undefined;
 }
 
@@ -52,6 +58,37 @@ function extractResponseBody(error: unknown): string | undefined {
   const body = (error as Record<string, unknown>).responseBody;
   if (typeof body === 'string') return body;
   return undefined;
+}
+
+export function isRequestTooLargeError(error: unknown): boolean {
+  const message = extractMessage(error).trim();
+  const responseBody = extractResponseBody(error) ?? "";
+  const combined = `${message}\n${responseBody}`;
+  const statusCode = extractStatusCode(error, combined);
+  return (
+    statusCode === 413 ||
+    /\brequest entity too large\b/i.test(combined) ||
+    /\b413\b(?!\s*ms\b).*\b(payload|request|too large|entity)\b/i.test(combined)
+  );
+}
+
+/**
+ * Anthropic preserved-thinking prefix-binding failure (#4073):
+ * "Invalid signature in thinking block. The block is bound to a different conversation."
+ * Triggered when client history mutates an earlier tool_result / drops early turns /
+ * injects a durable summary while still replaying later signed thinking blocks.
+ */
+export function isInvalidAnthropicThinkingSignatureError(error: unknown): boolean {
+  const message = extractMessage(error).trim();
+  const responseBody = extractResponseBody(error) ?? "";
+  const combined = `${message}\n${responseBody}`;
+  const statusCode = extractStatusCode(error, combined);
+  const looksLikeSignature = /Invalid[\s\S]*signature[\s\S]*thinking|bound to a different conversation/i.test(combined);
+  if (!looksLikeSignature) return false;
+  // Prefer structured 400 when present; still match when only the text is available
+  // (some SDK shims omit statusCode and put the body in the message).
+  if (statusCode !== undefined && statusCode !== 400) return false;
+  return true;
 }
 
 function looksLikeHtml(text: string): boolean {
@@ -120,7 +157,7 @@ export function classifyError(error: unknown): ErrorInfo {
 
   const sanitizedRaw = sanitizeErrorMessage(rawMessage);
 
-  if (statusCode === 413 || /\brequest entity too large\b/i.test(rawMessage)) {
+  if (isRequestTooLargeError(error)) {
     return {
       type: 'network',
       message:

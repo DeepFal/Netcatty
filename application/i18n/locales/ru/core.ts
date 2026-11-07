@@ -1,6 +1,44 @@
 import type { Messages } from '../types';
 
 export const ruCoreMessages: Messages = {
+  "settings.plugins.github.install": "Установить из GitHub",
+  "settings.plugins.github.description": "Загрузите опубликованный выпуск .ncpkg и проверьте источник и разрешения.",
+  "settings.plugins.github.repository": "Репозиторий GitHub",
+  "settings.plugins.github.formats": "Поддерживаются https://github.com/owner/repo, github.com/owner/repo и owner/repo.",
+  "settings.plugins.github.busy": "Загрузка, проверка или установка пакета...",
+  "settings.plugins.github.review": "Источник и целостность пакета не подтверждают доверие к издателю. Скрипты сборки не запускаются. Плагин устанавливается выключенным; проверьте разрешения перед включением.",
+  "settings.plugins.github.accept": "Я доверяю этому репозиторию и проверил заявленные разрешения.",
+  "settings.plugins.github.confirm": "Установить выключенным",
+  "settings.plugins.github.download": "Загрузить и проверить",
+  "settings.plugins.github.error.invalidRepository": "Введите https://github.com/owner/repo, github.com/owner/repo или owner/repo. Укажите только репозиторий, без учётных данных, параметров, фрагментов и дополнительных путей.",
+  "settings.plugins.github.error.unavailable": "Установка плагинов из GitHub недоступна в этом сеансе.",
+  "settings.plugins.github.error.reviewFirst": "Сначала загрузите и проверьте плагин из GitHub.",
+  "settings.plugins.github.error.network": "Не удалось подключиться к GitHub. Проверьте соединение и повторите попытку.",
+  "settings.plugins.github.error.timeout": "Время ожидания загрузки из GitHub истекло. Повторите попытку.",
+  "settings.plugins.github.error.rateLimit": "Достигнут лимит запросов API GitHub. Повторите попытку позже.",
+  "settings.plugins.github.error.notFound": "Репозиторий или файл GitHub не найден. Поддерживаются только доступные публичные репозитории; импортируйте приватные пакеты из локального файла.",
+  "settings.plugins.github.error.accessDenied": "GitHub отказал в доступе. Приватные репозитории и вход в аккаунт не поддерживаются.",
+  "settings.plugins.github.error.http": "Ошибка загрузки из GitHub (HTTP {status}). Повторите попытку позже.",
+  "settings.plugins.github.error.moved": "Репозиторий GitHub перемещён. Введите его текущий адрес.",
+  "settings.plugins.github.error.redirect": "Не удалось проверить перенаправление загрузки GitHub. Загрузите доверенный пакет .ncpkg и импортируйте его из локального файла.",
+  "settings.plugins.github.error.noRelease": "В репозитории нет опубликованного стабильного выпуска. Попросите автора опубликовать выпуск с файлом .ncpkg или импортируйте готовый пакет из локального файла.",
+  "settings.plugins.github.error.noAsset": "В выпуске нет файла .ncpkg. Попросите автора собрать и прикрепить его; Netcatty не собирает репозитории исходного кода.",
+  "settings.plugins.github.error.multipleAssets": "В выпуске несколько файлов .ncpkg. Загрузите нужный пакет и импортируйте его из локального файла.",
+  "settings.plugins.github.error.metadata": "Некорректные метаданные выпуска GitHub. Попросите автора проверить выпуск, тег и файл .ncpkg.",
+  "settings.plugins.github.error.identity": "Пакет не соответствует выбранному репозиторию и выпуску GitHub. Установка остановлена.",
+  "settings.plugins.github.error.commit": "У тега выпуска нет доступного коммита. Попросите автора исправить тег.",
+  "settings.plugins.github.error.size": "Размер пакета GitHub некорректен или превышает лимит загрузки.",
+  "settings.plugins.github.error.integrity": "Загруженный пакет не прошёл проверку размера или SHA-256. Загрузите и проверьте его снова.",
+  "settings.plugins.github.error.package": "GitHub не вернул корректный ZIP-пакет .ncpkg или метаданные выпуска. Попросите автора проверить файл выпуска.",
+  "settings.plugins.github.error.busy": "Операция с плагином GitHub уже выполняется. Закройте предпросмотр и повторите попытку.",
+  "settings.plugins.github.error.expired": "Предпросмотр пакета GitHub устарел. Загрузите и проверьте его снова.",
+  "settings.plugins.github.error.advanced": "Для этого пакета нужен расширенный режим разработчика. Обычный менеджер принимает только браузерные пакеты.",
+  "settings.plugins.github.error.incompatible": "Плагин несовместим с этой версией Netcatty. Уточните технические подробности у автора.",
+  "settings.plugins.github.error.source": "Плагин уже привязан к другому источнику. Перед сменой источника удалите плагин и явно очистите данные прежнего источника.",
+  "settings.plugins.github.error.failed": "Не удалось проверить или установить плагин. Изучите технические подробности перед повторной попыткой.",
+  "settings.plugins.github.error.details": "Технические подробности",
+
+
   // Common
   'common.save': 'Сохранить',
   'common.cancel': 'Отмена',
@@ -40,13 +78,22 @@ export const ruCoreMessages: Messages = {
   'common.left': 'Слева',
   'common.right': 'Справа',
   'common.more': 'Ещё',
+  'toolbar.layout.customize': 'Настроить панель',
+  'toolbar.layout.show': 'Показать',
+  'toolbar.layout.collapse': 'Свернуть',
+  'toolbar.layout.hide': 'Скрыть',
+  'toolbar.layout.moveEarlier': 'Переместить раньше',
+  'toolbar.layout.moveLater': 'Переместить позже',
+  'toolbar.layout.reset': 'Сбросить по умолчанию',
   'common.selectAHost': 'Выберите хост',
   'common.selectAHostPlaceholder': 'Выберите хост...',
+  'sort.manual': 'Ручной порядок',
   'sort.az': 'А-Я',
   'sort.za': 'Я-А',
   'sort.newest': 'Сначала новые',
   'sort.oldest': 'Сначала старые',
   'sort.group': 'По группе',
+  'sort.ip': 'По IP',
   'field.label': 'Метка',
   'field.type': 'Тип',
   'auth.keyType': 'Тип {type}',
@@ -68,11 +115,37 @@ export const ruCoreMessages: Messages = {
   'field.selectHosts': 'Выбрать хосты',
   'placeholder.workspaceName': 'Имя рабочего пространства',
   'placeholder.sessionName': 'Имя сессии',
-  'placeholder.searchHosts': 'Поиск хостов...',
+  'placeholder.searchHosts': 'Поиск хостов или тегов...',
   'toast.settingsUnavailable': 'Окно настроек недоступно на этой платформе.',
   'credentials.protectionUnavailable.title': 'Защита учётных данных недоступна',
   'credentials.protectionUnavailable.message': 'Сохранённые пароли и ключи не могут быть автоматически расшифрованы на этом устройстве. Перед подключением введите учётные данные заново.',
   'credentials.protectionUnavailable.action': 'Открыть настройки',
+
+  // App Lock
+  'appLock.title': 'Netcatty заблокирован',
+  'appLock.reason.default': 'Введите пароль блокировки, чтобы продолжить.',
+  'appLock.reason.startup': 'Netcatty блокируется при каждом открытии этого окна.',
+  'appLock.reason.idle': 'Netcatty заблокирован после периода бездействия.',
+  'appLock.reason.manual': 'Netcatty был заблокирован вручную.',
+  'appLock.passwordLabel': 'Пароль блокировки',
+  'appLock.passwordPlaceholder': 'Введите пароль для разблокировки',
+  'appLock.unlock': 'Разблокировать',
+  'appLock.unlocking': 'Разблокировка...',
+  'appLock.usePassword': 'Использовать пароль',
+  'appLock.error.emptyPassword': 'Введите пароль блокировки.',
+  'appLock.error.incorrectPassword': 'Неверный пароль блокировки.',
+  'appLock.systemUnlock.unlockWith': 'Разблокировать через {label}',
+  'appLock.systemUnlock.preparing': 'Подготовка {label}...',
+  'appLock.systemUnlock.verifying': 'Ожидание {label}...',
+  'appLock.systemUnlock.error': 'Системная разблокировка не завершена. Используйте пароль блокировки, чтобы продолжить.',
+  'appLock.logoLabel': 'Netcatty',
+  'appLock.reset.title': 'Сбросить блокировку',
+  'appLock.reset.description': 'Это удалит текущий пароль блокировки и отключит App Lock. Новый пароль можно создать позже в настройках.',
+  'appLock.reset.cancel': 'Отмена',
+  'appLock.reset.confirm': 'Сбросить App Lock',
+  'appLock.reset.resetting': 'Сброс...',
+  'appLock.reset.error': 'Не удалось сбросить App Lock. Попробуйте ещё раз.',
+  'topTabs.lockApp': 'Заблокировать Netcatty',
 
   // Settings shell
   'settings.title': 'Настройки',
@@ -80,8 +153,12 @@ export const ruCoreMessages: Messages = {
   'settings.tab.appearance': 'Внешний вид',
   'settings.tab.terminal': 'Терминал',
   'settings.tab.shortcuts': 'Горячие клавиши',
+  'settings.tab.ai': 'AI',
   'settings.tab.syncCloud': 'Синхронизация и облако',
   'settings.tab.system': 'Система',
+  'settings.search.open': 'Поиск настроек',
+  'settings.search.placeholder': 'Искать настройки…',
+  'settings.search.noResults': 'Совпадений не найдено',
 
   // Settings > System
   'settings.system.title': 'Система',
@@ -95,7 +172,12 @@ export const ruCoreMessages: Messages = {
   'settings.system.clearTempFiles': 'Очистить временные файлы',
   'settings.system.clearing': 'Очистка...',
   'settings.system.clearResult': 'Удалено файлов: {deleted}, ошибок: {failed}.',
-  'settings.system.tempDirectoryHint': 'Временные файлы создаются при открытии удалённых файлов во внешних приложениях. Они автоматически очищаются при закрытии SFTP-сессий.',
+  'settings.system.tempDirChoose': 'Выбрать папку',
+  'settings.system.tempDirManual': 'Введите абсолютный путь к папке',
+  'settings.system.tempDirApply': 'Применить',
+  'settings.system.tempDirReset': 'Сбросить по умолчанию',
+  'settings.system.tempDirError': 'Не удалось использовать эту папку.',
+  'settings.system.tempDirectoryHint': 'Используется для промежуточного хранения SFTP-передач и файлов, открытых во внешних приложениях. Смена папки во время передачи может повлиять на эту передачу.',
   'settings.system.credentials.title': 'Защита учётных данных',
   'settings.system.credentials.status': 'Статус',
   'settings.system.credentials.checking': 'Проверка...',
@@ -104,6 +186,80 @@ export const ruCoreMessages: Messages = {
   'settings.system.credentials.unknown': 'Неизвестно (не поддерживается в этой среде)',
   'settings.system.credentials.unavailableHint': 'Учётные данные, зашифрованные в другом профиле пользователя или на другой машине, здесь расшифровать нельзя. Повторно введите и сохраните их на этом устройстве.',
   'settings.system.credentials.portabilityHint': 'Облачная синхронизация переносима, потому что использует шифрование вашим мастер-ключом. Локальное шифрование safeStorage привязано к устройству и пользователю.',
+
+  // Settings > System > App Lock
+  'settings.appLock.title': 'Блокировка приложения',
+  'settings.appLock.description': 'Требовать локальный пароль блокировки при открытии Netcatty, после бездействия или при ручной блокировке.',
+  'settings.appLock.setupTitle': 'Задайте пароль блокировки',
+  'settings.appLock.setupDescription': 'Создайте пароль ниже. Блокировка приложения включится сразу после сохранения.',
+  'settings.appLock.manageTitle': 'Блокировка приложения готова',
+  'settings.appLock.enabledStatus': 'Включена. Netcatty блокируется при запуске, после бездействия и при ручной блокировке.',
+  'settings.appLock.disabledStatus': 'Пароль сохранён, но блокировка приложения сейчас выключена.',
+  'settings.appLock.disableTitle': 'Отключить блокировку приложения',
+  'settings.appLock.disableDescription': 'Введите текущий пароль блокировки, чтобы Netcatty перестал блокироваться. Сохранённый пароль будет удалён; для повторного включения нужно создать новый.',
+  'settings.appLock.disable': 'Отключить блокировку',
+  'settings.appLock.disabling': 'Отключение...',
+  'settings.appLock.setupPasswordTitle': 'Создайте пароль блокировки',
+  'settings.appLock.setupPasswordDescription': 'Этот пароль нужен для разблокировки Netcatty, а также для изменения или отключения блокировки позже.',
+  'settings.appLock.changePasswordTitle': 'Изменить пароль блокировки',
+  'settings.appLock.changePasswordDescription': 'Введите текущий пароль блокировки, затем выберите новый.',
+  'settings.appLock.enable': 'Включить блокировку приложения',
+  'settings.appLock.enableDesc': 'Блокировать при запуске и после выбранного периода бездействия.',
+  'settings.appLock.timeout': 'Тайм-аут бездействия',
+  'settings.appLock.timeoutDesc': 'Блокировать после бездействия или при закрытии в трей. «Никогда» отключает оба варианта.',
+  'settings.appLock.timeout.0': 'Не блокировать автоматически',
+  'settings.appLock.timeout.1': '1 минута',
+  'settings.appLock.timeout.5': '5 минут',
+  'settings.appLock.timeout.15': '15 минут',
+  'settings.appLock.timeout.30': '30 минут',
+  'settings.appLock.timeout.60': '60 минут',
+  'settings.appLock.systemUnlock.label': 'Разблокировка через {label}',
+  'settings.appLock.systemUnlock.desc': 'Используйте {label} как альтернативный способ разблокировать Netcatty на этом устройстве.',
+  'settings.appLock.systemUnlock.unavailableDesc': '{label} сейчас недоступен на этом устройстве.',
+  'settings.appLock.systemUnlock.unavailable': 'Системная разблокировка недоступна на этом устройстве.',
+  'settings.appLock.systemUnlock.locked': 'Разблокируйте Netcatty перед изменением системной разблокировки.',
+  'settings.appLock.systemUnlock.autoPrompt.label': 'Открывать {label} автоматически',
+  'settings.appLock.systemUnlock.autoPrompt.desc': 'Автоматически показывать запрос {label}, когда Netcatty ожидает разблокировки.',
+  'settings.appLock.currentPassword': 'Текущий пароль',
+  'settings.appLock.currentPasswordPlaceholder': 'Нужен для отключения или замены',
+  'settings.appLock.currentPasswordForDisablePlaceholder': 'Текущий пароль для отключения блокировки',
+  'settings.appLock.currentPasswordForChangePlaceholder': 'Текущий пароль для изменения',
+  'settings.appLock.newPassword': 'Новый пароль',
+  'settings.appLock.newPasswordPlaceholder': 'Задайте пароль блокировки',
+  'settings.appLock.confirmPassword': 'Подтвердите пароль',
+  'settings.appLock.confirmPasswordPlaceholder': 'Повторите пароль',
+  'settings.appLock.savePassword': 'Задать и включить',
+  'settings.appLock.savingPassword': 'Сохранение...',
+  'settings.appLock.passwordSet': 'Пароль настроен',
+  'settings.appLock.replacePassword': 'Заменить пароль',
+  'settings.appLock.enableAfterPassword': 'Задайте пароль блокировки перед включением.',
+  'settings.appLock.localOnlyHint': 'Локальная приватная блокировка. Она не синхронизируется и не является системной границей безопасности.',
+  'settings.appLock.validation.currentRequired': 'Введите текущий пароль блокировки.',
+  'settings.appLock.validation.newRequired': 'Введите новый пароль блокировки.',
+  'settings.appLock.validation.confirmRequired': 'Подтвердите новый пароль блокировки.',
+  'settings.appLock.validation.mismatch': 'Новые пароли не совпадают.',
+  'settings.appLock.validation.incorrect': 'Текущий пароль блокировки неверен.',
+
+  // Settings > System > Auto Launch
+  'settings.autoLaunch.title': 'Запуск при входе в систему',
+  'settings.autoLaunch.enabled': 'Запускать при старте системы',
+  'settings.autoLaunch.enabledDesc': 'Автоматически запускать Netcatty при входе в систему, свернутым в системный трей.',
+  'settings.autoLaunch.unsupportedDesc': 'Недоступно на этой платформе или в сборке для разработки.',
+
+  // Settings > System > Network Proxy
+  'settings.system.networkProxy.title': 'Сетевой прокси',
+  'settings.system.networkProxy.description': 'HTTP(S)-прокси для облачной синхронизации и AI-провайдеров. Не связан с SSH ProxyJump / ProxyCommand.',
+  'settings.system.networkProxy.mode': 'Режим прокси',
+  'settings.system.networkProxy.mode.system': 'Системный прокси',
+  'settings.system.networkProxy.mode.direct': 'Напрямую (без прокси)',
+  'settings.system.networkProxy.mode.custom': 'Свой прокси',
+  'settings.system.networkProxy.url': 'URL прокси',
+  'settings.system.networkProxy.url.placeholder': 'http://127.0.0.1:7890',
+  'settings.system.networkProxy.url.desc': 'Поддерживаются URL вида http://, https:// и socks5:// host:port. Учётные данные в URL прокси не поддерживаются.',
+  'settings.system.networkProxy.bypass': 'Список исключений',
+  'settings.system.networkProxy.bypass.placeholder': '<local>,localhost,127.0.0.1',
+  'settings.system.networkProxy.bypass.desc': 'Хосты через запятую, для которых прокси не используется. <local> — localhost и локальные имена.',
+  'settings.system.networkProxy.hint': 'Влияет на вход в Google Drive / OneDrive / GitHub sync и запросы к AI-провайдерам. SSH-подключения не меняет.',
 
   // Settings > System > Crash Logs
   'settings.system.crashLogs.title': 'Журналы сбоев',
@@ -159,7 +315,12 @@ export const ruCoreMessages: Messages = {
   'settings.sessionLogs.formatTxt': 'Обычный текст (.txt)',
   'settings.sessionLogs.formatRaw': 'Сырые данные с ANSI (.log)',
   'settings.sessionLogs.formatHtml': 'HTML (.html)',
+  'settings.sessionLogs.timestamps': 'Добавлять метки времени',
+  'settings.sessionLogs.timestampsDesc': 'Добавлять локальное время в начало каждой строки в текстовых и HTML-журналах.',
   'settings.sessionLogs.hint': 'Журналы сессий сохраняют весь вывод терминала для диагностики и аудита.',
+  'settings.sessionLogs.clearAll': 'Очистить все журналы',
+  'settings.sessionLogs.clearAllDesc': 'Удалить все сохранённые файлы журналов сессий и вложенные папки хостов из папки сохранения.',
+  'settings.sessionLogs.clearConfirm': 'Это приведёт к безвозвратному удалению всех файлов журналов сессий в папке сохранения. Это действие нельзя отменить. Продолжить?',
 
   // Settings > SSH Debug Logs
   'settings.sshDebugLogs.title': 'Отладочные журналы SSH',
@@ -178,8 +339,11 @@ export const ruCoreMessages: Messages = {
   'settings.globalHotkey.toggleWindowDesc': 'Нажмите сочетание клавиш, чтобы задать глобальную горячую клавишу для показа или скрытия окна.',
   'settings.globalHotkey.notSet': 'Не задано',
   'settings.globalHotkey.reset': 'Сбросить по умолчанию',
-  'settings.globalHotkey.closeToTray': 'Сворачивать в системный трей',
-  'settings.globalHotkey.closeToTrayDesc': 'Если включено, при закрытии окно будет сворачиваться в системный трей вместо выхода из приложения.',
+  'settings.globalHotkey.closeToTray': 'Оставлять приложение в фоне при закрытии окна',
+  'settings.globalHotkey.closeToTrayDesc': 'При закрытии окно скрывается, а приложение продолжает работать. Отображение значка в трее настраивается отдельно.',
+  'settings.globalHotkey.showTrayIcon': 'Показывать значок в системном трее',
+  'settings.globalHotkey.showTrayIconDesc': 'Если отключено, значок в трее скрыт, но приложение продолжает работать в фоне.',
+  'settings.globalHotkey.showTrayIconHiddenHint': 'Значок в трее скрыт. Запустите приложение снова или используйте глобальную горячую клавишу, чтобы вернуть окно, затем снова включите этот параметр, чтобы восстановить значок.',
   'settings.globalHotkey.enabled': 'Включить глобальную горячую клавишу',
   'settings.globalHotkey.enabledDesc': 'Регистрировать системные сочетания клавиш. Когда отключено, все глобальные горячие клавиши снимаются с регистрации.',
   'settings.globalHotkey.hint': 'Глобальная горячая клавиша работает на уровне всей системы и позволяет быстро показывать или скрывать окно (терминал в стиле Quake).',
@@ -194,10 +358,12 @@ export const ruCoreMessages: Messages = {
   'tray.status.active': 'Активно',
   'tray.status.inactive': 'Неактивно',
   'tray.status.error': 'Ошибка',
+  'tray.status.unknown': 'Неизвестно',
   'tray.recentHosts': 'Недавние хосты',
   'tray.empty.title': 'Пока здесь ничего нет',
   'tray.empty.subtitle': 'Подключитесь к серверу, они по вам скучают 🚀',
   'tray.quit': 'Выйти из Netcatty',
+  'tray.closeSession': 'Закрыть сессию',
 
   // Vault Sidebar
   'vault.sidebar.collapse': 'Свернуть боковую панель',
@@ -219,10 +385,22 @@ export const ruCoreMessages: Messages = {
   'settings.vault.title': 'Хранилище',
   'settings.vault.showRecentHosts': 'Показывать недавно подключённые хосты',
   'settings.vault.showRecentHostsDesc': 'Показывать раздел недавно подключённых хостов в верхней части хранилища',
+  'settings.vault.selectBeforeConnect': 'Сначала выбрать, потом подключать',
+  'settings.vault.selectBeforeConnectDesc': 'Один клик выбирает хост (акцентная рамка в сетке), повторный клик подключает. Группы работают так же. По умолчанию — подключение одним кликом.',
   'settings.vault.showOnlyUngroupedHostsInRoot': 'Показывать в корне только хосты без группы',
   'settings.vault.showOnlyUngroupedHostsInRootDesc': 'Если включено, в корневом списке хостов будут показаны только хосты без группы. Откройте группу на боковой панели, чтобы увидеть сгруппированные хосты.',
   'settings.vault.showSftpTab': 'Показывать вкладку SFTP',
   'settings.vault.showSftpTabDesc': 'Показывать отдельный SFTP-вид в верхней панели вкладок. Если скрыто, используйте боковую панель SFTP внутри сессии.',
+  'settings.vault.showHostTreeSidebar': 'Показывать боковую панель хостов',
+  'settings.vault.showHostTreeSidebarDesc': 'Показывать список хостов и кнопку в верхней панели для вкладок терминала и редактора.',
+  'settings.vault.autoImportSystemKnownHosts': 'Автоимпорт системного known_hosts',
+  'settings.vault.autoImportSystemKnownHostsDesc': 'При открытии хранилища тихо импортировать записи из OpenSSH known_hosts. Отключите, чтобы держать известные хосты Netcatty отдельно; кнопка «Сканировать систему» по-прежнему импортирует вручную.',
+  'settings.vault.notesFont': 'Шрифт кода',
+  'settings.vault.notesFontDesc': 'Шрифт для блоков кода и встроенного кода в заметках',
+  'settings.vault.notesFontSize': 'Размер шрифта заметок',
+  'settings.vault.notesFontSizeDesc': 'Размер шрифта для основного текста заметок',
+  'settings.vault.notesCodeFontSize': 'Размер шрифта кода',
+  'settings.vault.notesCodeFontSizeDesc': 'Размер шрифта для блоков кода и встроенного кода в заметках',
 
   // Update notifications
   'update.available.title': 'Доступно обновление',
@@ -262,14 +440,153 @@ export const ruCoreMessages: Messages = {
   'settings.appearance.themeColor.dark': 'Палитра тёмной темы',
   'settings.appearance.customCss': 'Пользовательский CSS',
   'settings.appearance.customCss.desc':
-    'Добавьте пользовательский CSS, чтобы настроить внешний вид приложения. Изменения применяются сразу. Основные области интерфейса имеют атрибут [data-section="..."], который можно использовать для выбора элементов, например: snippets-panel, host-details-panel, group-details-panel, serial-host-details-panel, ai-chat-panel, vault-sidebar, vault-main, vault-hosts-header, vault-host-list, vault-view, terminal-workspace, terminal-workspace-sidebar, top-tabs.',
+    'Добавьте пользовательский CSS, чтобы настроить внешний вид. Изменения применяются сразу. Выбранные верхние вкладки (`.top-tab[data-active="true"]`) читают `--top-tab-active-bg`, `--top-tab-active-fg` и `--top-tab-active-border`. Не задавайте их, чтобы сохранить текущий вид.',
+  'settings.appearance.customCss.help.ariaLabel': 'Справка по пользовательскому CSS',
+  'settings.appearance.customCss.help.title': 'Руководство по пользовательскому CSS',
+  'settings.appearance.customCss.help.body': `Основные области интерфейса помечены атрибутом \`data-section\` для CSS-селекторов. Изменения применяются сразу после правки.
+
+### Как выбирать элементы
+
+Используйте селекторы по атрибуту:
+
+\`\`\`css
+[data-section="terminal-side-panel"] {
+  border: 2px solid #00c851 !important;
+  border-radius: 6px !important;
+}
+\`\`\`
+
+У некоторых строк и панелей также есть хуки состояния вроде \`[data-selected="true"]\` и \`[data-focused="true"]\`.
+
+Из‑за высокой специфичности утилит Tailwind часто требуется \`!important\`.
+
+### Верхние вкладки
+
+- \`top-tabs\`
+- \`top-tabs-host-tree-toggle\`
+- \`top-tabs-quick-switcher-toggle\`
+
+У выбранных верхних вкладок есть класс \`top-tab\` и атрибут \`data-active="true"\`. Задайте эти переменные, чтобы перекрасить выбранную вкладку. Не задавайте их, чтобы сохранить текущий вид. \`!important\` не нужен.
+
+- \`--top-tab-active-bg\` — заливка выбранной вкладки (по умолчанию текущий фон вкладки)
+- \`--top-tab-active-fg\` — цвет подписи (по умолчанию текущий цвет текста)
+- \`--top-tab-active-border\` — внутренняя обводка 1px (по умолчанию прозрачная, то есть без рамки)
+
+Вкладка Vaults остаётся плоской и не использует заливку.
+
+\`\`\`css
+.top-tab[data-active="true"] {
+  --top-tab-active-bg: #2563eb;
+  --top-tab-active-fg: #ffffff;
+  --top-tab-active-border: #1d4ed8;
+}
+\`\`\`
+
+### Хранилище
+
+- \`vault-view\`
+- \`vault-sidebar\`
+- \`vault-main\`
+- \`vault-hosts-header\`
+- \`vault-host-list\`
+
+### Рабочая область терминала
+
+- \`terminal-workspace\`
+- \`terminal-workspace-sidebar\` — список терминалов в режиме Focus
+- \`terminal-host-tree-sidebar\`
+- \`terminal-host-tree-sidebar-content\`
+- \`terminal-host-tree-sidebar-row\`
+- \`terminal-split-pane\`
+- \`terminal-split-resizer\`
+
+### Боковая панель терминала
+
+- \`terminal-side-panel\` — панель SFTP / скриптов / темы / AI (только пока открыта)
+- \`terminal-side-panel-tabs\`
+- \`terminal-side-panel-content\`
+
+### SFTP
+
+- \`terminal-sftp-panel\`
+- \`terminal-sftp-host-header\`
+- \`terminal-sftp-pane\`
+- \`terminal-sftp-toolbar\`
+- \`terminal-sftp-path\`
+- \`terminal-sftp-filter-bar\`
+- \`terminal-sftp-list\`
+- \`terminal-sftp-list-header\`
+- \`terminal-sftp-list-row\`
+- \`terminal-sftp-tree\`
+- \`terminal-sftp-tree-row\`
+- \`terminal-sftp-transfer-queue\`
+- \`terminal-sftp-transfer-row\`
+
+### Панели деталей / инструментов
+
+- \`snippets-panel\`
+- \`host-details-panel\`
+- \`group-details-panel\`
+- \`serial-host-details-panel\`
+- \`ai-chat-panel\`
+
+### Примеры
+
+Скрыть переключатель списка хостов в верхней панели вкладок:
+
+\`\`\`css
+[data-section="top-tabs-host-tree-toggle"] {
+  width: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+\`\`\`
+
+Стилизовать выбранные строки SFTP:
+
+\`\`\`css
+[data-section="terminal-sftp-list-row"][data-selected="true"] {
+  background-color: #00c851 !important;
+  color: #001b10 !important;
+}
+\`\`\`
+
+Подсветить активную панель сплита:
+
+\`\`\`css
+[data-section="terminal-split-pane"][data-focused="true"] {
+  outline: 2px solid hsl(var(--primary)) !important;
+  outline-offset: -2px;
+}
+\`\`\`
+`,
   'settings.appearance.customCss.placeholder':
-    '/* Примеры — используйте !important, чтобы переопределить специфичность утилит Tailwind */\n\n/* Сделать текст в боковой панели сниппетов крупнее */\n[data-section="snippets-panel"] {\n  font-size: 14px !important;\n}\n\n/* Пользовательский фон терминала */\n.terminal { background: #1a1a2e !important; }\n\n/* Настройка глобального радиуса скругления */\n:root { --radius: 0.25rem; }',
+    '/* Примеры — используйте !important, чтобы переопределить специфичность утилит Tailwind */\n\n/* Выбранная верхняя вкладка. Не задавайте переменные, чтобы сохранить текущий вид. */\n.top-tab[data-active="true"] {\n  --top-tab-active-bg: #2563eb;\n  --top-tab-active-fg: #ffffff;\n  --top-tab-active-border: #1d4ed8;\n}\n\n/* Скрыть переключатель списка хостов в верхней панели вкладок */\n[data-section="top-tabs-host-tree-toggle"] {\n  width: 0 !important;\n  opacity: 0 !important;\n  pointer-events: none !important;\n}\n\n/* Скрыть кнопку плюса, открывающую быстрый переключатель */\n[data-section="top-tabs-quick-switcher-toggle"] {\n  display: none !important;\n}\n\n/* Рамка вокруг боковой панели SFTP (не остаётся после закрытия) */\n[data-section="terminal-side-panel"] {\n  border: 2px solid #00c851 !important;\n  border-radius: 6px !important;\n}\n\n/* Изменить фон всей боковой панели, а не только верхних вкладок */\n[data-section="terminal-side-panel"],\n[data-section="terminal-side-panel-tabs"],\n[data-section="terminal-side-panel-content"],\n[data-section="terminal-sftp-panel"],\n[data-section="terminal-sftp-pane"],\n[data-section="terminal-sftp-list"],\n[data-section="terminal-sftp-tree"],\n[data-section="terminal-sftp-transfer-queue"] {\n  background-color: #1c384a !important;\n}\n\n/* Настроить выбранные строки SFTP */\n[data-section="terminal-sftp-list-row"][data-selected="true"] {\n  background-color: #00c851 !important;\n  color: #001b10 !important;\n}\n\n/* Более заметные разделители сплита */\n[data-section="terminal-split-resizer-bar"] {\n  background-color: hsl(var(--primary)) !important;\n  transform: scale(2) !important;\n}\n\n/* Подсветка активной панели сплита */\n[data-section="terminal-split-pane"][data-focused="true"] {\n  outline: 2px solid hsl(var(--primary)) !important;\n  outline-offset: -2px;\n}\n\n/* Или: Настройки → Терминал → Индикатор фокуса → Рамка вокруг активной панели */',
   'settings.appearance.language': 'Язык',
   'settings.appearance.language.desc': 'Выберите язык интерфейса',
   'settings.appearance.uiFont': 'Шрифт интерфейса',
   'settings.appearance.uiFont.desc': 'Выберите шрифт для интерфейса приложения',
-
+  'settings.appearance.windowOpacity': 'Прозрачность окна',
+  'settings.appearance.windowOpacity.desc': 'Настройте прозрачность всего окна приложения. При низких значениях текст терминала тоже бледнеет. В некоторых средах Linux это может не поддерживаться.',
+  'settings.appearance.windowBackgroundBlur': 'Матовое стекло',
+  'settings.appearance.windowBackgroundBlur.desc': 'Размывает рабочий стол за окном. При непрозрачности 100 % эффект не виден, но ваш выбор сохраняется.',
+  'settings.appearance.appIcon': 'Значок приложения',
+  'settings.appearance.appIcon.desc': 'Выберите стиль значка для Dock/панели задач, чтобы Netcatty было проще найти при переключении приложений. В Windows значок области уведомлений использует тот же стиль. Применяется во время работы; значок установленного пакета не меняется.',
+  'settings.appearance.appIcon.original': 'Оригинал',
+  'settings.appearance.appIcon.bright': 'Яркий',
+  'settings.appearance.appIcon.dark': 'Тёмный',
+  'settings.appearance.appIcon.colorful': 'Цветной',
+  'settings.appearance.appIcon.highContrast': 'Высокий контраст',
+  'settings.appearance.appIcon.group.classic': 'Цветной фон',
+  'settings.appearance.appIcon.group.white': 'Белый фон',
+  'settings.appearance.appIcon.group.special': 'Скрытые',
+  'settings.appearance.appIcon.whiteNavy': 'Белый · синий кот',
+  'settings.appearance.appIcon.whiteSky': 'Белый · голубой кот',
+  'settings.appearance.appIcon.whiteRose': 'Белый · розовый кот',
+  'settings.appearance.appIcon.whiteEmerald': 'Белый · изумрудный кот',
+  'settings.appearance.appIcon.whiteAmber': 'Белый · янтарный кот',
+  'settings.appearance.appIcon.whiteViolet': 'Белый · фиолетовый кот',
+  'settings.appearance.appIcon.rainbow': 'Радужный кот',
   // Settings > Terminal
   'settings.terminal.section.theme': 'Тема терминала',
   'settings.terminal.themeModal.title': 'Выберите тему',
@@ -302,12 +619,35 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.font.cjk.option.lxgwWenkai': 'LXGW WenKai Mono',
   'settings.terminal.font.cjk.option.simSun': 'SimSun',
   'settings.terminal.font.cjk.option.legacy': '{font} · не рекомендуется (пропорциональный шрифт)',
+  'settings.terminal.font.cjk.option.recommended': 'Рекомендуется для выравнивания в терминале',
+  'settings.terminal.font.cjk.option.installed': 'Установленный шрифт',
+  'settings.terminal.font.cjk.option.unverified': 'Не удалось проверить доступность',
+  'settings.terminal.font.cjk.option.unavailable': 'Не установлен на этом устройстве',
+  'settings.terminal.font.cjk.searchPlaceholder': 'Поиск установленных шрифтов…',
+  'settings.terminal.font.cjk.empty': 'Подходящие шрифты не найдены',
+  'settings.terminal.font.cjk.useCustom': 'Использовать шрифт',
+  'settings.terminal.font.cjk.refresh': 'Обновить список шрифтов',
+  'settings.terminal.font.cjk.alignmentWarning': 'Этот шрифт не проверен как моноширинный. Проверьте выравнивание в предварительном просмотре.',
+  'settings.terminal.font.cjk.unavailableWarning': 'Этот шрифт не установлен на устройстве. Netcatty сохранит настройку и использует безопасный запасной шрифт.',
   'settings.terminal.font.size': 'Размер шрифта',
   'settings.terminal.font.size.desc': 'Размер текста терминала',
   'settings.terminal.font.weight': 'Толщина шрифта',
   'settings.terminal.font.weight.desc': 'Толщина обычного текста (100-900)',
+  'settings.terminal.font.weight.thin': 'Тонкий',
+  'settings.terminal.font.weight.extraLight': 'Очень светлый',
+  'settings.terminal.font.weight.light': 'Светлый',
+  'settings.terminal.font.weight.normal': 'Обычный',
+  'settings.terminal.font.weight.medium': 'Средний',
+  'settings.terminal.font.weight.semiBold': 'Полужирный',
+  'settings.terminal.font.weight.bold': 'Жирный',
+  'settings.terminal.font.weight.extraBold': 'Очень жирный',
+  'settings.terminal.font.weight.black': 'Максимально жирный',
   'settings.terminal.font.weightBold': 'Толщина жирного шрифта',
   'settings.terminal.font.weightBold.desc': 'Толщина жирного текста (100-900)',
+  'settings.terminal.font.smoothing': 'Сглаживание шрифта',
+  'settings.terminal.font.smoothing.desc': 'Использовать родное сглаживание шрифтов macOS',
+  'settings.terminal.font.ligatures': 'Лигатуры шрифта',
+  'settings.terminal.font.ligatures.desc': 'Показывать лигатуры вроде !=, если шрифт терминала их содержит',
   'settings.terminal.font.linePadding': 'Межстрочный отступ',
   'settings.terminal.font.linePadding.desc': 'Дополнительное пространство между строками (0-10)',
   'settings.terminal.font.emulationType': 'Тип эмуляции терминала',
@@ -315,29 +655,79 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.cursor.style.block': 'Блок',
   'settings.terminal.cursor.style.bar': 'Полоса',
   'settings.terminal.cursor.style.underline': 'Подчёркивание',
+  'settings.terminal.cursor.barWidth': 'Толщина курсора-полосы',
+  'settings.terminal.cursor.barWidth.desc': 'Ширина курсоров-полос, используемых приложениями вроде vi (1-4 пикс.)',
   'settings.terminal.cursor.blink': 'Мигание курсора',
+  'settings.terminal.cursor.highlightLine': 'Подсветка текущей строки',
+  'settings.terminal.cursor.highlightLine.desc':
+    'Затенять строку под курсором, чтобы активную строку было легче найти',
   'settings.terminal.keyboard.altAsMeta': 'Использовать Option как клавишу Meta',
   'settings.terminal.keyboard.altAsMeta.desc':
     'Использовать Option (Alt) как клавишу Meta вместо ввода специальных символов',
   'settings.terminal.keyboard.optionArrowWordJump': 'Option+←/→ переход по словам',
   'settings.terminal.keyboard.optionArrowWordJump.desc':
     'Отправлять Meta-b / Meta-f при Option+Влево/Вправо, чтобы оболочка перемещалась по словам, вместо стандартного ^[[1;3D / ^[[1;3C',
+  'settings.terminal.keyboard.kittyProtocol': 'Протокол клавиатуры Kitty',
+  'settings.terminal.keyboard.kittyProtocol.desc':
+    'Включить поддержку протокола клавиатуры Kitty.',
   'settings.terminal.accessibility.minimumContrastRatio': 'Минимальный коэффициент контрастности',
   'settings.terminal.accessibility.minimumContrastRatio.desc':
     'Подстраивать цвета под требования контрастности (1 = отключено, 21 = максимум)',
   'settings.terminal.behavior.rightClick': 'Поведение правой кнопки мыши',
   'settings.terminal.behavior.rightClick.desc': 'Действие при щелчке правой кнопкой в терминале',
+  'settings.terminal.behavior.rightClick.longPressMenu': 'Удержание правой кнопки открывает меню',
+  'settings.terminal.behavior.rightClick.longPressMenu.desc': 'Если правая кнопка вставляет текст или выделяет слово, удерживайте её полсекунды для открытия меню. Не влияет на приложения, захватывающие мышь.',
+  'settings.terminal.behavior.rightClick.fullscreenMenu': 'Показывать меню поверх полноэкранных приложений',
+  'settings.terminal.behavior.rightClick.fullscreenMenu.desc':
+    'Показывать контекстное меню, даже когда tmux, vim или другие полноэкранные приложения перехватывают мышь. Когда выключено, правый щелчок передаётся приложению (Shift+правый щелчок всё равно открывает меню).',
+  'settings.terminal.behavior.autoCloseOnExit': 'Автоматически закрывать терминал при выходе',
+  'settings.terminal.behavior.autoCloseOnExit.desc':
+    'Разрешить автоматическое закрытие вкладок и окон терминала после завершения сеанса. Отключите, чтобы сохранять их после любого выхода.',
+  'settings.terminal.behavior.disconnectedNotice': 'При разрыве соединения',
+  'settings.terminal.behavior.disconnectedNotice.desc':
+    'Показывать компактное уведомление внутри уже подключённого терминала или полный диалог. Ошибки первого подключения по-прежнему показываются в диалоге.',
+  'settings.terminal.behavior.disconnectedNotice.terminal': 'В терминале',
+  'settings.terminal.behavior.disconnectedNotice.dialog': 'Диалог',
   'settings.terminal.behavior.rightClick.menu': 'Показать меню',
   'settings.terminal.behavior.rightClick.paste': 'Вставить',
   'settings.terminal.behavior.rightClick.selectWord': 'Выбрать слово',
   'settings.terminal.behavior.copyOnSelect': 'Копировать при выделении',
   'settings.terminal.behavior.copyOnSelect.desc': 'Автоматически копировать выделенный текст. В tmux/vim с режимом мыши удерживайте Option на macOS или Shift на Windows/Linux для выделения',
+  'settings.terminal.behavior.normalizeTextOnCopy': 'Нормализовать текст терминала при копировании',
+  'settings.terminal.behavior.normalizeTextOnCopy.desc':
+    'При копировании из терминала убирать отображающие хвостовые пробелы и объединять soft-wrap строки, чтобы вставка соответствовала логическому тексту. Отключите, чтобы копировать сырое выделение экрана (включая padding TUI и визуальные переносы).',
   'settings.terminal.behavior.middleClickPaste': 'Вставка средней кнопкой мыши',
   'settings.terminal.behavior.middleClickPaste.desc':
     'Вставлять содержимое буфера обмена по щелчку средней кнопкой',
+  'settings.terminal.behavior.middleClick': 'Поведение средней кнопки мыши',
+  'settings.terminal.behavior.middleClick.desc': 'Действие при щелчке средней кнопкой в терминале',
+  'settings.terminal.behavior.middleClick.menu': 'Показать меню',
+  'settings.terminal.behavior.middleClick.paste': 'Вставить',
+  'settings.terminal.behavior.middleClick.disabled': 'Ничего не делать',
+  'settings.terminal.behavior.wordSeparators': 'Разделители слов',
+  'settings.terminal.behavior.wordSeparators.desc':
+    'Символы, которые считаются границами слова при выделении двойным щелчком. Пробел тоже учитывается; добавьте =, запятую или : для строк вроде uid=name.',
   'settings.terminal.behavior.bracketedPaste': 'Режим bracketed paste',
   'settings.terminal.behavior.bracketedPaste.desc':
     'Оборачивать вставляемый текст escape-последовательностями, чтобы оболочка отличала вставку от обычного ввода. Отключите, если видите артефакты вида ^[[200~.',
+  'settings.terminal.behavior.autoUploadClipboardImage': 'Авто-загрузка изображений буфера обмена при вставке',
+  'settings.terminal.behavior.autoUploadClipboardImage.desc':
+    'Когда в буфере обмена есть изображение, вставка в удалённой сессии загружает его по SFTP в каталог .netcatty-paste-images/ в текущем удалённом каталоге и вводит удалённый путь вместо вставки текста.',
+  'settings.terminal.behavior.confirmMultilinePaste': 'Спрашивать перед вставкой нескольких строк',
+  'settings.terminal.behavior.confirmMultilinePaste.desc':
+    'Перед вставкой нескольких строк показывать диалог подтверждения с количеством строк и символов, редактируемым предпросмотром и действиями «Отправить» / «Отправить построчно» / «Отмена». Защищает CLI сетевых устройств (Cisco IOS, Huawei VRP, H3C Comware), не поддерживающих bracketed paste.',
+  'settings.terminal.behavior.confirmMultilinePasteMinLines': 'Порог подтверждения (строк)',
+  'settings.terminal.behavior.confirmMultilinePasteMinLines.desc':
+    'Запрашивать подтверждение, если вставка содержит не меньше этого числа строк.',
+  'settings.terminal.behavior.shiftEnterNewline': 'Текст для Shift+Enter',
+  'settings.terminal.behavior.shiftEnterNewline.desc':
+    'Отправлять настроенный текст вместо обычного Enter при нажатии Shift+Enter в терминале.',
+  'settings.terminal.behavior.shiftEnterNewlineText': 'Отправляемый текст',
+  'settings.terminal.behavior.shiftEnterNewlineText.desc':
+    'Используйте \\n для перевода строки, \\t для табуляции, \\e для Escape и \\\\ для обратной косой черты. По умолчанию \\e\\r (Escape + Enter, классическая кодировка Alt+Enter), которую большинство TUI-CLI распознают как перевод строки.',
+  'settings.terminal.behavior.shiftEnterForceText': 'Отправлять текст и в режиме ввода Win32',
+  'settings.terminal.behavior.shiftEnterForceText.desc':
+    'Отправлять указанный выше текст даже когда локальная сессия Windows ConPTY согласует режим ввода Win32. Нужно для CLI на Node/Bun (Claude Code, CodeBuddy), которые не читают модификаторы из записей ввода консоли.',
   'settings.terminal.behavior.clearWipesScrollback': '`clear` очищает буфер прокрутки',
   'settings.terminal.behavior.clearWipesScrollback.desc':
     'Команда `clear` также будет очищать буфер прокрутки (поведение POSIX по умолчанию). Отключите, чтобы история оставалась видимой после `clear`.',
@@ -347,6 +737,23 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.behavior.forcePromptNewLine': 'Переносить приглашение на новую строку',
   'settings.terminal.behavior.forcePromptNewLine.desc':
     'Если последняя строка вывода команды не завершена переводом строки, переносить распознанное приглашение оболочки на следующую визуальную строку.',
+  'settings.terminal.behavior.dynamicTabTitle': 'Динамический заголовок вкладки',
+  'settings.terminal.behavior.dynamicTabTitle.desc':
+    'Выберите, когда вкладки сеансов должны следовать заголовкам окна оболочки и обновлять значки coding CLI. «Отключено» также останавливает распознавание значков.',
+  'settings.terminal.behavior.dynamicTabTitle.off': 'Отключено',
+  'settings.terminal.behavior.dynamicTabTitle.agent': 'Только агенты',
+  'settings.terminal.behavior.dynamicTabTitle.all': 'Все сеансы',
+  'settings.terminal.behavior.tabDoubleClick': 'Действие по двойному щелчку вкладки',
+  'settings.terminal.behavior.tabDoubleClick.desc': 'Выберите действие при двойном щелчке вкладки терминала.',
+  'settings.terminal.behavior.tabDoubleClick.duplicate': 'Дублировать сеанс (новое подключение)',
+  'settings.terminal.behavior.tabDoubleClick.copy': 'Копировать вкладку (использовать подключение)',
+  'settings.terminal.behavior.tabDoubleClick.disabled': 'Ничего не делать',
+  'settings.terminal.behavior.oscNotifications': 'Системные уведомления OSC',
+  'settings.terminal.behavior.oscNotifications.desc':
+    'Показывать системное уведомление, когда программа отправляет OSC 9, OSC 777 notify или kitty OSC 99. Так Codex и другие агенты сообщают о завершении хода и запросе подтверждения.',
+  'settings.terminal.behavior.oscNotifications.off': 'Отключено',
+  'settings.terminal.behavior.oscNotifications.unfocused': 'Когда окно не в фокусе',
+  'settings.terminal.behavior.oscNotifications.always': 'Всегда',
   'settings.terminal.behavior.osc52Clipboard': 'Буфер обмена OSC-52',
   'settings.terminal.behavior.osc52Clipboard.desc':
     'Разрешить удалённым программам (tmux, vim и т. д.) доступ к локальному буферу обмена через escape-последовательности OSC-52.',
@@ -372,6 +779,11 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.behavior.smoothScrolling': 'Плавная прокрутка',
   'settings.terminal.behavior.smoothScrolling.desc':
     'Анимировать прокрутку области терминала вместо мгновенного перехода',
+  'settings.terminal.sidePanel.pane.browser': 'Браузер',
+  'settings.terminal.behavior.linkBrowser': 'Открывать ссылки терминала в',
+  'settings.terminal.behavior.linkBrowser.desc': 'SSH-ссылки используют подключённый хост; локальные ссылки — этот компьютер.',
+  'settings.terminal.behavior.linkBrowser.netcatty': 'Браузер Netcatty (по умолчанию)',
+  'settings.terminal.behavior.linkBrowser.system': 'Системный браузер',
   'settings.terminal.behavior.linkModifier': 'Клавиша-модификатор для ссылок',
   'settings.terminal.behavior.linkModifier.desc': 'Удерживайте эту клавишу, чтобы нажимать на ссылки в терминале',
   'settings.terminal.behavior.linkModifier.none': 'Нет (нажимать напрямую)',
@@ -417,7 +829,17 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.localShell.startDir.placeholder': 'Домашний каталог',
   'settings.terminal.localShell.startDir.notFound': 'Каталог не найден',
   'settings.terminal.localShell.startDir.isFile': 'Путь указывает на файл, а не на каталог',
+  'settings.terminal.section.localShellSidePanel': 'Боковая панель локальной оболочки',
+  'settings.terminal.localShellSidePanel.autoOpen': 'Развернуть боковую панель при открытии локальной оболочки',
+  'settings.terminal.localShellSidePanel.autoOpen.desc': 'Автоматически открывать боковую панель после открытия локальной оболочки.',
+  'settings.terminal.localShellSidePanel.autoOpenPane': 'Боковая панель по умолчанию',
+  'settings.terminal.localShellSidePanel.autoOpenPane.desc': 'Выберите, какую панель открывать в первую очередь.',
+  'settings.terminal.localShellSidePanel.pane.files': 'Файлы',
   'settings.terminal.section.connection': 'Подключение',
+  'settings.terminal.connection.temporaryLegacyAlgorithms': 'Устаревшие алгоритмы для временных подключений',
+  'settings.terminal.connection.temporaryLegacyAlgorithms.desc': 'SSH-подключения без сохранённого хоста, включая запуск в стиле PuTTY и быстрое подключение, предлагают те же устаревшие алгоритмы, что и настройка хоста. Сохранённые хосты используют свою настройку. По умолчанию выключено: у этих алгоритмов есть известные слабости.',
+  'settings.terminal.connection.temporaryNetworkDeviceMode': 'Режим сетевого устройства для временных подключений',
+  'settings.terminal.connection.temporaryNetworkDeviceMode.desc': 'SSH-подключения без сохранённого хоста, включая внешний запуск и быстрое подключение, открываются в режиме сетевого устройства. Сохранённые хосты и группы сохраняют свой тип устройства. По умолчанию выключено.',
   'settings.terminal.connection.keepaliveInterval': 'Интервал keepalive',
   'settings.terminal.connection.keepaliveInterval.desc': 'Как часто (в секундах) отправлять keepalive-пакеты на уровне SSH. Установите 0, чтобы отключить глобально. Учтите, что отдельные хосты могут переопределять это значение в своих настройках.',
   'settings.terminal.connection.keepaliveCountMax': 'Макс. число пропущенных keepalive',
@@ -425,7 +847,25 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.connection.x11Display': 'Дисплей X11',
   'settings.terminal.connection.x11Display.desc': 'Необязательный адрес локального дисплея для перенаправления X11. Оставьте пустым, чтобы использовать системное значение по умолчанию.',
   'settings.terminal.connection.x11Display.placeholder': 'Авто (:0 или DISPLAY)',
+  'settings.terminal.connection.defaultProxy': 'Прокси по умолчанию',
+  'settings.terminal.connection.defaultProxy.desc': 'Сохраненный прокси, если у хоста нет своего и он не наследует прокси группы. «Нет» — прямое подключение.',
+  'settings.terminal.connection.defaultProxy.none': 'Нет',
   'settings.terminal.section.serverStats': 'Статистика сервера (Linux)',
+  'settings.terminal.hostInfoBar.show': 'Показывать сведения о хосте',
+  'settings.terminal.hostInfoBar.show.desc': 'Показывать адрес хоста и сведения о сервере над терминалом. Кнопки действий остаются доступными после скрытия.',
+  'settings.terminal.hostInfoBar.titleMode': 'Заголовок сведений о хосте',
+  'settings.terminal.hostInfoBar.titleMode.desc': 'Показывать в панели адрес подключения (user@host) или метку хоста из хранилища.',
+  'settings.terminal.hostInfoBar.titleMode.address': 'Адрес подключения',
+  'settings.terminal.hostInfoBar.titleMode.label': 'Метка хоста',
+  'settings.terminal.section.systemManager': 'Системный менеджер',
+  'settings.terminal.systemManager.processRefreshInterval': 'Обновление списка процессов',
+  'settings.terminal.systemManager.processRefreshInterval.desc': 'Как часто обновлять список процессов в боковой панели системного менеджера.',
+  'settings.terminal.systemManager.tmuxRefreshInterval': 'Обновление сессий tmux',
+  'settings.terminal.systemManager.tmuxRefreshInterval.desc': 'Как часто обновлять список сессий tmux.',
+  'settings.terminal.systemManager.dockerListRefreshInterval': 'Обновление списка контейнеров',
+  'settings.terminal.systemManager.dockerListRefreshInterval.desc': 'Как часто обновлять списки контейнеров и подов.',
+  'settings.terminal.systemManager.dockerStatsRefreshInterval': 'Обновление статистики Docker',
+  'settings.terminal.systemManager.dockerStatsRefreshInterval.desc': 'Как часто обновлять CPU/память/сеть контейнеров Docker.',
   'settings.terminal.serverStats.show': 'Показывать статистику сервера',
   'settings.terminal.serverStats.show.desc': 'Показывать загрузку CPU, памяти и диска в строке состояния терминала (только для Linux-серверов).',
   'settings.terminal.serverStats.refreshInterval': 'Интервал обновления',
@@ -437,6 +877,26 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.rendering.renderer': 'Рендерер',
   'settings.terminal.rendering.renderer.desc': 'Выберите технологию рендеринга терминала. В режиме "Авто" на устройствах с малым объёмом памяти будет использоваться DOM. Изменения применяются к новым терминальным сессиям.',
   'settings.terminal.rendering.auto': 'Авто',
+
+  // Settings > Terminal > Inline Images
+  'settings.terminal.section.inlineImages': 'Встроенные изображения',
+  'settings.terminal.inlineImages.enabled': 'Отображать встроенные изображения',
+  'settings.terminal.inlineImages.enabled.desc': 'Показывать настоящие изображения, которые выводят удалённые программы (kitten icat, chafa, предпросмотр в файловых менеджерах и TUI). Изменения применяются к новым терминальным сессиям.',
+  'settings.terminal.inlineImages.kitty': 'Графический протокол Kitty',
+  'settings.terminal.inlineImages.kitty.desc': 'Принимать графические последовательности Kitty, включая режим direct/stream по SSH.',
+  'settings.terminal.inlineImages.sixel': 'SIXEL',
+  'settings.terminal.inlineImages.sixel.desc': 'Принимать графику SIXEL, которую используют img2sixel, mpv, gnuplot и другие инструменты в стиле DEC.',
+  'settings.terminal.inlineImages.iip': 'Протокол встроенных изображений iTerm',
+  'settings.terminal.inlineImages.iip.desc': 'Принимать последовательности OSC 1337 из iTerm2 (PNG, JPEG, первый кадр GIF).',
+  'settings.terminal.inlineImages.storageLimit': 'Кэш изображений на терминал',
+  'settings.terminal.inlineImages.storageLimit.desc': 'Сколько памяти терминал может занимать декодированными изображениями до вытеснения самых старых (8–512 МБ).',
+  'settings.terminal.inlineImages.maxMegapixels': 'Максимальный размер изображения',
+  'settings.terminal.inlineImages.maxMegapixels.desc': 'Наибольшее изображение, которое будет декодировано; более крупные отбрасываются без изменения буфера терминала (1–64 Мпикс, 16 Мпикс — это 4096 × 4096).',
+  'settings.terminal.inlineImages.sequenceLimit': 'Максимальный размер последовательности',
+  'settings.terminal.inlineImages.sequenceLimit.desc': 'Наибольшая escape-последовательность изображения, принимаемая до начала декодирования (1–64 МБ).',
+  'settings.terminal.inlineImages.unit.mb': 'МБ',
+  'settings.terminal.inlineImages.unit.megapixels': 'Мпикс',
+  'settings.terminal.inlineImages.hibernateNote': 'Вкладки, показавшие встроенное изображение, сохраняют свой рендерер и не уходят в спящий режим, потому что снимок восстанавливает только текст.',
 
   // Settings > Terminal > Workspace Focus Indicator
   'settings.terminal.section.workspaceFocus': 'Индикатор фокуса рабочей области',
@@ -453,6 +913,20 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.autocomplete.ghostText.desc': 'Показывать серую встроенную подсказку после курсора (как в fish shell).',
   'settings.terminal.autocomplete.popupMenu': 'Всплывающее меню',
   'settings.terminal.autocomplete.popupMenu.desc': 'Показывать плавающий список из нескольких подсказок.',
+  'settings.terminal.autocomplete.historyScope': 'Область подсказок истории',
+  'settings.terminal.autocomplete.historyScope.desc':
+    'Выберите, брать ли подсказки истории автодополнения только с текущего хоста или со всех хостов.',
+  'settings.terminal.autocomplete.historyScope.host': 'Текущий хост',
+  'settings.terminal.autocomplete.historyScope.global': 'Все хосты',
+
+  // Settings > Terminal > Password prompt assist (sudo/su)
+  'settings.terminal.section.passwordPromptAssist': 'Подсказки пароля',
+  'settings.terminal.passwordPromptAssist.mode': 'Режим подсказки',
+  'settings.terminal.passwordPromptAssist.mode.desc':
+    'Когда sudo или su запрашивают пароль, предложить сохранённые учётные данные. Никогда не отправляет пароль без подтверждения.',
+  'settings.terminal.passwordPromptAssist.off': 'Выкл.',
+  'settings.terminal.passwordPromptAssist.hint': 'Быстрая вставка (Enter)',
+  'settings.terminal.passwordPromptAssist.picker': 'Список учётных данных',
 
   // Settings > Shortcuts
   'settings.shortcuts.section.scheme': 'Схема горячих клавиш',
@@ -461,6 +935,12 @@ export const ruCoreMessages: Messages = {
   'settings.shortcuts.scheme.disabled': 'Отключено',
   'settings.shortcuts.scheme.mac': 'Mac (Cmd)',
   'settings.shortcuts.scheme.pc': 'PC (Ctrl)',
+  'settings.shortcuts.disableTerminalFontZoom.label': 'Отключить масштаб терминала',
+  'settings.shortcuts.disableTerminalFontZoom.desc': 'Отключает быстрый масштаб текста в терминале, включая Cmd/Ctrl + колесо мыши.',
+  'settings.shortcuts.shellOnlyTabNumberShortcuts.label': 'Сочетания без закреплённых вкладок',
+  'settings.shortcuts.shellOnlyTabNumberShortcuts.desc': 'Если включено, Cmd/Ctrl+[1...9] и Ctrl+Tab переключают только рабочие вкладки (терминалы, рабочие области, редакторы), а не закреплённые Vault и SFTP.',
+  'settings.shortcuts.showTabNumberBadges.label': 'Номера на вкладках',
+  'settings.shortcuts.showTabNumberBadges.desc': 'Показывать 1-9 на вкладках при удержании Cmd/Ctrl, чтобы точнее переключаться через Cmd/Ctrl+[1...9].',
   'settings.shortcuts.section.custom': 'Пользовательские сочетания',
   'settings.shortcuts.resetAll': 'Сбросить все',
   'settings.shortcuts.recording': 'Нажмите клавиши...',
@@ -476,6 +956,7 @@ export const ruCoreMessages: Messages = {
   'settings.shortcuts.binding.next-tab': 'Следующая вкладка',
   'settings.shortcuts.binding.prev-tab': 'Предыдущая вкладка',
   'settings.shortcuts.binding.close-tab': 'Закрыть вкладку',
+  'settings.shortcuts.binding.close-session': 'Закрыть панель сессии',
   'settings.shortcuts.binding.new-tab': 'Новая локальная вкладка',
   'settings.shortcuts.binding.copy': 'Копировать из терминала',
   'settings.shortcuts.binding.paste': 'Вставить в терминал',
@@ -483,9 +964,13 @@ export const ruCoreMessages: Messages = {
   'settings.shortcuts.binding.select-all': 'Выделить всё содержимое терминала',
   'settings.shortcuts.binding.clear-buffer': 'Очистить буфер терминала',
   'settings.shortcuts.binding.search-terminal': 'Открыть поиск по терминалу',
+  'settings.shortcuts.binding.increase-terminal-font-size': 'Увеличить размер шрифта терминала',
+  'settings.shortcuts.binding.decrease-terminal-font-size': 'Уменьшить размер шрифта терминала',
+  'settings.shortcuts.binding.reset-terminal-font-size': 'Сбросить размер шрифта терминала',
   'settings.shortcuts.binding.move-focus': 'Переместить фокус между разделёнными окнами',
   'settings.shortcuts.binding.split-horizontal': 'Горизонтальное разделение',
   'settings.shortcuts.binding.split-vertical': 'Вертикальное разделение',
+  'settings.shortcuts.binding.toggle-pane-zoom': 'Переключить масштаб панели',
   'settings.shortcuts.binding.open-hosts': 'Открыть список хостов',
   'settings.shortcuts.binding.open-local': 'Открыть локальный терминал',
   'settings.shortcuts.binding.open-sftp': 'Открыть SFTP',
@@ -496,7 +981,9 @@ export const ruCoreMessages: Messages = {
   'settings.shortcuts.binding.new-workspace': 'Новая рабочая область',
   'settings.shortcuts.binding.snippets': 'Открыть сниппеты',
   'settings.shortcuts.binding.broadcast': 'Переключить режим трансляции',
+  'settings.shortcuts.binding.toggle-opacity': 'Переключить прозрачность окна',
   'settings.shortcuts.binding.toggle-side-panel': 'Переключить боковую панель',
+  'settings.shortcuts.binding.toggle-host-tree': 'Переключить список хостов',
   'settings.shortcuts.binding.sftp-copy': 'Копировать файл',
   'settings.shortcuts.binding.sftp-cut': 'Вырезать файл',
   'settings.shortcuts.binding.sftp-paste': 'Вставить файл',
@@ -529,6 +1016,7 @@ export const ruCoreMessages: Messages = {
   'sync.cloudSync': 'Облачная синхронизация',
   'sync.settings': 'Настройки синхронизации',
   'sync.active': 'Облачная синхронизация активна',
+  'sync.pending': 'Есть несинхронизированные изменения',
   'sync.syncing': 'Синхронизация...',
   'sync.error': 'Ошибка синхронизации',
   'sync.notConfigured': 'Не настроено',
@@ -565,7 +1053,7 @@ export const ruCoreMessages: Messages = {
   'sync.autoSync.emptyVaultConflict.restoreDesc': 'Рекомендуется — восстановить ваши хосты, ключи и сниппеты из облачной резервной копии',
   'sync.autoSync.emptyVaultConflict.keepEmpty': 'Оставить пустым',
   'sync.autoSync.emptyVaultConflict.keepEmptyDesc': 'Начать заново с пустым хранилищем',
-  'sync.autoSync.emptyVaultConflict.cloudSummary': '{hosts} хостов, {keys} ключей, {snippets} сниппетов, {proxyProfiles} прокси',
+  'sync.autoSync.emptyVaultConflict.cloudSummary': '{hosts} хостов, {keys} ключей, {snippets} сниппетов, {notes} заметок, {proxyProfiles} прокси',
   'sync.autoSync.emptyVaultManual': 'Синхронизация невозможна: локальное хранилище пусто. Сначала восстановите его из локальной резервной копии или включите принудительную отправку в панели синхронизации.',
 
   'sync.blocked.title': 'Синхронизация приостановлена',
@@ -602,6 +1090,7 @@ export const ruCoreMessages: Messages = {
   'vault.nav.proxies': 'Прокси',
   'vault.nav.portForwarding': 'Проброс портов',
   'vault.nav.snippets': 'Сниппеты',
+  'vault.nav.notes': 'Заметки',
   'vault.nav.knownHosts': 'Известные хосты',
   'vault.nav.logs': 'Журналы',
 
@@ -610,12 +1099,12 @@ export const ruCoreMessages: Messages = {
   'proxyProfiles.section.proxies': 'Прокси',
   'proxyProfiles.count.items': 'Элементов: {count}',
   'proxyProfiles.empty.title': 'Нет прокси',
-  'proxyProfiles.empty.desc': 'Создавайте переиспользуемые HTTP- или SOCKS5-прокси и выбирайте их в настройках хоста.',
+  'proxyProfiles.empty.desc': 'Создавайте переиспользуемые HTTP-, SOCKS5- или командные прокси и выбирайте их в настройках хоста.',
   'proxyProfiles.usage': 'Связано: {count}',
   'proxyProfiles.copyName': '{name} Копия',
   'proxyProfiles.panel.newTitle': 'Новый прокси',
   'proxyProfiles.field.name': 'Имя прокси',
-  'proxyProfiles.error.required': 'Имя, хост и порт обязательны.',
+  'proxyProfiles.error.required': 'Имя и параметры прокси обязательны.',
   'proxyProfiles.error.port': 'Порт должен быть в диапазоне от 1 до 65535.',
   'proxyProfiles.viewMode': 'Режим просмотра прокси',
   'proxyProfiles.delete.title': 'Удалить прокси?',
@@ -635,7 +1124,16 @@ export const ruCoreMessages: Messages = {
   'vault.groups.deleteDialogTitle': 'Удалить группу',
   'vault.groups.deleteDialog.desc': 'Группа будет безвозвратно удалена, а все хосты будут перемещены в корень.',
   'vault.groups.deleteDialog.managedDesc': 'Это управляемая группа SSH-конфига. При её удалении также будут удалены все хосты и снята связь с исходным файлом.',
+  'vault.groups.deleteDialog.mixedDesc': 'Эта группа содержит хосты, импортированные из связанного SSH-конфига. Все хосты под управляемой подгруппой будут удалены, включая хосты, не управляемые этим файлом. Остальные хосты будут перемещены в корень, если вы также не удалите их ниже.',
+  'vault.groups.deleteDialog.managedWarning': 'При удалении этой группы её записи также будут удалены из связанного файла конфигурации SSH. Записи, импортированные из этого файла, могут быть утеряны, это затронет и другие приложения, использующие файл. Сделайте резервную копию файла перед продолжением.',
+  'vault.groups.deleteDialog.sourcesChanged': 'Управляемые файлы, затрагиваемые этим удалением, изменились. Проверьте файлы и подтвердите удаление снова.',
+  'vault.groups.deleteDialog.managedFile': 'Связанный файл: {file}',
   'vault.groups.deleteDialog.deleteHosts': 'Также удалить все хосты в этой группе',
+  'vault.groups.deleteDialog.bulkTitle': 'Удалить выбранные группы',
+  'vault.groups.deleteDialog.bulkDesc': 'Выбранные группы будут безвозвратно удалены, а их хосты перемещены в корень.',
+  'vault.groups.deleteDialog.bulkDeleteHosts': 'Также удалить все хосты в выбранных группах',
+  'vault.groups.selectedCount': 'Выбрано групп: {count}',
+  'vault.groups.deleteMultiple.success': 'Удалено выбранных элементов: {count}',
   'vault.groups.ungrouped': 'Без группы',
   'vault.groups.field.name': 'Имя группы',
   'vault.groups.placeholder.example': 'например, Production',
@@ -660,10 +1158,195 @@ export const ruCoreMessages: Messages = {
   'vault.groups.errors.invalidChars': "Имя группы не может содержать '/' или '\\\\'.",
   'vault.groups.errors.duplicatePath': 'Группа с таким именем уже существует в этом расположении.',
 
+  'vault.deleteConfirm.title': 'Удалить "{name}"?',
+  'vault.deleteConfirm.desc': 'Это действие нельзя отменить.',
+  'vault.deleteConfirm.packageDesc': 'Пакет скриптов будет удалён. Скрипты внутри него сохранятся и будут вынесены из пакета.',
+  'vault.deleteConfirm.noteGroupDesc': 'Папка будет удалена. Заметки внутри неё сохранятся и будут вынесены из папки.',
+  'vault.deleteConfirm.portForwardingDesc': 'Правило проброса портов будет удалено.',
+
   'vault.managedSource.unmanage': 'Снять управление',
   'vault.managedSource.unmanageSuccess': 'Управление группой успешно снято',
 
   'vault.hosts.header.entries': 'Записей: {count}',
   'vault.hosts.header.live': 'Активных: {count}',
+  'deepLink.ssh.invalid': 'Недопустимая ссылка ssh://',
+  'deepLink.telnet.invalid': 'Недопустимая ссылка telnet://',
+  'deepLink.jms.invalid': 'Недопустимая ссылка JumpServer',
+  'deepLink.jms.unsupported': 'Неподдерживаемый протокол JumpServer: {{protocol}}',
 
+  'settings.tab.plugins': 'Плагины',
+  "settings.plugins.author.official": "Официальная поддержка",
+  "settings.plugins.author.officialMeaning": "Поддерживается проектом Netcatty. Это не сертификат безопасности.",
+  "settings.plugins.manager.installed": "Установленные плагины",
+  "settings.plugins.manager.import": "Импорт .ncpkg",
+  "settings.plugins.manager.preview": "Импортированные пакеты отключены до проверки и включения.",
+  "settings.plugins.manager.empty": "Импортируйте локальный пакет плагина.",
+  "settings.plugins.manager.enabled": "Включён",
+  "settings.plugins.manager.disabled": "Отключён",
+  "settings.plugins.manager.enable": "Включить",
+  "settings.plugins.manager.disable": "Отключить",
+  "settings.plugins.manager.remove": "Удалить",
+  "settings.plugins.manager.removeNote": "Удаление очищает код пакета и локальные данные KV. Настройки пользователя, секреты и данные синхронизации сохраняются.",
+  "settings.plugins.permissions.statusUnknown": "Состояние неизвестно",
+  "plugins.sidebar.extensions": "Страницы расширений",
+  "plugins.sidebar.selectTerminal": "Сначала выберите открытый терминал.",
+  "plugins.sidebar.loading": "Загрузка страницы расширения…",
+  "plugins.vault.loading": "Загрузка страницы плагина…",
+  "plugins.vault.extensions": "Расширения",
+  "plugins.vault.back": "К хостам",
+  "plugins.interaction.title": "Запрос плагина",
+  "plugins.interaction.sharing": "Переданный текст доступен плагину и его разрешённым возможностям, включая сеть. Чтение не разрешает новый сетевой адрес.",
+  "plugins.interaction.input": "Ввести текст",
+  "plugins.interaction.filter": "Фильтр вариантов",
+  "plugins.interaction.preview": "Предпросмотр буфера обмена",
+  "plugins.interaction.previewNote": "Буфер читается только после нажатия предпросмотра. Затем проверьте текст и отдельно подтвердите передачу.",
+  "plugins.interaction.previewAction": "Предпросмотр буфера обмена",
+  "plugins.interaction.share": "Передать плагину",
+  "plugins.interaction.copy": "Копировать в буфер обмена",
+  "plugins.interaction.failed": "Запрос истёк или не выполнен.",
+  "plugins.command.failed": "Не удалось выполнить команду плагина. Проверьте необходимые выбранные объекты и разрешения.",
+  "plugins.interaction.terminalDisclosure": "Only the current selection from this terminal is shared, up to 4096 UTF-8 bytes. Terminal text can contain passwords, tokens, and other secrets. Inspect the exact preview before sharing. No redaction guarantee is made.",
+  "plugins.interaction.terminalTarget": "Selected terminal",
+  "plugins.interaction.terminalPreview": "Preview terminal selection",
+  "plugins.interaction.draftNote": "Editable draft for review only. This dialog sends no terminal input or Enter. Copy text yourself and use the normal terminal UI if you choose to send it. Your edits stay in this dialog.",
+  "plugins.interaction.draft": "Terminal input draft",
+  "plugins.interaction.exactText": "Exact text with escaped controls",
+  "plugins.interaction.closeDraft": "Close draft",
+  "settings.plugins.permissions.current": "Соответствует текущему запуску",
+  "settings.plugins.permissions.inactive": "Не действует для текущего запуска",
+  "settings.plugins.permissions.title": "Сохранённые разрешения",
+  "settings.plugins.permissions.refresh": "Обновить",
+  "settings.plugins.permissions.loading": "Загрузка разрешений...",
+  "settings.plugins.permissions.empty": "Сохранённых разрешений нет. Одноразовые решения не сохраняются.",
+  "settings.plugins.permissions.always": "До отзыва",
+  "settings.plugins.permissions.application": "До выхода из Netcatty",
+  "settings.plugins.permissions.session": "До закрытия сеанса",
+  "settings.plugins.permissions.audit": "Последние события безопасности (до 100)",
+  "settings.plugins.permissions.revoke": "Отключить и отозвать все разрешения",
+  "settings.plugins.permissions.revokeNote": "Плагин будет отключён, его задачи отменены, а сохранённые разрешения удалены. Включите его для нового запроса доступа.",
+  "settings.plugins.permissions.unavailable": "Управление разрешениями недоступно",
+  "settings.plugins.manager.permissions": "Заявленные разрешения",
+  "settings.plugins.manager.permissionNote": "Заявленные поддерживаемые возможности по умолчанию разрешены. Для каждой можно выбрать запрос или запрет в настройках разрешений. Проверки приложения и область ресурсов действуют всегда.",
+  "settings.plugins.manager.noPermissions": "Привилегированные разрешения не заявлены.",
+  "settings.plugins.manager.required": "Обязательно",
+  "settings.plugins.manager.optional": "Необязательно",
+  "settings.plugins.themes.title": "Темы плагинов",
+  "settings.plugins.themes.description": "Предпросмотр меняет только это окно. Применение сохраняет выбор на этом устройстве. Личные настройки сохраняются.",
+  "settings.plugins.themes.empty": "Нет включённых тем для этого режима.",
+  "settings.plugins.themes.choose": "Выберите тему",
+  "settings.plugins.themes.unavailable": "Сохранённая тема недоступна; используется стандартная палитра",
+  "settings.plugins.themes.applied": "Применено",
+  "settings.plugins.themes.preview": "Предпросмотр",
+  "settings.plugins.themes.apply": "Применить",
+  "settings.plugins.themes.cancel": "Отменить предпросмотр",
+  "settings.plugins.themes.restore": "Сбросить тему",
+  "settings.plugins.themes.invalid": "Некоторые палитры недоступны или отклонены.",
+  "settings.plugins.themes.failed": "Не удалось применить тему.",
+  "settings.plugins.manager.dataTheme": "Пакет тем: проверенные цвета без выполнения кода.",
+  "settings.plugins.manager.browser": "Браузерная среда: привилегированный доступ проходит через проверку разрешений приложения.",
+  "settings.plugins.manager.advanced": "Расширенная среда: полный доступ Node к файловой системе и сети. Разрешения посредника не ограничивают этот доступ. Только для разработки.",
+  "settings.plugins.manager.data": "Данные KV остаются на устройстве. Синхронизируются только явно отмеченные несекретные настройки в зашифрованных данных. Пакеты и разрешения не синхронизируются.",
+  "settings.plugins.market.results": "Плагинов: {count}",
+  "settings.plugins.manager.lastError": "Последняя записанная ошибка",
+  "settings.plugins.sources.offline": "Источник недоступен. Ранее проверенный каталог этого источника, если он есть в кэше, доступен только для просмотра. Установка недоступна до успешного обновления.",
+  "settings.plugins.sources.note": "Этот каталог предоставляет выбранная третья сторона; Netcatty не отбирает его содержимое. Перед установкой проверьте домен источника и разрешения. Обновления выполняются вручную.",
+  "settings.plugins.sources.sourceOnly": "Запись с исходным кодом от этого поставщика. Пакет для загрузки отсутствует; см. инструкции автора по сборке и импорту.",
+  "settings.plugins.market.offline": "Реестр недоступен. Показан последний корректный каталог или встроенные примеры. Для установки необходимо успешно обновить каталог.",
+  "settings.plugins.manager.details": "Подробнее",
+  "settings.plugins.manager.noDescription": "Описание не предоставлено.",
+  "settings.plugins.status": "Уведомления: {count}",
+  "settings.plugins.info": "Информация о плагинах",
+  "settings.plugins.manager.noVaultShort": "Хранилище секретов недоступно",
+  "settings.plugins.market.offlineShort": "Каталог офлайн · установка недоступна",
+  "settings.plugins.market.readmeInfo": "Об этом README",
+  "settings.plugins.market.installed": "Установлен",
+  "settings.plugins.market.sourceBadge": "Пример исходного кода",
+  "settings.plugins.market.title": "Каталог",
+  "settings.plugins.market.note": "Отобранные плагины с открытым кодом. Проверка не гарантирует безопасность. Обновления выполняются вручную.",
+  "settings.plugins.market.back": "Все плагины",
+  "settings.plugins.market.install": "Установить эту версию (отключённой)",
+  "settings.plugins.market.installNote": "Установленная версия будет заменена и остановлена. Проверьте разрешения перед включением.",
+  "settings.plugins.market.sourceOnly": "Пример из этого проекта. Соберите локальной CLI и импортируйте .ncpkg; готовый пакет для скачивания не опубликован.",
+  "settings.plugins.market.readmeNote": "Зафиксирован указанный коммит. HTML не выполняется, внешние изображения не загружаются. Текст автора плагина.",
+  "settings.plugins.manager.noVault": "Системное хранилище ключей недоступно. Операции с секретами и учётными данными заблокированы; каталог и плагины без секретов доступны.",
+  "settings.plugins.manager.sensitive": "Чувствительный доступ: эта возможность может раскрыть личные данные. Её режим можно изменить в настройках разрешений.",
+  "settings.plugins.manager.dual": "По умолчанию используется браузерная среда. Пакет также содержит вход Node с полным доступом к устройству; только для разработчиков.",
+  "settings.plugins.manager.advancedDeclaration": "Браузерная точка входа с заявленными расширенными разрешениями. Не допускается в обычном режиме; проверьте все разрешения.",
+  "settings.plugins.market.retry": "Повторить",
+  "settings.plugins.market.empty": "Каталог пуст. Можно импортировать локальный браузерный плагин.",
+  "settings.plugins.market.emptyReadme": "Этот README пуст.",
+  "settings.plugins.market.search": "Поиск по имени, автору или описанию",
+  "settings.plugins.market.noResults": "Совпадений нет. Измените запрос.",
+  "settings.plugins.market.manifest": "Совместимость и разрешения",
+  "settings.plugins.manager.unbounded": "Более узкая область ресурсов не заявлена. Проверки приложения и выбранный режим разрешений продолжают действовать.",
+  "settings.plugins.openView": "Открыть",
+  "settings.plugins.openManager": "Открыть управление плагинами",
+  "settings.plugins.sources.conflict": "This ID is installed from another source. Uninstall and explicitly reset its private data before switching. Existing source:",
+  "settings.plugins.sources.clearPrivate": "Also clear this source’s private data, grants and secrets to reinstall from another source. This cannot be undone.",
+  "settings.plugins.sources.short.official": "Официальный",
+  "settings.plugins.sources.short.thirdparty": "Сторонний",
+  "settings.plugins.sources.short.local": "Локальный",
+  "settings.plugins.sources.official": "Official marketplace",
+  "settings.plugins.sources.thirdparty": "Third-party marketplace",
+  "settings.plugins.sources.manage": "Manage sources",
+  "settings.plugins.sources.select": "Select a source",
+  "settings.plugins.sources.empty": "Choose or add a third-party source.",
+  "settings.plugins.sources.add": "Add source",
+  "settings.plugins.sources.remove": "Remove source",
+  "settings.plugins.sources.name": "Source name",
+  "settings.plugins.sources.address": "HTTPS source address",
+  "settings.plugins.sources.risk": "Third-party sources are not maintained or endorsed by Netcatty. Review the real domain, package permissions and author before installing.",
+  "settings.plugins.sources.accept": "I trust this domain to supply plugin metadata and packages. This does not grant plugin permissions.",
+  "settings.plugins.sources.removeNote": "Installed plugins and their data remain. Updates from this source stop; another source will not replace it.",
+  "settings.plugins.sources.disablePlugins": "Also disable plugins installed from this source",
+  "settings.plugins.sources.installConfirm": "Review third-party installation",
+  "settings.plugins.sources.source": "Source",
+  "settings.plugins.sources.local": "Local import",
+  "settings.plugins.sources.all": "All sources",
+  "settings.plugins.title": "Плагины",
+  "settings.plugins.configuration": "Настройки плагина",
+  "settings.plugins.description": "Управляйте плагинами и просматривайте каталог.",
+  'settings.plugins.loading': 'Загрузка настроек плагинов…',
+  'settings.plugins.empty': 'Включённые плагины не предоставляют настройки.',
+  'settings.plugins.scopeContext': 'Откройте эту настройку в контексте {scope}.',
+  'settings.plugins.pressKeybinding': 'Нажмите сочетание клавиш',
+  'settings.plugins.validJsonArray': 'Введите корректный массив JSON.',
+  'settings.plugins.browse': 'Обзор',
+  'settings.plugins.restartRequired': 'Требуется перезапуск',
+  'settings.plugins.saving': 'Сохранение…',
+  'settings.plugins.storedSecurely': 'Сохранено безопасно',
+  'settings.plugins.configuredReplacement': 'Настроено — введите новое значение для замены',
+  'settings.plugins.moveItemUp': 'Переместить элемент {index} «{label}» вверх',
+  'settings.plugins.moveItemDown': 'Переместить элемент {index} «{label}» вниз',
+  'settings.plugins.addItem': 'Добавить элемент',
+  'settings.plugins.removeItem': 'Удалить элемент',
+  'settings.plugins.scopeTargets': 'Области настроек плагинов',
+  'settings.plugins.scopeTarget': 'Цель {scope}',
+  'settings.plugins.noScopeTargets': 'Нет доступных целей',
+  'settings.plugins.thisDevice': 'Это устройство',
+  'plugins.authentication.description': 'Завершите запрос аутентификации в этом диалоге Netcatty.',
+  'plugins.authentication.value': 'Значение',
+  'plugins.authentication.password': 'Пароль',
+  'plugins.authentication.code': 'Одноразовый код',
+  'plugins.authentication.deviceCode': 'Код устройства',
+  'plugins.authentication.openBrowser': 'Открыть браузер',
+  'plugins.authentication.invalidUrl': 'Поставщик аутентификации вернул небезопасный или некорректный URL.',
+  'plugins.authentication.responseFailed': 'Не удалось отправить ответ аутентификации. Повторите попытку или отмените запрос.',
+  'plugins.authentication.responseFailedWithMessage': 'Не удалось отправить ответ аутентификации: {message}. Повторите попытку или отмените запрос.',
+  'plugins.authentication.continue': 'Продолжить',
+  'plugins.hostActions.select': 'Передать метаданные выбранных хостов',
+  'plugins.hostActions.selectionNote': 'Передаются только метаданные выбранных хостов: сохранённые имена, адреса, пользователи, протоколы, группы и теги. Группа включает только выбранные сейчас хосты. Дальнейшие запросы изменения или подключения зависят от настроек разрешений плагина.',
+  'plugins.hostActions.create': 'Проверить черновик хоста',
+  'plugins.hostActions.edit': 'Проверить изменения хоста',
+  'plugins.hostActions.connect': 'Подтвердить подключение',
+  'plugins.hostActions.fieldDiff': 'Изменения для сохранения',
+  'plugins.hostActions.defaultsWarning': 'Применяются сохранённые настройки подключения. Смена группы может изменить унаследованные настройки входа, прокси и скрипты.',
+  'plugins.hostActions.invalidDraft': 'Введите корректные данные хоста.',
+  'plugins.hostActions.scriptsRun': 'При подключении могут выполняться сохранённые скрипты запуска, подключения или вывода.',
+  'plugins.hostActions.noScripts': 'Для этого хоста не настроены сохранённые скрипты запуска, подключения или вывода.',
+  'plugins.hostActions.connectionNote': 'Netcatty откроет подключение с сохранёнными настройками. Содержимое сеанса не передаётся плагину.',
+  'plugins.hostActions.localExecution': 'Локальное выполнение: откроется оболочка на этом устройстве.',
+  'plugins.hostActions.managedUnsupported': 'Изменяйте управляемые настройки SSH в редакторе хостов Vault.',
+  'plugins.hostActions.failed': 'Запрос истёк, был отозван или хост изменился. Выберите хост заново.',
+  'plugins.hostActions.selectionLimit': 'Выберите не более 50 текущих хостов.',
 };

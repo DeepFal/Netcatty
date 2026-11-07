@@ -6,6 +6,7 @@
  * Uses useSyncExternalStore for real-time state synchronization across all components.
  */
 
+import { useCloudSyncAutoUnlock } from './useCloudSyncAutoUnlock';
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import {
   type CloudProvider,
@@ -19,6 +20,7 @@ import {
   type SyncPayload,
   type SyncResult,
   type SyncHistoryEntry,
+  type ConvergentFieldConflict,
   type WebDAVConfig,
   type S3Config,
   formatLastSync,
@@ -26,6 +28,8 @@ import {
   isProviderReadyForSync,
 } from '../../domain/sync';
 import type { CloudSyncStrategy } from '../../domain/syncStrategy';
+import { LOCAL_STORAGE_ADAPTER_CHANGED_EVENT, localStorageAdapter } from '../../infrastructure/persistence/localStorageAdapter';
+import { STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS } from '../../infrastructure/config/storageKeys';
 import type { CloudSyncConflictAction } from '../../domain/syncStrategy';
 import {
   getCloudSyncManager,
@@ -35,10 +39,31 @@ import {
 import type { ShrinkFinding } from '../../domain/syncGuards';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
 import type { DeviceFlowState } from '../../infrastructure/services/adapters/GitHubAdapter';
+import {
+  getConvergentSyncLocalConfig,
+  getConvergentSyncLocalConfigSnapshot,
+  pauseConvergentSync,
+  refreshConvergentSyncLocalConfigSnapshot,
+  setConvergentSyncLocalConfig,
+  subscribeConvergentSyncLocalConfig,
+  type ConvergentSyncLocalConfig,
+} from '../../infrastructure/services/convergentSyncConfig';
 
 // ============================================================================
 // Types
 // ============================================================================
+
+type ConvergentPayloadApplier = (
+  payload: SyncPayload,
+  commitReplica: () => Promise<void>,
+) => Promise<void>;
+
+interface CloudSyncRunOptions {
+  overrideShrink?: boolean;
+  conflictActionOverride?: CloudSyncConflictAction;
+  applyConvergentPayload?: ConvergentPayloadApplier;
+  signal?: AbortSignal;
+}
 
 export interface CloudSyncHook {
   // State
@@ -58,6 +83,9 @@ export interface CloudSyncHook {
   remoteVersion: number;
   remoteUpdatedAt: number;
   syncHistory: SyncHistoryEntry[];
+  pendingLocalSync: boolean;
+  convergentConflicts: ConvergentFieldConflict[];
+  convergentSyncConfig: ConvergentSyncLocalConfig;
   pendingBrowserAuthProvider: 'google' | 'onedrive' | null;
   
   // Computed
@@ -83,6 +111,12 @@ export interface CloudSyncHook {
     authAttemptId?: number
   ) => Promise<void>;
   connectGoogle: () => Promise<string>;
+  /** Connect a namespaced plugin sync Provider (encrypted-object storage only). */
+  connectPluginProvider: (
+    providerId: string,
+    configuration?: unknown,
+    credential?: unknown,
+  ) => Promise<void>;
   connectOneDrive: () => Promise<string>;
   connectWebDAV: (config: WebDAVConfig) => Promise<void>;
   connectS3: (config: S3Config) => Promise<void>;
@@ -96,11 +130,31 @@ export interface CloudSyncHook {
   resetProviderStatus: (provider: CloudProvider) => void;
 
   // Sync Actions
-  syncNow: (payload: SyncPayload, opts?: { overrideShrink?: boolean; conflictActionOverride?: CloudSyncConflictAction }) => Promise<Map<CloudProvider, SyncResult>>;
-  syncToProvider: (provider: CloudProvider, payload: SyncPayload, opts?: { overrideShrink?: boolean }) => Promise<SyncResult>;
+  syncNow: (payload: SyncPayload, opts?: CloudSyncRunOptions) => Promise<Map<CloudProvider, SyncResult>>;
+  syncToProvider: (
+    provider: CloudProvider,
+    payload: SyncPayload,
+    opts?: Pick<CloudSyncRunOptions, 'overrideShrink' | 'applyConvergentPayload' | 'signal'>,
+  ) => Promise<SyncResult>;
   downloadFromProvider: (provider: CloudProvider) => Promise<RemoteSyncPayload | null>;
   commitRemoteInspection: (provider: CloudProvider, remoteFile: SyncedFile, payload: SyncPayload, opts?: { recordDownload?: boolean }) => Promise<void>;
   resolveConflict: (resolution: ConflictResolution) => Promise<RemoteSyncPayload | null>;
+  resolveConvergentConflict: (
+    addressKey: string,
+    candidateDot: string,
+    applyPayload: (
+      payload: SyncPayload,
+      commitReplica: () => Promise<void>,
+    ) => Promise<void>,
+  ) => Promise<{ payload: SyncPayload; results: Map<CloudProvider, SyncResult> }>;
+  downgradeConvergentSync: (
+    confirmed: boolean,
+    buildLocalPayload: () => SyncPayload | Promise<SyncPayload>,
+    applyPayload: (
+      payload: SyncPayload,
+      commitReplica: () => Promise<void>,
+    ) => Promise<void>,
+  ) => Promise<Map<CloudProvider, SyncResult>>;
 
   // Gist Revision History
   getGistRevisionHistory: () => Promise<Array<{ version: string; date: Date }>>;
@@ -111,6 +165,7 @@ export interface CloudSyncHook {
       hostCount: number;
       keyCount: number;
       snippetCount: number;
+      noteCount: number;
       identityCount: number;
       portForwardingRuleCount: number;
     };
@@ -120,6 +175,11 @@ export interface CloudSyncHook {
   setAutoSync: (enabled: boolean, intervalMinutes?: number) => void;
   setDeviceName: (name: string) => void;
   setSyncStrategy: (strategy: CloudSyncStrategy) => void;
+  /** Whether AI chat sessions are included in cloud sync payloads (opt-in). */
+  aiSessionsSyncEnabled: boolean;
+  setAiSessionsSyncEnabled: (enabled: boolean) => Promise<void>;
+  setConvergentSyncEnabled: (enabled: boolean) => ConvergentSyncLocalConfig;
+  refreshConvergentSyncConfig: () => ConvergentSyncLocalConfig;
 
   // Local Data Reset
   resetLocalVersion: () => void;
@@ -194,6 +254,25 @@ const getSnapshot = (): SyncManagerState => {
   return manager.getState();
 };
 
+function readAiSessionsSyncEnabled(): boolean {
+  return localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled === true;
+}
+
+function subscribeAiSessionsSyncEnabled(listener: () => void): () => void {
+  const storage = (event: StorageEvent) => {
+    if (event.key === STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS || event.key === null) listener();
+  };
+  const local = (event: Event) => {
+    if ((event as CustomEvent<{ key?: string }>).detail?.key === STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS) listener();
+  };
+  window.addEventListener('storage', storage);
+  window.addEventListener(LOCAL_STORAGE_ADAPTER_CHANGED_EVENT, local);
+  return () => {
+    window.removeEventListener('storage', storage);
+    window.removeEventListener(LOCAL_STORAGE_ADAPTER_CHANGED_EVENT, local);
+  };
+}
+
 export const useCloudSync = (): CloudSyncHook => {
   // Use useSyncExternalStore for real-time state sync across all components
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
@@ -206,43 +285,61 @@ export const useCloudSync = (): CloudSyncHook => {
   const activeOAuthProviderRef = useRef<'google' | 'onedrive' | null>(null);
   const activeGitHubAuthAbortRef = useRef<AbortController | null>(null);
   const activeGitHubAuthAttemptIdRef = useRef<number | null>(null);
+  const convergentSyncConfig = useSyncExternalStore(
+    subscribeConvergentSyncLocalConfig,
+    getConvergentSyncLocalConfigSnapshot,
+    getConvergentSyncLocalConfigSnapshot,
+  );
 
-  // Auto-unlock: if a master key exists, retrieve the persisted password (Electron safeStorage)
-  // and unlock silently so users don't have to manage a LOCKED state in the UI.
-  // Track the master key config hash to detect when a new master key is set up in another window.
-  const lastMasterKeyHashRef = useRef<string | null>(null);
-  const attemptedAutoUnlockRef = useRef(false);
+  useCloudSyncAutoUnlock({
+    securityState: state.securityState,
+    masterKeyIdentity: state.masterKeyConfig
+      ? JSON.stringify(state.masterKeyConfig)
+      : null,
+    manager,
+    bridge: netcattyBridge.get(),
+  });
+
   useEffect(() => {
-    // Compute a simple hash of the master key config to detect changes
-    const currentHash = state.masterKeyConfig 
-      ? JSON.stringify({ salt: state.masterKeyConfig.salt, kdf: state.masterKeyConfig.kdf })
-      : null;
-    
-    // If master key config changed (e.g., set up in settings window), reset the attempt flag
-    if (currentHash !== lastMasterKeyHashRef.current) {
-      lastMasterKeyHashRef.current = currentHash;
-      attemptedAutoUnlockRef.current = false;
-    }
-    
-    if (attemptedAutoUnlockRef.current) return;
-    if (state.securityState !== 'LOCKED') return;
-    attemptedAutoUnlockRef.current = true;
+    if (state.securityState !== 'UNLOCKED') return;
+    if (!getConvergentSyncLocalConfig().initialized) return;
+    void manager.refreshConvergentConflicts().catch(() => {
+      // A missing/corrupt replica is surfaced by the next explicit sync.
+    });
+  }, [state.securityState]);
 
-    void (async () => {
+  // Keep plugin sync provider availability aligned with live contributions so
+  // disabled/uninstalled providers leave the auto-sync ready set after restart.
+  useEffect(() => {
+    let cancelled = false;
+    const refreshAvailable = async () => {
       try {
-        const bridge = netcattyBridge.get();
-        const password = await bridge?.cloudSyncGetSessionPassword?.();
-        if (!password) return;
-
-        const ok = await manager.unlock(password);
-        if (!ok) {
-          void bridge?.cloudSyncClearSessionPassword?.();
-        }
+        const { pluginExtensionBridge } = await import('./pluginExtensionBridge');
+        const listed = await pluginExtensionBridge.listProviders('sync');
+        if (cancelled) return;
+        const ids = (listed ?? []).map((entry) => {
+          const nested = (entry as { provider?: { id?: string } }).provider;
+          return typeof nested?.id === 'string' ? nested.id : '';
+        }).filter((id) => id.length > 0);
+        manager.setAvailablePluginSyncProviders(ids);
       } catch {
-        // Ignore auto-unlock errors; manual actions will surface them.
+        // Transient IPC / host startup failures must not wipe the availability
+        // catalog; leave the previous set until a successful discovery.
       }
-    })();
-  }, [state.securityState, state.masterKeyConfig]);
+    };
+    void refreshAvailable();
+    let unsubscribe = () => {};
+    void import('./pluginExtensionBridge').then(({ pluginExtensionBridge }) => {
+      if (cancelled) return;
+      unsubscribe = pluginExtensionBridge.onContributionsChanged(() => {
+        void refreshAvailable();
+      });
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
   
   // ========== Computed Values ==========
   
@@ -616,6 +713,18 @@ export const useCloudSync = (): CloudSyncHook => {
   const connectS3 = useCallback(async (config: S3Config): Promise<void> => {
     await manager.connectConfigProvider('s3', config);
   }, []);
+
+  /**
+   * Connect a namespaced plugin sync Provider (encrypted-object storage only).
+   * Configuration is opaque plugin-owned JSON; encryption stays host-owned.
+   */
+  const connectPluginProvider = useCallback(async (
+    providerId: string,
+    configuration: unknown = {},
+    credential?: unknown,
+  ): Promise<void> => {
+    await manager.connectPluginProvider(providerId, configuration, credential);
+  }, []);
   
   const cancelOAuthConnect = useCallback(() => {
     const githubAbort = activeGitHubAuthAbortRef.current;
@@ -637,6 +746,19 @@ export const useCloudSync = (): CloudSyncHook => {
   
   const setDeviceName = useCallback((name: string) => {
     manager.setDeviceName(name);
+  }, []);
+
+  const aiSessionsSyncEnabled = useSyncExternalStore(
+    subscribeAiSessionsSyncEnabled, readAiSessionsSyncEnabled, readAiSessionsSyncEnabled,
+  );
+  const setAiSessionsSyncEnabled = useCallback(async (enabled: boolean) => {
+    const { setAiSessionsSyncPreference } = await import('../syncPayload');
+    await setAiSessionsSyncPreference(enabled, async () => {
+      const providers = Object.entries(manager.getAllProviders())
+        .filter(([, connection]) => isProviderReadyForSync(connection));
+      const remotes = await Promise.all(providers.map(([provider]) => manager.downloadFromProvider(provider as CloudProvider)));
+      return remotes.filter((remote) => remote !== null).map((remote) => remote.payload);
+    }, manager.getState().syncStrategy === 'smartMergePreserve');
   }, []);
 
   const setSyncStrategy = useCallback((strategy: CloudSyncStrategy) => {
@@ -672,14 +794,50 @@ export const useCloudSync = (): CloudSyncHook => {
     throw new Error('Vault is locked');
   }, []);
 
-  const syncNowWithUnlock = useCallback(async (payload: SyncPayload, opts?: { overrideShrink?: boolean; conflictActionOverride?: CloudSyncConflictAction }) => {
+  const syncNowWithUnlock = useCallback(async (payload: SyncPayload, opts?: CloudSyncRunOptions) => {
     await ensureUnlocked();
-    return await manager.syncAllProviders(payload, opts);
+    const controller = new AbortController();
+    let onAbort: (() => void) | undefined;
+    if (opts?.signal) {
+      if (opts.signal.aborted) controller.abort();
+      else {
+        onAbort = () => controller.abort();
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
+    try {
+      const results = await manager.syncAllProviders(payload, { ...opts, signal: controller.signal });
+      const { commitPluginSidecarsAfterSuccessfulSync } = await import('../pluginSyncSidecarBridge');
+      commitPluginSidecarsAfterSuccessfulSync(payload, results.values());
+      return results;
+    } finally {
+      if (opts?.signal && onAbort) opts.signal.removeEventListener('abort', onAbort);
+    }
   }, [ensureUnlocked]);
 
-  const syncToProviderWithUnlock = useCallback(async (provider: CloudProvider, payload: SyncPayload, opts?: { overrideShrink?: boolean }) => {
+  const syncToProviderWithUnlock = useCallback(async (
+    provider: CloudProvider,
+    payload: SyncPayload,
+    opts?: Pick<CloudSyncRunOptions, 'overrideShrink' | 'applyConvergentPayload' | 'signal'>,
+  ) => {
     await ensureUnlocked();
-    return await manager.syncToProvider(provider, payload, opts);
+    const controller = new AbortController();
+    let onAbort: (() => void) | undefined;
+    if (opts?.signal) {
+      if (opts.signal.aborted) controller.abort();
+      else {
+        onAbort = () => controller.abort();
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
+    try {
+      const result = await manager.syncToProvider(provider, payload, { ...opts, signal: controller.signal });
+      const { commitPluginSidecarsAfterSuccessfulSync } = await import('../pluginSyncSidecarBridge');
+      commitPluginSidecarsAfterSuccessfulSync(payload, [result]);
+      return result;
+    } finally {
+      if (opts?.signal && onAbort) opts.signal.removeEventListener('abort', onAbort);
+    }
   }, [ensureUnlocked]);
 
   const downloadFromProviderWithUnlock = useCallback(async (provider: CloudProvider) => {
@@ -711,6 +869,65 @@ export const useCloudSync = (): CloudSyncHook => {
     await ensureUnlocked();
     return await manager.resolveConflict(resolution);
   }, [ensureUnlocked]);
+
+  const resolveConvergentConflictWithUnlock = useCallback(async (
+    addressKey: string,
+    candidateDot: string,
+    applyPayload: (
+      payload: SyncPayload,
+      commitReplica: () => Promise<void>,
+    ) => Promise<void>,
+  ) => {
+    await ensureUnlocked();
+    // Collect live sidecars so conflict apply/upload does not revert plugin
+    // settings that changed after the last provider baseline. Operational
+    // collection failures must abort (not proceed as empty). Host gated off /
+    // non-authoritative collect must omit the field (not last-known cache) so
+    // apply preserves local DB sidecars.
+    const {
+      collectPluginSyncSidecarsFromHost,
+      isPluginSidecarHostUnavailableError,
+    } = await import('../pluginSyncSidecarBridge');
+    let pluginSidecars: SyncPayload['pluginSidecars'] | undefined;
+    try {
+      const collected = await collectPluginSyncSidecarsFromHost({ liveOnly: true });
+      if (collected) pluginSidecars = collected;
+    } catch (error) {
+      if (isPluginSidecarHostUnavailableError(error)) {
+        // Host gated off: omit field so apply preserves local sidecars.
+      } else {
+        throw error;
+      }
+    }
+    return manager.resolveConvergentConflict(addressKey, candidateDot, applyPayload, {
+      pluginSidecars,
+      aiSessions: (await import('../syncPayload')).collectAiSessionsForSync(),
+    });
+  }, [ensureUnlocked]);
+
+  const refreshConvergentSyncConfig = useCallback(() => {
+    return refreshConvergentSyncLocalConfigSnapshot();
+  }, []);
+
+  const setConvergentSyncEnabled = useCallback((enabled: boolean) => {
+    const current = getConvergentSyncLocalConfig();
+    const next = enabled
+      ? setConvergentSyncLocalConfig({ enabled: true, initialized: current.initialized })
+      : pauseConvergentSync();
+    return next;
+  }, []);
+
+  const downgradeConvergentSyncWithUnlock = useCallback(async (
+    confirmed: boolean,
+    buildLocalPayload: () => SyncPayload | Promise<SyncPayload>,
+    applyPayload: (
+      payload: SyncPayload,
+      commitReplica: () => Promise<void>,
+    ) => Promise<void>,
+  ) => {
+    await ensureUnlocked();
+    return manager.downgradeConvergentSync(confirmed, buildLocalPayload, applyPayload);
+  }, [ensureUnlocked]);
   
   return {
     // State
@@ -730,6 +947,9 @@ export const useCloudSync = (): CloudSyncHook => {
     remoteVersion: state.remoteVersion,
     remoteUpdatedAt: state.remoteUpdatedAt,
     syncHistory: state.syncHistory,
+    pendingLocalSync: state.pendingLocalSync,
+    convergentConflicts: state.convergentConflicts,
+    convergentSyncConfig,
     pendingBrowserAuthProvider: pendingBrowserAuth?.provider ?? null,
     
     // Computed
@@ -751,6 +971,7 @@ export const useCloudSync = (): CloudSyncHook => {
     connectOneDrive,
     connectWebDAV,
     connectS3,
+    connectPluginProvider,
     completePKCEAuth,
     cancelOAuthConnect,
     disconnectProvider,
@@ -762,6 +983,8 @@ export const useCloudSync = (): CloudSyncHook => {
     downloadFromProvider: downloadFromProviderWithUnlock,
     commitRemoteInspection: commitRemoteInspectionWithUnlock,
     resolveConflict: resolveConflictWithUnlock,
+    resolveConvergentConflict: resolveConvergentConflictWithUnlock,
+    downgradeConvergentSync: downgradeConvergentSyncWithUnlock,
 
     // Gist Revision History (#679)
     getGistRevisionHistory: manager.getGistRevisionHistory.bind(manager),
@@ -771,6 +994,10 @@ export const useCloudSync = (): CloudSyncHook => {
     setAutoSync,
     setDeviceName,
     setSyncStrategy,
+    aiSessionsSyncEnabled,
+    setAiSessionsSyncEnabled,
+    setConvergentSyncEnabled,
+    refreshConvergentSyncConfig,
 
     // Local Data Reset
     resetLocalVersion: () => manager.resetLocalVersion(),

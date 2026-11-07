@@ -1,0 +1,203 @@
+"use strict";
+
+const { CAPABILITY_STATUS } = require("../constants.cjs");
+
+/** @type {import("../types.cjs").CapabilityDefinition[]} */
+const META_CAPABILITIES = [
+  {
+    id: "session.environment",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "List scoped terminal sessions available to the agent.",
+    policy: {
+      write: false,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/getContext", mcpTool: "get_environment" },
+      public: { rpcMethod: "public/getEnvironment", mcpTool: "get_environment" },
+      cli: { command: ["env"] },
+    },
+  },
+  {
+    id: "meta.status",
+    domain: "meta",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Return bridge runtime status and policy configuration.",
+    policy: {
+      write: false,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: false,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/getStatus" },
+      public: { rpcMethod: "public/getStatus" },
+      cli: { command: ["status"] },
+    },
+  },
+  {
+    id: "attachment.list",
+    domain: "attachment",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "List user-attached files in the current AI chat scope.",
+    policy: {
+      write: false,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/listAttachments", mcpTool: "list_attachments" },
+      cli: { command: ["attachment", "list"] },
+    },
+  },
+  {
+    id: "attachment.read",
+    domain: "attachment",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Read a user-attached file from the current AI chat scope.",
+    policy: {
+      write: false,
+      sensitiveRead: true,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/readAttachment", mcpTool: "read_attachment" },
+      cli: { command: ["attachment", "read"] },
+    },
+  },
+  {
+    id: "session.cancel",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Cancel in-flight operations for a chat session.",
+    policy: {
+      write: false,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/setCancelled" },
+      cli: { command: ["cancel"] },
+    },
+  },
+  {
+    id: "session.resume",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Resume write operations for a cancelled chat session.",
+    policy: {
+      write: false,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/setCancelled" },
+      cli: { command: ["resume"] },
+    },
+  },
+  {
+    id: "session.get",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Get metadata for a single scoped session.",
+    policy: {
+      write: false,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      builtin: { rpcMethod: "netcatty/getContext" },
+      cli: { command: ["session"] },
+    },
+  },
+  {
+    id: "session.reconnect",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Request reconnect of a disconnected session in the current scope, preserving its tab and workspace. Does not restart connected sessions or replay commands. Returns acknowledgement, not shell readiness. Recovery is limited to three attempts with 2/5 second backoff in a 120 second incident; inspect authentication or exhausted recovery instead of retrying indefinitely.",
+    policy: {
+      write: true,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: false,
+      bypassesChatCancel: false,
+    },
+    surfaces: {
+      global: { rpcMethod: "session/reconnect" },
+      public: { rpcMethod: "public/session/reconnect", mcpTool: "session_reconnect" },
+      cli: { command: ["session-reconnect"] },
+    },
+  },
+  {
+    id: "session.recover",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Inspect and recover a scoped disconnected session in place. Automatically applies bounded reconnect/backoff for up to 20 seconds per call and reports ready only once the transport is restored (still-offline budgets return pending); shellReady is advisory (true/false/null) and, when unconfirmed, nextAction \"inspect_shell\" asks you to verify the prompt before typing. Stops for authentication, busy jobs, cancellation or unavailable state. Never creates tabs or executes/replays commands.",
+    policy: {
+      write: true,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: false,
+      bypassesApproval: false,
+      bypassesChatCancel: false,
+    },
+    surfaces: {
+      global: { rpcMethod: "session/recover" },
+      public: { rpcMethod: "public/session/recover", mcpTool: "session_recover" },
+      cli: { command: ["session-recover"] },
+    },
+  },
+  {
+    id: "session.close",
+    domain: "session",
+    status: CAPABILITY_STATUS.IMPLEMENTED,
+    description: "Close a terminal session previously opened by host_open in the current AI scope.",
+    policy: {
+      write: true,
+      sensitiveRead: false,
+      longRunning: false,
+      requiresChatSession: true,
+      bypassesObserverBlock: true,
+      bypassesApproval: true,
+      bypassesChatCancel: true,
+    },
+    surfaces: {
+      global: { rpcMethod: "session/close" },
+      public: { rpcMethod: "public/session/close", mcpTool: "session_close" },
+    },
+  },
+];
+
+module.exports = { META_CAPABILITIES };

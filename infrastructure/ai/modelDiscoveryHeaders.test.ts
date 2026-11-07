@@ -18,7 +18,7 @@ test("buildModelDiscoveryHeaders uses Bearer auth for the openai-compatible fami
 
 test("buildModelDiscoveryHeaders uses x-goog-api-key for the google family", () => {
   // Google Generative AI rejects Bearer auth — discovery has to match
-  // the createGoogleGenerativeAI runtime client, which uses x-goog-api-key.
+  // the createGoogle runtime client, which uses x-goog-api-key.
   assert.deepEqual(buildModelDiscoveryHeaders("google", "AIza-test"), {
     "x-goog-api-key": "AIza-test",
   });
@@ -56,4 +56,13 @@ test("resolveModelsDiscoveryEndpoint falls back to the preset path only when the
   // google has no STYLE_DEFAULT — preserve whatever the caller passed.
   assert.equal(resolveModelsDiscoveryEndpoint("google", "/custom/list"), "/custom/list");
   assert.equal(resolveModelsDiscoveryEndpoint("google", undefined), undefined);
+});
+
+test('custom discovery headers override default auth regardless of case', () => {
+  for (const [style, name] of [['openai', 'authorization'], ['anthropic', 'X-API-Key'], ['google', 'X-Goog-Api-Key']] as const) {
+    const headers = buildModelDiscoveryHeaders(style, 'default-key', { [name]: 'custom-key', 'X-Tenant': 'tenant' });
+    assert.equal(headers[name], 'custom-key');
+    assert.equal(Object.keys(headers).filter(key => key.toLowerCase() === name.toLowerCase()).length, 1);
+    assert.equal(headers['X-Tenant'], 'tenant');
+  }
 });

@@ -21,6 +21,38 @@ export const parseKeyCombo = (keyStr: string): { modifiers: string[]; key: strin
   return { modifiers: parts, key };
 };
 
+const KEY_STRING_TO_EVENT_KEY: Record<string, string> = {
+  Space: ' ',
+  '↑': 'ArrowUp',
+  '↓': 'ArrowDown',
+  '←': 'ArrowLeft',
+  '→': 'ArrowRight',
+  Esc: 'Escape',
+  '⌫': 'Backspace',
+  Del: 'Delete',
+  '↵': 'Enter',
+  '⇥': 'Tab',
+};
+
+/** Rebuild a keydown-like event from a stored shortcut string for matching. */
+export const keyStringToKeyboardEvent = (keyString: string): KeyboardEvent | null => {
+  const parsed = parseKeyCombo(keyString);
+  if (!parsed) return null;
+
+  const modifiers = new Set(parsed.modifiers);
+  const mappedKey = KEY_STRING_TO_EVENT_KEY[parsed.key];
+  const key = mappedKey ?? (parsed.key.length === 1 ? parsed.key.toLowerCase() : parsed.key);
+
+  return {
+    key,
+    code: '',
+    metaKey: modifiers.has('⌘') || modifiers.has('Win'),
+    ctrlKey: modifiers.has('⌃') || modifiers.has('Ctrl'),
+    altKey: modifiers.has('⌥') || modifiers.has('Alt'),
+    shiftKey: modifiers.has('Shift'),
+  } as KeyboardEvent;
+};
+
 const PHYSICAL_SHORTCUT_KEY_NAMES: Record<string, string> = {
   Backquote: '`',
   Minus: '-',
@@ -35,11 +67,23 @@ const PHYSICAL_SHORTCUT_KEY_NAMES: Record<string, string> = {
   Slash: '/',
 };
 
-const physicalShortcutKeyName = (e: KeyboardEvent): string | null => {
+const physicalShortcutKeyName = (e: Pick<KeyboardEvent, 'code'>): string | null => {
   const code = e.code;
   if (/^Key[A-Z]$/.test(code)) return code.slice(3);
   if (/^Digit[0-9]$/.test(code)) return code.slice(5);
   return PHYSICAL_SHORTCUT_KEY_NAMES[code] ?? null;
+};
+
+/**
+ * Resolve the 1-9 tab shortcut digit from a key event.
+ * Prefer the physical Digit code so Shift+[1...9] still works when e.key is "!" etc.
+ */
+export const tabShortcutDigitFromEvent = (
+  e: Pick<KeyboardEvent, 'key' | 'code'>,
+): number | null => {
+  const key = physicalShortcutKeyName(e) ?? e.key;
+  if (!/^[1-9]$/.test(key)) return null;
+  return Number.parseInt(key, 10);
 };
 
 const LATIN_SHORTCUT_KEY_PATTERN = /^\p{Script=Latin}$/u;
@@ -104,8 +148,9 @@ export const matchesKeyBinding = (e: KeyboardEvent, keyStr: string, isMac: boole
   // Handle range patterns like "[1...9]"
   if (keyStr.includes('[1...9]')) {
     const basePattern = keyStr.replace('[1...9]', '');
-    const key = physicalShortcutKeyName(e) ?? shortcutEventKey(e);
-    if (!/^[1-9]$/.test(key)) return false;
+    const digit = tabShortcutDigitFromEvent(e);
+    if (digit === null) return false;
+    const key = String(digit);
     // Check modifiers match the base pattern
     const testStr = basePattern + key;
     const physicalDigitEvent = {
@@ -197,6 +242,7 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { id: 'next-tab', action: 'nextTab', label: 'Next Tab', mac: '⌘ + Shift + ]', pc: 'Ctrl + Tab', category: 'tabs' },
   { id: 'prev-tab', action: 'prevTab', label: 'Previous Tab', mac: '⌘ + Shift + [', pc: 'Ctrl + Shift + Tab', category: 'tabs' },
   { id: 'close-tab', action: 'closeTab', label: 'Close Tab', mac: '⌘ + W', pc: 'Ctrl + W', category: 'tabs' },
+  { id: 'close-session', action: 'closeSession', label: 'Close Session Pane', mac: '⌘ + Shift + W', pc: 'Ctrl + Shift + W', category: 'tabs' },
   { id: 'new-tab', action: 'newTab', label: 'New Local Tab', mac: '⌘ + T', pc: 'Ctrl + T', category: 'tabs' },
 
   // Terminal Operations
@@ -214,10 +260,11 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { id: 'move-focus', action: 'moveFocus', label: 'Move focus between Split View panes', mac: '⌘ + ⌥ + arrows', pc: 'Ctrl + Alt + arrows', category: 'navigation' },
   { id: 'split-horizontal', action: 'splitHorizontal', label: 'Split Horizontal', mac: '⌘ + D', pc: 'Ctrl + Shift + D', category: 'navigation' },
   { id: 'split-vertical', action: 'splitVertical', label: 'Split Vertical', mac: '⌘ + Shift + D', pc: 'Ctrl + Shift + E', category: 'navigation' },
+  { id: 'toggle-pane-zoom', action: 'togglePaneZoom', label: 'Toggle Pane Zoom', mac: '⌥ + M', pc: 'Alt + M', category: 'navigation' },
 
   // App Features
   { id: 'open-hosts', action: 'openHosts', label: 'Open Hosts Page', mac: 'Disabled', pc: 'Disabled', category: 'app' },
-  { id: 'open-local', action: 'openLocal', label: 'Open Local Terminal', mac: '⌘ + L', pc: 'Ctrl + L', category: 'app' },
+  { id: 'open-local', action: 'openLocal', label: 'Open Local Terminal', mac: '⌘ + L', pc: 'Disabled', category: 'app' },
   { id: 'open-sftp', action: 'openSftp', label: 'Open SFTP', mac: '⌘ + Shift + O', pc: 'Ctrl + Shift + O', category: 'app' },
   { id: 'port-forwarding', action: 'portForwarding', label: 'Open Port Forwarding', mac: '⌘ + P', pc: 'Ctrl + P', category: 'app' },
   { id: 'command-palette', action: 'commandPalette', label: 'Open Command Palette', mac: '⌘ + K', pc: 'Ctrl + K', category: 'app' },
@@ -226,7 +273,9 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { id: 'snippets', action: 'snippets', label: 'Open Snippets', mac: '⌘ + Shift + S', pc: 'Ctrl + Shift + S', category: 'app' },
   { id: 'broadcast', action: 'broadcast', label: 'Switch the Broadcast Mode', mac: '⌘ + B', pc: 'Ctrl + B', category: 'app' },
   { id: 'toggle-side-panel', action: 'toggleSidePanel', label: 'Toggle Side Panel', mac: '⌘ + \\', pc: 'Ctrl + \\', category: 'app' },
+  { id: 'toggle-host-tree', action: 'toggleHostTree', label: 'Toggle Host List', mac: '⌘ + Shift + B', pc: 'Ctrl + Shift + B', category: 'app' },
   { id: 'open-settings', action: 'openSettings', label: 'Open Settings', mac: '⌘ + ,', pc: 'Ctrl + ,', category: 'app' },
+  { id: 'toggle-opacity', action: 'toggleOpacity', label: 'Toggle Window Transparency', mac: '⌘ + U', pc: 'Ctrl + Shift + U', category: 'app' },
 
   // SFTP Operations
   { id: 'sftp-copy', action: 'sftpCopy', label: 'Copy Files', mac: '⌘ + C', pc: 'Ctrl + C', category: 'sftp' },

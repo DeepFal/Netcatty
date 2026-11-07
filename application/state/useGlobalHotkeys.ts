@@ -23,6 +23,7 @@ export const getAppLevelActions = (): Set<string> => {
     'nextTab',
     'prevTab',
     'closeTab',
+    'closeSession',
     'newTab',
     'openHosts',
     'openSftp',
@@ -35,8 +36,10 @@ export const getAppLevelActions = (): Set<string> => {
     'splitVertical',
     'moveFocus',
     'broadcast',
+    'togglePaneZoom',
     'openLocal',
     'openSettings',
+    'toggleOpacity',
   ]);
 };
 

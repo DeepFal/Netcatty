@@ -49,6 +49,10 @@ function createMoshStatsConnectionApi(ctx) {
   // when not wired in (e.g. older callers / some unit tests) the verifier
   // simply skips the system-known_hosts fallback.
   const isHostKeyTrustedBySystem = ctx.isHostKeyTrustedBySystem;
+  // FIDO2 sk-* key handles parse as OpenSSH keys but can never sign locally —
+  // signing stays on the hardware token via ssh-add / the FIDO agent. The
+  // stats companion must not build a software certificate agent from them.
+  const { looksLikeSkOpenSshMaterial } = require("../sshAuthHelper.cjs");
   with (ctx) {
     // Resolve a usable, non-interactive private key (+ passphrase) for the
     // companion connection. Returns null when the key is missing, encrypted
@@ -71,10 +75,11 @@ function createMoshStatsConnectionApi(ctx) {
 
     // Read identity files from disk without prompting. Only unencrypted keys
     // (or keys whose stored passphrase parses them) are returned.
-    async function resolveNonInteractiveIdentityFile(identityFilePaths, passphrase) {
+    async function resolveNonInteractiveIdentityFiles(identityFilePaths, passphrase) {
       if (!Array.isArray(identityFilePaths) || identityFilePaths.length === 0) {
-        return null;
+        return [];
       }
+      const keys = [];
       for (const rawPath of identityFilePaths) {
         if (typeof rawPath !== "string" || rawPath.trim().length === 0) continue;
         const resolvedPath = expandIdentityFilePath(rawPath);
@@ -86,9 +91,9 @@ function createMoshStatsConnectionApi(ctx) {
         }
         if (!content) continue;
         const key = resolveNonInteractiveKey(content, passphrase);
-        if (key) return key;
+        if (key) keys.push(key);
       }
-      return null;
+      return keys;
     }
 
     // An ssh2 hostVerifier that ACCEPTS the transport only when the live host
@@ -116,8 +121,14 @@ function createMoshStatsConnectionApi(ctx) {
     // keys. `trust.trusted` additionally gates the password method in the
     // authHandler (defense in depth); `trust.rejected` lets the caller treat an
     // untrusted host as a permanent failure so it stops reconnecting every poll.
-    function createTrustEnforcingHostVerifier({ hostname, port, knownHosts, trust }) {
+    function createTrustEnforcingHostVerifier({ hostname, port, knownHosts, verifyHostKeys = true, trust, label }) {
       return (rawKey, callback) => {
+        if (verifyHostKeys === false) {
+          trust.trusted = true;
+          callback(true);
+          return;
+        }
+
         try {
           const keyInfo = hostKeyVerifier.describeHostKey(rawKey);
           const decision = hostKeyVerifier.classifyHostKey({
@@ -140,7 +151,7 @@ function createMoshStatsConnectionApi(ctx) {
             }) === true;
           }
         } catch (err) {
-          log("[Mosh] stats companion host-key check failed:", err?.message || String(err));
+          log(`[${label}] stats companion host-key check failed:`, err?.message || String(err));
           trust.trusted = false;
         }
         if (!trust.trusted) trust.rejected = true;
@@ -150,14 +161,22 @@ function createMoshStatsConnectionApi(ctx) {
 
     // A function-form ssh2 authHandler that offers, in order: none, agent (if
     // available), publickey (if a key was resolved), and — only when the host
-    // key is trusted — password and keyboard-interactive. Returning method
-    // name strings lets ssh2 pull the credential data from connectOpts. This
-    // is what actually withholds the password from an untrusted host while
-    // still letting key/agent auth succeed.
-    function createGatedAuthHandler({ hasAgent, hasKey, hasPassword, trust }) {
+    // key is trusted — password and keyboard-interactive. Agent/password
+    // methods use names from connectOpts; identity files use explicit key
+    // objects so every discovered key can be attempted. This is what actually
+    // withholds the password from an untrusted host while still letting
+    // key/agent auth succeed.
+    function createGatedAuthHandler({ hasAgent, keys, hasPassword, trust, username }) {
       const methods = ["none"];
       if (hasAgent) methods.push("agent");
-      if (hasKey) methods.push("publickey");
+      for (const key of keys) {
+        methods.push({
+          type: "publickey",
+          username,
+          key: key.privateKey,
+          passphrase: key.passphrase,
+        });
+      }
       let index = 0;
       let trustedMethodsAppended = false;
       return (_methodsLeft, _partialSuccess, callback) => {
@@ -178,7 +197,7 @@ function createMoshStatsConnectionApi(ctx) {
       };
     }
 
-    async function buildStatsConnectOpts(auth) {
+    async function buildStatsConnectOpts(auth, label = "Mosh") {
       const connectOpts = {
         host: auth.hostname,
         port: auth.port || 22,
@@ -197,9 +216,26 @@ function createMoshStatsConnectionApi(ctx) {
 
       const hasCertificate =
         typeof auth.certificate === "string" && auth.certificate.trim().length > 0;
-      const key =
-        resolveNonInteractiveKey(auth.privateKey, auth.passphrase) ||
-        await resolveNonInteractiveIdentityFile(auth.identityFilePaths, auth.passphrase);
+      const allowLocalKeyFallbackWithAgent = auth.authMethod === "auto";
+      let inlineKey = auth.useSshAgent && !allowLocalKeyFallbackWithAgent
+        ? null
+        : resolveNonInteractiveKey(auth.privateKey, auth.passphrase);
+      // SK key handles parse non-interactively but cannot sign locally. A
+      // software NetcattyAgent built around one always fails signing — and its
+      // non-null presence would skip prepareSystemSshAgentForAuth() below, so
+      // the companion would never use the hardware-backed agent that the
+      // Mosh/ET session itself authenticated with. Route SK material to the
+      // prepared agent instead.
+      if (inlineKey && looksLikeSkOpenSshMaterial(inlineKey.privateKey)) {
+        inlineKey = null;
+      }
+      const keys = inlineKey
+        ? [inlineKey]
+        : auth.useSshAgent && !allowLocalKeyFallbackWithAgent
+          ? []
+          : (await resolveNonInteractiveIdentityFiles(auth.identityFilePaths, auth.passphrase))
+            .filter((candidate) => !looksLikeSkOpenSshMaterial(candidate.privateKey));
+      const key = keys[0] || null;
 
       let agent = null;
       if (hasCertificate && key) {
@@ -227,6 +263,22 @@ function createMoshStatsConnectionApi(ctx) {
         if (key.passphrase) connectOpts.passphrase = key.passphrase;
       }
 
+      if (!agent && auth.useSshAgent && typeof prepareSystemSshAgentForAuth === "function") {
+        const prepared = await prepareSystemSshAgentForAuth({
+          ...auth,
+          resolveWebContents: () => auth.webContents && !auth.webContents.isDestroyed?.()
+            ? auth.webContents : null,
+        }, `[${label} Stats]`);
+        connectOpts.agent = prepared;
+        if (typeof prepared?._releaseNetcattyFidoAgent === "function") {
+          // Surface the release hook on connectOpts so establishStatsConnection
+          // can drop the owned FIDO agent / askpass lease on close, error, or
+          // sessionGone — this consumer never attaches the agent to a long-lived
+          // SSHClient lifecycle helper.
+          connectOpts._releaseNetcattyFidoAgent = prepared._releaseNetcattyFidoAgent;
+        }
+      }
+
       if (typeof auth.password === "string" && auth.password.length > 0) {
         connectOpts.password = auth.password;
         // Many SSH servers (PAM-backed) only offer password auth through
@@ -246,8 +298,8 @@ function createMoshStatsConnectionApi(ctx) {
       // any saved password (ssh2 tries agent before password), so a
       // public-key host that also happens to have a stored password still
       // authenticates via the agent instead of failing on password-only.
-      if (!agent && !connectOpts.privateKey) {
-        const agentSocket = getSshAgentSocket();
+      if (auth.useSshAgent !== false && !connectOpts.agent && !agent && !inlineKey) {
+        const agentSocket = getSshAgentSocket(auth.identityAgent);
         if (agentSocket) {
           connectOpts.agent = agentSocket;
         }
@@ -267,19 +319,23 @@ function createMoshStatsConnectionApi(ctx) {
         hostname: connectOpts.host,
         port: connectOpts.port,
         knownHosts: auth.knownHosts,
+        verifyHostKeys: auth.verifyHostKeys,
         trust,
+        label,
       });
 
       // When a plaintext password is in play, also gate it behind the trust
       // flag in the authHandler (defense in depth): key/agent methods are
       // offered first, and the password / keyboard-interactive methods only
       // once the verifier has confirmed the host key is trusted.
-      if (connectOpts.password) {
+      const authKeys = agent ? [] : keys;
+      if (connectOpts.password || authKeys.length > 1) {
         connectOpts.authHandler = createGatedAuthHandler({
           hasAgent: Boolean(connectOpts.agent),
-          hasKey: Boolean(connectOpts.privateKey),
-          hasPassword: true,
+          keys: authKeys,
+          hasPassword: Boolean(connectOpts.password),
           trust,
+          username: connectOpts.username,
         });
       }
 
@@ -310,21 +366,41 @@ function createMoshStatsConnectionApi(ctx) {
      * @param {Electron.WebContents} [webContents] - sender of the stats IPC,
      *   used only for certificate-agent construction.
      */
-    function ensureMoshStatsConnection(session, sessionId, webContents) {
+    function ensureStatsConnection(session, sessionId, webContents, opts) {
       if (!session) return Promise.resolve(null);
       // A previously established companion is reused.
-      if (session.moshStatsConn) return Promise.resolve(session.moshStatsConn);
+      if (session[opts.connProp]) return Promise.resolve(session[opts.connProp]);
       // A prior attempt permanently failed — don't keep retrying every poll.
-      if (session.moshStatsConnFailed) return Promise.resolve(null);
+      if (session[opts.failedProp]) return Promise.resolve(null);
       // Reuse an in-flight attempt so two near-simultaneous polls don't open
       // two connections.
-      if (session.moshStatsConnPromise) return session.moshStatsConnPromise;
+      if (session[opts.promiseProp]) return session[opts.promiseProp];
 
-      const promise = establishMoshStatsConnection(session, sessionId, webContents).finally(() => {
-        session.moshStatsConnPromise = null;
+      const promise = establishStatsConnection(session, sessionId, webContents, opts).finally(() => {
+        session[opts.promiseProp] = null;
       });
-      session.moshStatsConnPromise = promise;
+      session[opts.promiseProp] = promise;
       return promise;
+    }
+
+    function ensureMoshStatsConnection(session, sessionId, webContents) {
+      return ensureStatsConnection(session, sessionId, webContents, {
+        label: "Mosh",
+        authProp: "moshStatsAuth",
+        connProp: "moshStatsConn",
+        failedProp: "moshStatsConnFailed",
+        promiseProp: "moshStatsConnPromise",
+      });
+    }
+
+    function ensureEtStatsConnection(session, sessionId, webContents) {
+      return ensureStatsConnection(session, sessionId, webContents, {
+        label: "ET",
+        authProp: "etStatsAuth",
+        connProp: "etStatsConn",
+        failedProp: "etStatsConnFailed",
+        promiseProp: "etStatsConnPromise",
+      });
     }
 
     // True once the session has gone away — either explicitly closed or
@@ -334,8 +410,8 @@ function createMoshStatsConnectionApi(ctx) {
       return session.closed || sessions.get(sessionId) !== session;
     }
 
-    async function establishMoshStatsConnection(session, sessionId, webContents) {
-      const auth = session.moshStatsAuth;
+    async function establishStatsConnection(session, sessionId, webContents, opts) {
+      const auth = session[opts.authProp];
       if (!auth || !auth.hostname) {
         // moshStatsAuth is only assigned once the handshake completes and the
         // session swaps to mosh-client. The renderer can mark a session
@@ -349,16 +425,31 @@ function createMoshStatsConnectionApi(ctx) {
       const { connectOpts, hasAnyAuth, trust } = await buildStatsConnectOpts({
         ...auth,
         webContents,
-      });
+      }, opts.label);
+      const releaseStatsFidoAgent = (() => {
+        const releaseFn = connectOpts?._releaseNetcattyFidoAgent;
+        if (typeof releaseFn !== "function") return () => {};
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          try { releaseFn(); } catch { /* ignore */ }
+        };
+      })();
+      // Do not forward the internal release hook into ssh2 connect options.
+      delete connectOpts._releaseNetcattyFidoAgent;
+
       if (!hasAnyAuth) {
         // Nothing we can authenticate with non-interactively (e.g. the user
         // typed a password into the Mosh handshake PTY that we never stored).
-        session.moshStatsConnFailed = true;
+        releaseStatsFidoAgent();
+        session[opts.failedProp] = true;
         return null;
       }
 
       // The session may have been closed while we were reading identity files.
       if (sessionGone(session, sessionId)) {
+        releaseStatsFidoAgent();
         return null;
       }
 
@@ -399,7 +490,8 @@ function createMoshStatsConnectionApi(ctx) {
         // retry.
         const fail = (err, permanent) => {
           try { conn.end(); } catch { /* ignore */ }
-          if (permanent) session.moshStatsConnFailed = true;
+          releaseStatsFidoAgent();
+          if (permanent) session[opts.failedProp] = true;
           finish(null);
         };
 
@@ -407,20 +499,22 @@ function createMoshStatsConnectionApi(ctx) {
           // The session may have been closed while we were connecting.
           if (sessionGone(session, sessionId)) {
             try { conn.end(); } catch { /* ignore */ }
+            releaseStatsFidoAgent();
             finish(null);
             return;
           }
-          // Stored only on moshStatsConn — never on session.conn (see the
-          // ensureMoshStatsConnection docstring for why).
-          session.moshStatsConn = conn;
+          // Stored only on the protocol-specific companion property
+          // (opts.connProp, e.g. moshStatsConn / etStatsConn) — never on
+          // session.conn (see ensureMoshStatsConnection docstring for why).
+          session[opts.connProp] = conn;
           finish(conn);
         });
 
         conn.on("error", (err) => {
-          log("[Mosh] stats companion connection error:", err?.message || String(err));
+          log(`[${opts.label}] stats companion connection error:`, err?.message || String(err));
           // If this fired after we already adopted the connection, drop the
           // stale handle so the next poll can rebuild a fresh one.
-          if (session.moshStatsConn === conn) session.moshStatsConn = null;
+          if (session[opts.connProp] === conn) session[opts.connProp] = null;
           // Auth rejection won't change with the same stored credentials, and a
           // host-key rejection (untrusted host) won't either until the user
           // vets the host via a real session — treat both as permanent so we
@@ -429,10 +523,12 @@ function createMoshStatsConnectionApi(ctx) {
         });
 
         conn.on("close", () => {
-          if (session.moshStatsConn === conn) session.moshStatsConn = null;
+          if (session[opts.connProp] === conn) session[opts.connProp] = null;
+          releaseStatsFidoAgent();
           // If the socket closed mid-handshake without ever emitting "ready"
           // or "error", settle the attempt here so the awaiting getServerStats
-          // call (and session.moshStatsConnPromise) don't hang forever. This
+          // call (and the in-flight promise on opts.promiseProp) don't hang
+          // forever. This
           // is treated as transient — the next poll may retry.
           finish(null);
         });
@@ -440,7 +536,7 @@ function createMoshStatsConnectionApi(ctx) {
         try {
           conn.connect(connectOpts);
         } catch (err) {
-          log("[Mosh] stats companion connect threw:", err?.message || String(err));
+          log(`[${opts.label}] stats companion connect threw:`, err?.message || String(err));
           // A synchronous throw from connect() (e.g. malformed options) won't
           // succeed on retry either.
           fail(err, true);
@@ -448,7 +544,7 @@ function createMoshStatsConnectionApi(ctx) {
       });
     }
 
-    return { ensureMoshStatsConnection };
+    return { ensureMoshStatsConnection, ensureEtStatsConnection };
   }
 }
 

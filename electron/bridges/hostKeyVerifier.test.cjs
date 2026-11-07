@@ -272,6 +272,29 @@ test("createHostVerifier accepts trusted host keys without prompting", async () 
   assert.deepEqual(sent, []);
 });
 
+test("createHostVerifier skips prompts when host key verification is disabled", async () => {
+  const rawKey = Buffer.from("untrusted server key");
+  const sent = [];
+  const sender = {
+    id: 1,
+    isDestroyed: () => false,
+    send: (channel, payload) => sent.push({ channel, payload }),
+  };
+  const verifier = createHostVerifier({
+    sender,
+    sessionId: "session-1",
+    hostname: "switch.local",
+    port: 22,
+    knownHosts: [],
+    verifyHostKeys: false,
+  });
+
+  const accepted = await new Promise((resolve) => verifier(rawKey, resolve));
+
+  assert.equal(accepted, true);
+  assert.deepEqual(sent, []);
+});
+
 test("createHostVerifier accepts imported full known_hosts public keys without prompting", async () => {
   const rawKey = makeRawPublicKey("ssh-ed25519");
   const sent = [];
@@ -324,13 +347,134 @@ test("createHostVerifier prompts for unknown host keys and waits for user respon
   assert.equal(sent[0].payload.hostname, "switch.local");
   assert.equal(sent[0].payload.status, "unknown");
 
-  handleResponse(null, {
+  handleResponse({ sender: { id: sender.id } }, {
     requestId: sent[0].payload.requestId,
     accept: true,
     addToKnownHosts: true,
   });
 
   assert.equal(await acceptedPromise, true);
+});
+
+test("createHostVerifier answers rekeys synchronously with the key accepted at connect", async () => {
+  const rawKey = Buffer.from("new server key");
+  const sent = [];
+  const sender = {
+    id: 1,
+    isDestroyed: () => false,
+    send: (channel, payload) => sent.push({ channel, payload }),
+  };
+  // The knownHosts snapshot stays empty for the life of the connection, as it
+  // does when the user picks "Continue" or "Add and continue" on first connect.
+  const verifier = createHostVerifier({
+    sender,
+    sessionId: "session-1",
+    hostname: "switch.local",
+    port: 22,
+    knownHosts: [],
+  });
+
+  const acceptedPromise = new Promise((resolve) => verifier(rawKey, resolve));
+  assert.equal(sent.length, 1);
+  handleResponse({ sender: { id: sender.id } }, {
+    requestId: sent[0].payload.requestId,
+    accept: true,
+    addToKnownHosts: false,
+  });
+  assert.equal(await acceptedPromise, true);
+
+  // ssh2 re-runs the verifier on every rekey. It must answer before returning
+  // (ssh2 keeps sending channel data while an async answer is pending) and
+  // must not show the host-key dialog again.
+  const rekeyResults = [];
+  verifier(Buffer.from(rawKey), (ok) => rekeyResults.push(ok));
+  assert.deepEqual(rekeyResults, [true]);
+  assert.equal(sent.length, 1);
+});
+
+test("createHostVerifier rejects a different host key on rekey without prompting", async () => {
+  const rawKey = Buffer.from("trusted server key");
+  const fingerprint = crypto.createHash("sha256").update(rawKey).digest("base64").replace(/=+$/g, "");
+  const sent = [];
+  const sender = {
+    id: 1,
+    isDestroyed: () => false,
+    send: (channel, payload) => sent.push({ channel, payload }),
+  };
+  const verifier = createHostVerifier({
+    sender,
+    sessionId: "session-1",
+    hostname: "switch.local",
+    port: 22,
+    knownHosts: [{
+      id: "kh-1",
+      hostname: "switch.local",
+      port: 22,
+      keyType: "unknown",
+      publicKey: `SHA256:${fingerprint}`,
+      discoveredAt: 1,
+    }],
+  });
+
+  assert.equal(await new Promise((resolve) => verifier(rawKey, resolve)), true);
+
+  const rekeyResults = [];
+  verifier(Buffer.from("other server key"), (ok) => rekeyResults.push(ok));
+  assert.deepEqual(rekeyResults, [false]);
+  assert.deepEqual(sent, []);
+});
+
+test("createHostVerifier still prompts on the next connect after a rejected key", async () => {
+  const rawKey = Buffer.from("new server key");
+  const sent = [];
+  const sender = {
+    id: 1,
+    isDestroyed: () => false,
+    send: (channel, payload) => sent.push({ channel, payload }),
+  };
+  const verifier = createHostVerifier({
+    sender,
+    sessionId: "session-1",
+    hostname: "switch.local",
+    port: 22,
+    knownHosts: [],
+  });
+
+  const first = new Promise((resolve) => verifier(rawKey, resolve));
+  handleResponse({ sender: { id: sender.id } }, { requestId: sent[0].payload.requestId, accept: false });
+  assert.equal(await first, false);
+
+  const second = new Promise((resolve) => verifier(rawKey, resolve));
+  assert.equal(sent.length, 2);
+  handleResponse({ sender: { id: sender.id } }, { requestId: sent[1].payload.requestId, accept: true });
+  assert.equal(await second, true);
+});
+
+test("createHostVerifier forwards bootEpoch on host-key prompts", async () => {
+  const rawKey = Buffer.from("new server key");
+  const sent = [];
+  const sender = {
+    id: 1,
+    isDestroyed: () => false,
+    send: (channel, payload) => sent.push({ channel, payload }),
+  };
+  const verifier = createHostVerifier({
+    sender,
+    sessionId: "session-1",
+    hostname: "switch.local",
+    port: 22,
+    knownHosts: [],
+    bootEpoch: 7,
+  });
+
+  const acceptedPromise = new Promise((resolve) => verifier(rawKey, resolve));
+  assert.equal(sent[0].payload.bootEpoch, 7);
+
+  handleResponse({ sender: { id: sender.id } }, {
+    requestId: sent[0].payload.requestId,
+    accept: false,
+  });
+  assert.equal(await acceptedPromise, false);
 });
 
 test("createHostVerifier includes existing known host details when a key changes", async () => {
@@ -368,7 +512,7 @@ test("createHostVerifier includes existing known host details when a key changes
   assert.equal(sent[0].payload.knownHostId, "kh-1");
   assert.equal(sent[0].payload.knownFingerprint, "old-key");
 
-  handleResponse(null, {
+  handleResponse({ sender: { id: sender.id } }, {
     requestId: sent[0].payload.requestId,
     accept: true,
     addToKnownHosts: true,

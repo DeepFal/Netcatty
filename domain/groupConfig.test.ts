@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { applyGroupDefaults, resolveGroupDefaults, sanitizeGroupConfig } from "./groupConfig.ts";
+import {
+  getActiveGlobalDefaultProxyProfileId,
+  publishActiveGlobalDefaultProxyProfileId,
+} from "./globalDefaultProxy.ts";
 import { resolveTelnetPassword, resolveTelnetUsername } from "./host.ts";
 import type { GroupConfig, Host } from "./models.ts";
 
@@ -12,6 +16,16 @@ const host = (overrides: Partial<Host> = {}): Host => ({
   tags: [],
   os: "linux",
   ...overrides,
+});
+
+test("applyGroupDefaults ignores a legacy single-channel group flag", () => {
+  const result = applyGroupDefaults(
+    host(),
+    { deviceType: "network", singleChannelSsh: true } as Partial<GroupConfig>,
+  );
+
+  assert.equal(result.deviceType, "network");
+  assert.equal("singleChannelSsh" in result, false);
 });
 
 test("applyGroupDefaults lets a host proxy profile override a group custom proxy", () => {
@@ -35,6 +49,45 @@ test("applyGroupDefaults lets a host custom proxy override a group proxy profile
 
   assert.equal(result.proxyProfileId, undefined);
   assert.deepEqual(result.proxyConfig, customProxy);
+});
+
+test("applyGroupDefaults inherits group device type when host does not set one", () => {
+  const result = applyGroupDefaults(host(), { deviceType: "network" });
+
+  assert.equal(result.deviceType, "network");
+});
+
+test("applyGroupDefaults lets host device type override group device type", () => {
+  const result = applyGroupDefaults(host({ deviceType: "general" }), { deviceType: "network" });
+
+  assert.equal(result.deviceType, "general");
+});
+
+test("applyGroupDefaults skips remote-only device type for local shell hosts", () => {
+  const result = applyGroupDefaults(host({ protocol: "local" }), { deviceType: "network" });
+
+  assert.equal(result.deviceType, undefined);
+});
+
+test("applyGroupDefaults inherits startup command run mode", () => {
+  const result = applyGroupDefaults(host(), { startupCommandRunMode: "paste" });
+
+  assert.equal(result.startupCommandRunMode, "paste");
+});
+
+test("resolveGroupDefaults lets child group device type override parent device type", () => {
+  const resolved = resolveGroupDefaults("prod/access", [
+    {
+      path: "prod",
+      deviceType: "network",
+    },
+    {
+      path: "prod/access",
+      deviceType: "general",
+    },
+  ]);
+
+  assert.equal(resolved.deviceType, "general");
 });
 
 test("resolveGroupDefaults treats saved and custom proxies as one inherited setting", () => {
@@ -170,6 +223,277 @@ test("applyGroupDefaults still inherits telnet credentials when host fields are 
   assert.equal(resolveTelnetPassword(result), "group-telnet-password");
 });
 
+test("applyGroupDefaults inherits a reusable Telnet identity from the group", () => {
+  const result = applyGroupDefaults(
+    host({ telnetIdentityId: undefined }),
+    { telnetIdentityId: "group-telnet-identity" },
+  );
+
+  assert.equal(result.telnetIdentityId, "group-telnet-identity");
+});
+
+test("applyGroupDefaults preserves an explicitly cleared Telnet identity", () => {
+  const result = applyGroupDefaults(
+    host({ telnetIdentityId: "" }),
+    { telnetIdentityId: "group-telnet-identity" },
+  );
+
+  assert.equal(result.telnetIdentityId, "");
+});
+
+test("resolveGroupDefaults lets child manual SSH credentials replace a parent identity", () => {
+  const resolved = resolveGroupDefaults("prod/manual", [
+    { path: "prod", identityId: "parent-identity", username: "parent-user" },
+    { path: "prod/manual", username: "child-user", password: "child-password" },
+  ]);
+
+  assert.equal(resolved.identityId, undefined);
+  assert.equal(resolved.username, "child-user");
+  assert.equal(resolved.password, "child-password");
+});
+
+test("resolveGroupDefaults lets child manual Telnet credentials replace a parent identity", () => {
+  const resolved = resolveGroupDefaults("prod/manual", [
+    { path: "prod", telnetIdentityId: "parent-identity" },
+    { path: "prod/manual", telnetUsername: "child-user", telnetPassword: "child-password" },
+  ]);
+
+  assert.equal(resolved.telnetIdentityId, undefined);
+  assert.equal(resolved.telnetUsername, "child-user");
+  assert.equal(resolved.telnetPassword, "child-password");
+});
+
+test("resolveGroupDefaults clears a parent key identity bundle for a child password opt-out", () => {
+  const resolved = resolveGroupDefaults("prod/manual", [
+    {
+      path: "prod",
+      identityId: "parent-identity",
+      username: "parent-user",
+      authMethod: "key",
+      identityFileId: "parent-key",
+    },
+    {
+      path: "prod/manual",
+      identityId: "",
+      username: "child-user",
+      password: "child-password",
+      authMethod: "password",
+    },
+  ]);
+
+  assert.equal(resolved.identityId, "");
+  assert.equal(resolved.username, "child-user");
+  assert.equal(resolved.password, "child-password");
+  assert.equal(resolved.authMethod, "password");
+  assert.equal(resolved.identityFileId, undefined);
+});
+
+test("resolveGroupDefaults clears parent identity credentials for an empty child marker", () => {
+  const resolved = resolveGroupDefaults("prod/manual", [
+    {
+      path: "prod",
+      identityId: "parent-identity",
+      username: "parent-user",
+      authMethod: "key",
+      telnetIdentityId: "parent-telnet-identity",
+      telnetUsername: "parent-telnet-user",
+    },
+    {
+      path: "prod/manual",
+      identityId: "",
+      telnetIdentityId: "",
+    },
+  ]);
+
+  assert.equal(resolved.identityId, "");
+  assert.equal(resolved.username, undefined);
+  assert.equal(resolved.authMethod, undefined);
+  assert.equal(resolved.telnetIdentityId, "");
+  assert.equal(resolved.telnetUsername, undefined);
+});
+
+test("applyGroupDefaults keeps host manual SSH credentials instead of a group identity", () => {
+  const result = applyGroupDefaults(
+    host({ username: "host-user", password: "host-password" }),
+    {
+      identityId: "group-identity",
+      username: "group-user",
+      password: "group-password",
+      savePassword: false,
+      authMethod: "key",
+      identityFileId: "group-key",
+      identityFilePaths: ["~/.ssh/group-key"],
+    },
+  );
+
+  assert.equal(result.identityId, undefined);
+  assert.equal(result.username, "host-user");
+  assert.equal(result.password, "host-password");
+  assert.equal(result.savePassword, undefined);
+  assert.equal(result.authMethod, undefined);
+  assert.equal(result.identityFileId, undefined);
+  assert.equal(result.identityFilePaths, undefined);
+});
+
+test("applyGroupDefaults lets a host password inherit a manual group username", () => {
+  const result = applyGroupDefaults(
+    host({ username: "", password: "host-password" }),
+    { username: "group-user" },
+  );
+
+  assert.equal(result.identityId, undefined);
+  assert.equal(result.username, "group-user");
+  assert.equal(result.password, "host-password");
+});
+
+test("applyGroupDefaults lets an empty host identity inherit manual group credentials", () => {
+  const result = applyGroupDefaults(
+    host({ identityId: "", username: "", authMethod: undefined }),
+    {
+      username: "group-user",
+      password: "group-password",
+      authMethod: "password",
+    },
+  );
+
+  assert.equal(result.identityId, "");
+  assert.equal(result.username, "group-user");
+  assert.equal(result.password, "group-password");
+  assert.equal(result.authMethod, "password");
+});
+
+test("applyGroupDefaults does not bypass a host no-save choice with a group identity", () => {
+  const result = applyGroupDefaults(
+    host({ username: "", password: undefined, savePassword: false }),
+    {
+      identityId: "group-identity",
+      username: "group-user",
+      password: "group-password",
+      authMethod: "password",
+    },
+  );
+
+  assert.equal(result.identityId, undefined);
+  assert.equal(result.username, "");
+  assert.equal(result.password, undefined);
+  assert.equal(result.savePassword, false);
+  assert.equal(result.authMethod, undefined);
+});
+
+test("applyGroupDefaults does not inherit a group password after a host clears it", () => {
+  const result = applyGroupDefaults(
+    host({ username: "", password: undefined, savePassword: false }),
+    {
+      username: "group-user",
+      password: "group-password",
+      authMethod: "password",
+    },
+  );
+
+  assert.equal(result.password, undefined);
+  assert.equal(result.savePassword, false);
+  assert.equal(result.authMethod, "password");
+});
+
+test("applyGroupDefaults keeps host manual Telnet credentials instead of a group identity", () => {
+  const result = applyGroupDefaults(
+    host({ telnetUsername: "host-user", telnetPassword: "host-password" }),
+    { telnetIdentityId: "group-identity" },
+  );
+
+  assert.equal(result.telnetIdentityId, undefined);
+  assert.equal(result.telnetUsername, "host-user");
+  assert.equal(result.telnetPassword, "host-password");
+});
+
+test("applyGroupDefaults preserves imported primary Telnet credentials", () => {
+  const result = applyGroupDefaults(
+    host({
+      protocol: "telnet",
+      username: "operator",
+      password: "host-password",
+      telnetIdentityId: undefined,
+    }),
+    { telnetIdentityId: "group-telnet-identity" },
+  );
+
+  assert.equal(result.telnetIdentityId, undefined);
+  assert.equal(resolveTelnetUsername(result), "operator");
+  assert.equal(resolveTelnetPassword(result), "host-password");
+});
+
+test("applyGroupDefaults lets a default primary Telnet host inherit a group identity", () => {
+  const result = applyGroupDefaults(
+    host({
+      protocol: "telnet",
+      username: "root",
+      password: undefined,
+      telnetIdentityId: undefined,
+    }),
+    { telnetIdentityId: "group-telnet-identity" },
+  );
+
+  assert.equal(result.telnetIdentityId, "group-telnet-identity");
+});
+
+test("applyGroupDefaults preserves explicit empty identityId instead of inheriting group identity", () => {
+  const result = applyGroupDefaults(
+    host({ identityId: "" }),
+    { identityId: "group-identity" },
+  );
+
+  assert.equal(result.identityId, "");
+});
+
+test("applyGroupDefaults inherits group identityId when host only has default SSH fields", () => {
+  const result = applyGroupDefaults(
+    host({ identityId: undefined, authMethod: "password" }),
+    { identityId: "group-identity" },
+  );
+
+  assert.equal(result.identityId, "group-identity");
+  assert.equal(result.username, "root");
+});
+
+test("applyGroupDefaults keeps explicit host auth modes instead of inheriting a group identity", () => {
+  for (const authMethod of ["auto", "password"] as const) {
+    const result = applyGroupDefaults(
+      host({ authMethod, authPolicyVersion: 1 }),
+      { identityId: "group-identity" },
+    );
+
+    assert.equal(result.authMethod, authMethod);
+    assert.equal(result.identityId, undefined);
+  }
+});
+
+test("applyGroupDefaults preserves a custom username instead of inheriting a group identity", () => {
+  const result = applyGroupDefaults(
+    host({ identityId: undefined, username: "ubuntu", authMethod: "password" }),
+    {
+      identityId: "group-identity",
+      username: "group-user",
+      password: "group-password",
+      authMethod: "password",
+    },
+  );
+
+  assert.equal(result.identityId, undefined);
+  assert.equal(result.username, "ubuntu");
+  assert.equal(result.password, undefined);
+  assert.equal(result.authMethod, "password");
+});
+
+test("applyGroupDefaults treats an explicit empty identity as a host opt-out", () => {
+  const result = applyGroupDefaults(
+    host({ identityId: "", username: "host-user", authMethod: "password" }),
+    { identityId: "group-identity", username: "group-user" },
+  );
+
+  assert.equal(result.identityId, "");
+  assert.equal(result.username, "host-user");
+});
+
 test("applyGroupDefaults continues to inherit empty ssh username from the group", () => {
   const result = applyGroupDefaults(
     host({
@@ -209,6 +533,59 @@ test("sanitizeGroupConfig keeps a still-valid fontFamily untouched", () => {
   assert.equal(after.fontFamilyOverride, true);
 });
 
+test("sanitizeGroupConfig drops a legacy single-channel SSH flag", () => {
+  const source = {
+    path: "team",
+    username: "alice",
+    singleChannelSsh: true,
+  } as Parameters<typeof sanitizeGroupConfig>[0];
+  const after = sanitizeGroupConfig(source);
+
+  assert.equal("singleChannelSsh" in after, false);
+  assert.equal(after.username, "alice");
+  assert.equal("singleChannelSsh" in source, true);
+});
+
+test("sanitizeGroupConfig preserves legacy group passwords as password-only", () => {
+  const after = sanitizeGroupConfig({
+    path: "team",
+    password: "group-secret",
+  });
+
+  assert.equal(after.authMethod, "password");
+});
+
+test("sanitizeGroupConfig preserves an explicit automatic password fallback", () => {
+  const after = sanitizeGroupConfig({
+    path: "team",
+    authMethod: "auto",
+    password: "group-secret",
+  });
+
+  assert.equal(after.authMethod, "auto");
+});
+
+test("sanitizeGroupConfig does not replace a selected identity with password-only", () => {
+  const after = sanitizeGroupConfig({
+    path: "team",
+    identityId: "identity-1",
+    password: "stale-secret",
+  });
+
+  assert.equal(after.authMethod, undefined);
+});
+
+test("sanitizeGroupConfig treats an empty inherited identity marker as cleared", () => {
+  const after = sanitizeGroupConfig({
+    path: "team/child",
+    identityId: "",
+    password: "child-secret",
+  });
+
+  assert.equal(after.identityId, "");
+  assert.equal(after.authMethod, "password");
+});
+
 test("applyGroupDefaults inherits skipEcdsaHostKey from the group when host has no value", () => {
   const result = applyGroupDefaults(host(), { skipEcdsaHostKey: true });
   assert.equal(result.skipEcdsaHostKey, true);
@@ -220,6 +597,58 @@ test("applyGroupDefaults keeps host-level skipEcdsaHostKey instead of group defa
     { skipEcdsaHostKey: true },
   );
   assert.equal(result.skipEcdsaHostKey, false);
+});
+
+test("resolveGroupDefaults uses the nearest group X11 toggle and stays off otherwise", () => {
+  const configs: GroupConfig[] = [
+    { path: "prod", x11Forwarding: true },
+    { path: "prod/edge", x11Forwarding: false },
+  ];
+  assert.equal(resolveGroupDefaults("prod", configs).x11Forwarding, true);
+  assert.equal(resolveGroupDefaults("prod/web", configs).x11Forwarding, true);
+  assert.equal(resolveGroupDefaults("prod/edge", configs).x11Forwarding, false);
+  assert.equal(resolveGroupDefaults("prod/edge/api", configs).x11Forwarding, false);
+  assert.equal(resolveGroupDefaults("other", configs).x11Forwarding, undefined);
+});
+
+test("applyGroupDefaults inherits group X11 forwarding when the host leaves it unset", () => {
+  assert.equal(applyGroupDefaults(host(), { x11Forwarding: true }).x11Forwarding, true);
+});
+
+test("applyGroupDefaults keeps an explicit host X11 toggle ahead of the group", () => {
+  assert.equal(
+    applyGroupDefaults(host({ x11Forwarding: false }), { x11Forwarding: true }).x11Forwarding,
+    false,
+  );
+  assert.equal(
+    applyGroupDefaults(host({ x11Forwarding: true }), { x11Forwarding: false }).x11Forwarding,
+    true,
+  );
+});
+
+test("applyGroupDefaults leaves X11 forwarding off when neither host nor group sets it", () => {
+  assert.equal(applyGroupDefaults(host(), {}).x11Forwarding, undefined);
+});
+
+test("applyGroupDefaults does not inherit X11 forwarding onto non-SSH transports", () => {
+  const groupDefaults = { x11Forwarding: true as const };
+  assert.equal(applyGroupDefaults(host({ moshEnabled: true }), groupDefaults).x11Forwarding, undefined);
+  assert.equal(applyGroupDefaults(host({ etEnabled: true }), groupDefaults).x11Forwarding, undefined);
+  assert.equal(applyGroupDefaults(host({ protocol: "telnet" }), groupDefaults).x11Forwarding, undefined);
+  assert.equal(applyGroupDefaults(host({ protocol: "serial" }), groupDefaults).x11Forwarding, undefined);
+  assert.equal(applyGroupDefaults(host({ protocol: "local" }), groupDefaults).x11Forwarding, undefined);
+  assert.equal(
+    applyGroupDefaults(host(), { ...groupDefaults, moshEnabled: true }).x11Forwarding,
+    undefined,
+  );
+  assert.equal(
+    applyGroupDefaults(host(), { ...groupDefaults, protocol: "telnet" }).x11Forwarding,
+    undefined,
+  );
+  assert.equal(
+    applyGroupDefaults(host({ moshEnabled: false }), { ...groupDefaults, moshEnabled: true }).x11Forwarding,
+    true,
+  );
 });
 
 test("applyGroupDefaults inherits algorithm overrides from the group", () => {
@@ -236,4 +665,235 @@ test("applyGroupDefaults keeps host algorithm overrides instead of inheriting", 
     { algorithms: groupOverrides },
   );
   assert.deepEqual(result.algorithms, hostOverrides);
+});
+
+test("group notes survive sanitization but are not connection defaults", () => {
+  const config = { path: "Project", notes: "# VPN\nConnect before SSH.", username: "admin" };
+  assert.equal(sanitizeGroupConfig(config).notes, config.notes);
+  assert.equal(resolveGroupDefaults("Project", [config]).notes, undefined);
+  assert.equal(resolveGroupDefaults("Project/Servers", [config]).notes, undefined);
+});
+
+test("applyGroupDefaults does not inherit group SSH credentials into serial hosts", () => {
+  const groupDefaults: Partial<GroupConfig> = {
+    username: "group-ssh-user",
+    password: "group-ssh-password",
+    savePassword: true,
+    authMethod: "password",
+  };
+
+  const result = applyGroupDefaults(
+    host({ protocol: "serial", username: undefined, password: undefined }),
+    groupDefaults,
+  );
+
+  assert.equal(result.username, undefined);
+  assert.equal(result.password, undefined);
+});
+
+test("applyGroupDefaults still inherits non-credential defaults into serial hosts", () => {
+  const result = applyGroupDefaults(
+    host({ protocol: "serial", username: undefined, charset: undefined }),
+    { username: "group-ssh-user", charset: "UTF-8" },
+  );
+
+  assert.equal(result.username, undefined);
+  assert.equal(result.charset, "UTF-8");
+});
+
+test("applyGroupDefaults does not inherit group SSH credentials into local shell hosts", () => {
+  const groupDefaults: Partial<GroupConfig> = {
+    username: "group-ssh-user",
+    password: "group-ssh-password",
+    savePassword: true,
+    authMethod: "password",
+    identityId: "identity-1",
+    identityFileId: "identity-file-1",
+  };
+
+  const result = applyGroupDefaults(
+    host({ protocol: "local", username: undefined, password: undefined }),
+    groupDefaults,
+  );
+
+  assert.equal(result.username, undefined);
+  assert.equal(result.password, undefined);
+  assert.equal(result.savePassword, undefined);
+  assert.equal(result.authMethod, undefined);
+  assert.equal(result.identityId, undefined);
+  assert.equal(result.identityFileId, undefined);
+});
+
+test("applyGroupDefaults does not inherit SSH transport/input defaults into local shell hosts", () => {
+  const groupDefaults: Partial<GroupConfig> = {
+    backspaceBehavior: "ctrl-h",
+    moshEnabled: true,
+    moshServerPath: "/usr/bin/mosh-server",
+    etEnabled: true,
+    etPort: 8737,
+    legacyAlgorithms: true,
+    skipEcdsaHostKey: true,
+    agentForwarding: true,
+    x11Forwarding: true,
+    hostChain: { hostIds: ["bastion-1"] },
+    charset: "UTF-8",
+    fontSize: 14,
+  };
+
+  const result = applyGroupDefaults(
+    host({
+      protocol: "local",
+      backspaceBehavior: undefined,
+      algorithms: undefined,
+      charset: undefined,
+      fontSize: undefined,
+    }),
+    groupDefaults,
+  );
+
+  assert.equal(result.backspaceBehavior, undefined);
+  assert.equal(result.moshEnabled, undefined);
+  assert.equal(result.moshServerPath, undefined);
+  assert.equal(result.etEnabled, undefined);
+  assert.equal(result.etPort, undefined);
+  assert.equal(result.legacyAlgorithms, undefined);
+  assert.equal(result.skipEcdsaHostKey, undefined);
+  assert.equal(result.agentForwarding, undefined);
+  assert.equal(result.x11Forwarding, undefined);
+  assert.equal(result.hostChain, undefined);
+  // Display/appearance defaults still apply to local shells.
+  assert.equal(result.charset, "UTF-8");
+  assert.equal(result.fontSize, 14);
+});
+
+test("applyGroupDefaults still inherits non-credential defaults into local shell hosts", () => {
+  const result = applyGroupDefaults(
+    host({ protocol: "local", username: undefined, charset: undefined, fontSize: undefined }),
+    { username: "group-ssh-user", charset: "UTF-8", fontSize: 14 },
+  );
+
+  assert.equal(result.username, undefined);
+  assert.equal(result.charset, "UTF-8");
+  assert.equal(result.fontSize, 14);
+});
+
+test("applyGroupDefaults does not inherit the group startup command into local shell hosts", () => {
+  const result = applyGroupDefaults(
+    host({ protocol: "local" }),
+    { startupCommand: "rm -rf /", startupCommandRunMode: "paste" },
+  );
+
+  assert.equal(result.startupCommand, undefined);
+  assert.equal(result.startupCommandRunMode, "paste");
+});
+
+const globalProxyOptions = {
+  globalProxyProfileId: "global-proxy",
+  validProxyProfileIds: new Set(["global-proxy", "group-proxy", "host-proxy"]),
+};
+
+test("applyGroupDefaults prefers the host proxy over the group and global defaults", () => {
+  const result = applyGroupDefaults(
+    host({ proxyProfileId: "host-proxy" }),
+    { proxyProfileId: "group-proxy" },
+    globalProxyOptions,
+  );
+
+  assert.equal(result.proxyProfileId, "host-proxy");
+});
+
+test("applyGroupDefaults prefers the nearest group proxy over the global default", () => {
+  const groupDefaults = resolveGroupDefaults("prod/api", [
+    { path: "prod", proxyProfileId: "group-proxy" },
+    { path: "prod/api", proxyProfileId: "child-proxy" },
+  ]);
+  const result = applyGroupDefaults(host({ group: "prod/api" }), groupDefaults, {
+    ...globalProxyOptions,
+    validProxyProfileIds: new Set(["global-proxy", "group-proxy", "child-proxy"]),
+  });
+
+  assert.equal(result.proxyProfileId, "child-proxy");
+});
+
+test("applyGroupDefaults uses the global default when the host and group have no proxy", () => {
+  const grouped = applyGroupDefaults(host({ group: "prod" }), {}, globalProxyOptions);
+  const ungrouped = applyGroupDefaults(host(), {}, globalProxyOptions);
+
+  assert.equal(grouped.proxyProfileId, "global-proxy");
+  assert.equal(ungrouped.proxyProfileId, "global-proxy");
+});
+
+test("applyGroupDefaults stays direct when the global default is off", () => {
+  const result = applyGroupDefaults(host(), {}, { globalProxyProfileId: "" });
+
+  assert.equal(result.proxyProfileId, undefined);
+  assert.equal(result.proxyConfig, undefined);
+});
+
+test("applyGroupDefaults lets an explicit host direct choice override group and global proxies", () => {
+  const result = applyGroupDefaults(
+    host({
+      directProxy: true,
+      proxyProfileId: "host-proxy",
+      proxyConfig: { type: "http", host: "leftover.example.com", port: 8080 },
+    }),
+    { proxyProfileId: "group-proxy" },
+    globalProxyOptions,
+  );
+
+  assert.equal(result.directProxy, true);
+  assert.equal(result.proxyProfileId, undefined);
+  assert.equal(result.proxyConfig, undefined);
+});
+
+test("applyGroupDefaults still inherits after the host proxy setting is cleared", () => {
+  const fromGroup = applyGroupDefaults(
+    host({ proxyProfileId: "" }),
+    { proxyProfileId: "group-proxy" },
+    globalProxyOptions,
+  );
+  const fromGlobal = applyGroupDefaults(
+    host({ proxyProfileId: "" }),
+    {},
+    globalProxyOptions,
+  );
+
+  assert.equal(fromGroup.proxyProfileId, "group-proxy");
+  assert.equal(fromGlobal.proxyProfileId, "global-proxy");
+});
+
+test("applyGroupDefaults ignores a deleted global proxy profile", () => {
+  const result = applyGroupDefaults(host(), {}, {
+    globalProxyProfileId: "deleted-proxy",
+    validProxyProfileIds: new Set(["group-proxy"]),
+  });
+
+  assert.equal(result.proxyProfileId, undefined);
+});
+
+test("applyGroupDefaults keeps a missing group proxy instead of using the global default", () => {
+  const result = applyGroupDefaults(
+    host(),
+    { proxyProfileId: "missing-proxy" },
+    {
+      globalProxyProfileId: "global-proxy",
+      validProxyProfileIds: new Set(["global-proxy"]),
+    },
+  );
+
+  assert.equal(result.proxyProfileId, "missing-proxy");
+});
+
+test("applyGroupDefaults reads the active global default when callers omit it", () => {
+  publishActiveGlobalDefaultProxyProfileId("global-proxy");
+  try {
+    const inherited = applyGroupDefaults(host(), {});
+    const forcedOff = applyGroupDefaults(host(), {}, { globalProxyProfileId: "" });
+    assert.equal(inherited.proxyProfileId, "global-proxy");
+    assert.equal(forcedOff.proxyProfileId, undefined);
+  } finally {
+    publishActiveGlobalDefaultProxyProfileId(undefined);
+  }
+
+  assert.equal(getActiveGlobalDefaultProxyProfileId(), undefined);
 });

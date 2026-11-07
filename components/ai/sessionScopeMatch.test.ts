@@ -46,7 +46,22 @@ test("host-matched terminal session remains resumable when no terminal is displa
       ["host-a"],
       new Set(["session-other"]),
     ),
-    1,
+    2,
+  );
+});
+
+test("host-mismatched terminal session is not resumable for the current terminal", () => {
+  const session = createSession("session-1", "terminal-closed", ["host-b"]);
+
+  assert.equal(
+    getSessionScopeMatchRank(
+      session,
+      "terminal",
+      "terminal-current",
+      ["host-a"],
+      new Set(),
+    ),
+    0,
   );
 });
 
@@ -71,7 +86,7 @@ test("ownership is tracked by session id, not scope.targetId", () => {
   );
 });
 
-test("session targeting the current scope is an exact match (rank 2)", () => {
+test("session targeting the current scope is an exact match (rank 3)", () => {
   const session = createSession("session-1", "terminal-current", ["host-a"]);
 
   assert.equal(
@@ -82,7 +97,7 @@ test("session targeting the current scope is an exact match (rank 2)", () => {
       ["host-a"],
       new Set(),
     ),
-    2,
+    3,
   );
 });
 
@@ -95,6 +110,38 @@ test("scope type mismatch returns 0 regardless of target or hosts", () => {
       "workspace",
       "terminal-current",
       ["host-a"],
+    ),
+    0,
+  );
+});
+
+test("workspace scope treats member-terminal chats as exact matches after merge", () => {
+  const session = createSession("session-1", "terminal-a", ["host-a"]);
+
+  assert.equal(
+    getSessionScopeMatchRank(
+      session,
+      "workspace",
+      "ws-1",
+      ["host-a"],
+      undefined,
+      new Set(["terminal-a", "terminal-b"]),
+    ),
+    3,
+  );
+});
+
+test("workspace scope ignores terminal chats that are not workspace members", () => {
+  const session = createSession("session-1", "terminal-other", ["host-a"]);
+
+  assert.equal(
+    getSessionScopeMatchRank(
+      session,
+      "workspace",
+      "ws-1",
+      ["host-a"],
+      undefined,
+      new Set(["terminal-a", "terminal-b"]),
     ),
     0,
   );

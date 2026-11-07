@@ -2,6 +2,7 @@ import React, { type Dispatch, type MutableRefObject, type SetStateAction } from
 import { AlertTriangle, Cloud, Database, Download, History, Key, Loader2, ShieldCheck, Trash2 } from 'lucide-react';
 import type { CloudProvider, ConflictResolution, SyncPayload, SyncResult, WebDAVAuthType } from '../../domain/sync';
 import type { ShrinkFinding } from '../../domain/syncGuards';
+import { stripSyncPayloadEncryptedCredentials } from '../../domain/credentials';
 import type { useCloudSync } from '../../application/state/useCloudSync';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
@@ -25,6 +26,7 @@ type HistoryPreview = {
     hostCount: number;
     keyCount: number;
     snippetCount: number;
+    noteCount: number;
     identityCount: number;
     portForwardingRuleCount: number;
   };
@@ -94,6 +96,8 @@ interface CloudSyncDialogsProps {
   setS3Prefix: StringSetter;
   s3ForcePathStyle: boolean;
   setS3ForcePathStyle: BooleanSetter;
+  s3AllowInsecure: boolean;
+  setS3AllowInsecure: BooleanSetter;
   showS3Secret: boolean;
   setShowS3Secret: BooleanSetter;
   s3Error: string | null;
@@ -126,8 +130,12 @@ interface CloudSyncDialogsProps {
   setIsUnlocking: BooleanSetter;
   showClearLocalDialog: boolean;
   setShowClearLocalDialog: BooleanSetter;
-  onBuildPayload: () => SyncPayload;
+  onBuildPayload: () => SyncPayload | Promise<SyncPayload>;
   onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
+  onApplyConvergentPayload: (
+    payload: SyncPayload,
+    commitReplica: () => Promise<void>,
+  ) => Promise<void>;
   onClearLocalData?: () => void;
   ensureSyncablePayload: (payload: SyncPayload) => boolean;
   showForcePushConfirm: boolean;
@@ -198,6 +206,8 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
   setS3Prefix,
   s3ForcePathStyle,
   setS3ForcePathStyle,
+  s3AllowInsecure,
+  setS3AllowInsecure,
   showS3Secret,
   setShowS3Secret,
   s3Error,
@@ -232,6 +242,7 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
   setShowClearLocalDialog,
   onBuildPayload,
   onApplyPayload,
+  onApplyConvergentPayload,
   onClearLocalData,
   ensureSyncablePayload,
   showForcePushConfirm,
@@ -308,6 +319,10 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
                                         <span className="font-medium">{historyPreview.preview.snippetCount}</span>
                                     </div>
                                     <div className="flex justify-between px-2 py-1 bg-muted/30 rounded">
+                                        <span className="text-muted-foreground">{t('cloudSync.revisionHistory.notes')}</span>
+                                        <span className="font-medium">{historyPreview.preview.noteCount}</span>
+                                    </div>
+                                    <div className="flex justify-between px-2 py-1 bg-muted/30 rounded">
                                         <span className="text-muted-foreground">{t('cloudSync.revisionHistory.identities')}</span>
                                         <span className="font-medium">{historyPreview.preview.identityCount}</span>
                                     </div>
@@ -339,7 +354,7 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
                                             disabled={historyPreviewLoading}
                                             className={cn(
                                                 "w-full flex items-center justify-between p-2.5 rounded-lg text-left text-sm transition-colors",
-                                                "hover:bg-accent border border-transparent hover:border-border",
+                                                "hover:bg-muted/50 border border-transparent hover:border-border",
                                                 index === 0 && "bg-primary/5 border-primary/20",
                                             )}
                                         >
@@ -568,6 +583,16 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
                         <label className="flex items-center gap-2 text-sm text-muted-foreground select-none">
                             <input
                                 type="checkbox"
+                                checked={s3AllowInsecure}
+                                onChange={(e) => setS3AllowInsecure(e.target.checked)}
+                                className="accent-primary"
+                            />
+                            {t('cloudSync.s3.allowInsecure')}
+                        </label>
+
+                        <label className="flex items-center gap-2 text-sm text-muted-foreground select-none">
+                            <input
+                                type="checkbox"
                                 checked={showS3Secret}
                                 onChange={(e) => setShowS3Secret(e.target.checked)}
                                 className="accent-primary"
@@ -687,7 +712,7 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
 
                                 let payloadForReencrypt: SyncPayload | null = null;
                                 if (sync.hasAnyConnectedProvider) {
-                                    const payload = onBuildPayload();
+                                    const payload = await onBuildPayload();
                                     if (!ensureSyncablePayload(payload)) {
                                         setChangeKeyError(t('sync.credentialsUnavailable'));
                                         return;
@@ -704,7 +729,9 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
                                     }
 
                                     if (payloadForReencrypt) {
-                                        await sync.syncNow(payloadForReencrypt);
+                                        await sync.syncNow(payloadForReencrypt, {
+                                            applyConvergentPayload: onApplyConvergentPayload,
+                                        });
                                     }
 
                                     toast.success(t('cloudSync.changeKey.updatedToast'));
@@ -857,24 +884,28 @@ export const CloudSyncDialogs: React.FC<CloudSyncDialogsProps> = ({
                             <Button
                                 variant="destructive"
                                 onClick={async () => {
-                                    const localPayload = onBuildPayload();
+                                    const localPayload = await onBuildPayload();
                                     if (!ensureSyncablePayload(localPayload)) {
                                         setShowForcePushConfirm(false);
                                         return;
                                     }
                                     setShowForcePushConfirm(false);
                                     try {
-                                        const results = await sync.syncNow(localPayload, { overrideShrink: true });
+                                        const results = await sync.syncNow(localPayload, {
+                                            overrideShrink: true,
+                                            applyConvergentPayload: onApplyConvergentPayload,
+                                        });
 
                                         // Apply any merged payload BEFORE clearing the banner. If a merge happened
                                         // during force-push (remote changed), the merged result is what the cloud
                                         // now has — applying it to local state prevents the next sync from
                                         // re-deleting the remote additions we just merged in.
                                         for (const result of results.values()) {
-                                            if (result.mergedPayload) {
-                                                await Promise.resolve(onApplyPayload(result.mergedPayload));
+                                            if (result.mergedPayload && !result.mergedPayloadApplied) {
+                                                const portableMerged = stripSyncPayloadEncryptedCredentials(result.mergedPayload);
+                                                await Promise.resolve(onApplyPayload(portableMerged));
                                                 if (result.remoteFile) {
-                                                    await sync.commitRemoteInspection(result.provider, result.remoteFile, result.mergedPayload, {
+                                                    await sync.commitRemoteInspection(result.provider, result.remoteFile, portableMerged, {
                                                         recordDownload: true,
                                                     });
                                                 }

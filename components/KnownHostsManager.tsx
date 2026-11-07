@@ -20,9 +20,18 @@ import React, {
 } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useKnownHostsBackend } from "../application/state/useKnownHostsBackend";
+import { useStoredBoolean } from "../application/state/useStoredBoolean";
 import { useStoredViewMode, ViewMode } from "../application/state/useStoredViewMode";
 import { fingerprintFromPublicKey } from "../domain/knownHosts";
-import { STORAGE_KEY_VAULT_KNOWN_HOSTS_VIEW_MODE } from "../infrastructure/config/storageKeys";
+import {
+  DEFAULT_AUTO_IMPORT_SYSTEM_KNOWN_HOSTS,
+  shouldAutoScanSystemKnownHosts,
+} from "../domain/systemKnownHostsAutoImport";
+import { reorderVaultItems, sortByVaultOrder } from "../domain/vaultOrder";
+import {
+  STORAGE_KEY_AUTO_IMPORT_SYSTEM_KNOWN_HOSTS,
+  STORAGE_KEY_VAULT_KNOWN_HOSTS_VIEW_MODE,
+} from "../infrastructure/config/storageKeys";
 import { logger } from "../lib/logger";
 import { cn } from "../lib/utils";
 import { Host, KnownHost } from "../types";
@@ -44,12 +53,16 @@ import {
   vaultHeaderIconButtonClass,
   vaultHeaderSecondaryButtonClass,
 } from "./vault/VaultPageHeader";
+import { VaultDeleteConfirmDialog } from "./vault/VaultDeleteConfirmDialog";
+import { VaultEntityIcon, vaultPrimaryIconClass } from "./vault/VaultEntityIcon";
+import { useVaultItemReorder } from "./vault/vaultReorderDrag";
 
 interface KnownHostsManagerProps {
   knownHosts: KnownHost[];
   hosts: Host[];
   onSave: (knownHost: KnownHost) => void;
   onUpdate: (knownHost: KnownHost) => void;
+  onReorder: (knownHosts: KnownHost[]) => void;
   onDelete: (id: string) => void;
   onConvertToHost: (knownHost: KnownHost) => void;
   onImportFromFile: (hosts: KnownHost[]) => void;
@@ -109,17 +122,82 @@ const parseKnownHostsFile = (content: string): KnownHost[] => {
   return parsed;
 };
 
+
+ // Well-known public service hostnames that should not be imported as managed hosts.
+ const PUBLIC_SERVICE_HOSTNAMES = new Set([
+   'github.com',
+   'gitlab.com',
+   'bitbucket.org',
+   'ssh.dev.azure.com',
+   'vs-ssh.visualstudio.com',
+ ]);
+
+ const isPublicServiceHost = (hostname: string): boolean =>
+   PUBLIC_SERVICE_HOSTNAMES.has(hostname);
 // Memoized Grid Item Component
+
 interface HostItemProps {
   knownHost: KnownHost;
   converted: boolean;
   viewMode: ViewMode;
+  reorderProps?: React.HTMLAttributes<HTMLDivElement>;
   onDelete: (id: string) => void;
   onConvertToHost: (knownHost: KnownHost) => void;
 }
 
+const knownHostActionButtonClass =
+  "h-8 w-8 shrink-0 opacity-0 transition-opacity group-hover:opacity-100";
+
+const KnownHostItemActions: React.FC<{
+  knownHost: KnownHost;
+  converted: boolean;
+  onDelete: (id: string) => void;
+  onConvertToHost: (knownHost: KnownHost) => void;
+}> = ({ knownHost, converted, onDelete, onConvertToHost }) => {
+  const { t } = useI18n();
+
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      {!converted && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className={knownHostActionButtonClass}
+              onClick={(e) => {
+                e.stopPropagation();
+                onConvertToHost(knownHost);
+              }}
+            >
+              <ArrowRight size={14} />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{t("action.convertToHost")}</TooltipContent>
+        </Tooltip>
+      )}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn(knownHostActionButtonClass, "text-destructive hover:text-destructive hover:bg-destructive/10")}
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(knownHost.id);
+            }}
+          >
+            <Trash2 size={14} />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t("action.remove")}</TooltipContent>
+      </Tooltip>
+    </div>
+  );
+};
+
 const HostItem = React.memo<HostItemProps>(
-  ({ knownHost, converted, viewMode, onDelete, onConvertToHost }) => {
+  ({ knownHost, converted, viewMode, reorderProps, onDelete, onConvertToHost }) => {
     const { t } = useI18n();
     // Disabled to reduce log noise - uncomment for debugging
     // console.log('[HostItem] render:', knownHost.hostname);
@@ -128,53 +206,30 @@ const HostItem = React.memo<HostItemProps>(
         <ContextMenu>
           <ContextMenuTrigger asChild>
             <div
+              {...reorderProps}
               className={cn(
+                reorderProps && "vault-drop-indicator-row",
                 "group cursor-pointer soft-card elevate rounded-xl h-[68px] px-3 py-2",
                 converted && "opacity-60",
+                reorderProps?.className,
               )}
             >
-              {/* Quick action buttons on hover */}
-              <div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                {!converted && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        className="p-1 rounded hover:bg-primary/20 text-primary"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onConvertToHost(knownHost);
-                        }}
-                      >
-                        <ArrowRight size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>{t("action.convertToHost")}</TooltipContent>
-                  </Tooltip>
-                )}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      className="p-1 rounded hover:bg-destructive/20 text-destructive"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDelete(knownHost.id);
-                      }}
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>{t("action.remove")}</TooltipContent>
-                </Tooltip>
-              </div>
               <div className="flex items-center gap-3 h-full">
-                <div className="h-11 w-11 rounded-xl bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
-                  <Server size={18} />
-                </div>
+                <VaultEntityIcon
+                  className={vaultPrimaryIconClass}
+                  icon={<Server size={18} />}
+                />
                 <div className="flex-1 min-w-0">
                   <span className="text-sm font-semibold truncate block">
                     {knownHost.hostname}
                   </span>
                 </div>
+                <KnownHostItemActions
+                  knownHost={knownHost}
+                  converted={converted}
+                  onDelete={onDelete}
+                  onConvertToHost={onConvertToHost}
+                />
               </div>
             </div>
           </ContextMenuTrigger>
@@ -200,39 +255,29 @@ const HostItem = React.memo<HostItemProps>(
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
+            {...reorderProps}
             className={cn(
+              reorderProps && "vault-drop-indicator-row",
               "group flex items-center gap-3 px-3 py-2 h-14 rounded-lg hover:bg-secondary/60 transition-colors cursor-pointer",
               converted && "opacity-60",
+              reorderProps?.className,
             )}
           >
-            <div className="h-11 w-11 rounded-xl bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
-              <Server size={18} />
-            </div>
+            <VaultEntityIcon
+              className={vaultPrimaryIconClass}
+              icon={<Server size={18} />}
+            />
             <div className="flex-1 min-w-0">
               <span className="text-sm font-semibold truncate block">
                 {knownHost.hostname}
               </span>
             </div>
-            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-              {!converted && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onConvertToHost(knownHost);
-                      }}
-                    >
-                      <ArrowRight size={14} />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>{t("action.convertToHost")}</TooltipContent>
-                </Tooltip>
-              )}
-            </div>
+            <KnownHostItemActions
+              knownHost={knownHost}
+              converted={converted}
+              onDelete={onDelete}
+              onConvertToHost={onConvertToHost}
+            />
           </div>
         </ContextMenuTrigger>
         <ContextMenuContent>
@@ -260,6 +305,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
   hosts,
   onSave: _onSave,
   onUpdate: _onUpdate,
+  onReorder,
   onDelete,
   onConvertToHost,
   onImportFromFile,
@@ -270,13 +316,19 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
   const [isScanning, setIsScanning] = useState(false);
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useStoredViewMode(
     STORAGE_KEY_VAULT_KNOWN_HOSTS_VIEW_MODE,
     "grid",
   );
-  const [sortMode, setSortMode] = useState<SortMode>("newest");
+  const [autoImportSystemKnownHosts] = useStoredBoolean(
+    STORAGE_KEY_AUTO_IMPORT_SYSTEM_KNOWN_HOSTS,
+    DEFAULT_AUTO_IMPORT_SYSTEM_KNOWN_HOSTS,
+  );
+  const [sortMode, setSortMode] = useState<SortMode>("manual");
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const hasScannedRef = React.useRef(false);
+  const listRef = React.useRef<HTMLDivElement | null>(null);
   const RENDER_LIMIT = 100; // Limit rendered items for performance
 
   // Define handleScanSystem before useEffect that depends on it
@@ -309,8 +361,9 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
         knownHosts.map((h) => `${h.hostname}:${h.port}`),
       );
       const newHosts = parsed.filter(
-        (h) => !existingHostnames.has(`${h.hostname}:${h.port}`),
+        (h) => !existingHostnames.has(`${h.hostname}:${h.port}`) && !isPublicServiceHost(h.hostname),
       );
+      const publicFiltered = parsed.filter((h) => isPublicServiceHost(h.hostname)).length;
 
       if (newHosts.length > 0) {
         onImportFromFile(newHosts);
@@ -320,6 +373,13 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
         );
       } else {
         if (!silent) toast.info(t("knownHosts.toast.scanNoNew"), t("vault.nav.knownHosts"));
+      }
+
+      if (!silent && publicFiltered > 0) {
+        toast.info(
+          t("knownHosts.toast.scanFiltered", { count: publicFiltered }),
+          t("vault.nav.knownHosts"),
+        );
       }
     } catch (err) {
       logger.error("Failed to scan system known_hosts:", err);
@@ -333,16 +393,22 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
     }
   }, [knownHosts, onRefresh, onImportFromFile, readKnownHosts, t]);
 
-  // Auto-scan on first mount (silent — don't show toasts for missing known_hosts)
+  // Auto-scan on first mount when enabled (silent — no toasts for missing known_hosts)
   useEffect(() => {
-    if (!hasScannedRef.current) {
-      hasScannedRef.current = true;
-      const timer = setTimeout(() => {
-        handleScanSystem(true);
-      }, 100);
-      return () => clearTimeout(timer);
+    if (
+      !shouldAutoScanSystemKnownHosts({
+        autoImportEnabled: autoImportSystemKnownHosts,
+        alreadyScanned: hasScannedRef.current,
+      })
+    ) {
+      return;
     }
-  }, [handleScanSystem]);
+    hasScannedRef.current = true;
+    const timer = setTimeout(() => {
+      handleScanSystem(true);
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [autoImportSystemKnownHosts, handleScanSystem]);
 
   // Sort and filter hosts with deduplication by hostname
   const filteredHosts = useMemo(() => {
@@ -378,12 +444,14 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           return b.discoveredAt - a.discoveredAt;
         case "oldest":
           return a.discoveredAt - b.discoveredAt;
+        case "manual":
+          return 0;
         default:
           return 0;
       }
     });
 
-    return result;
+    return sortMode === "manual" ? sortByVaultOrder(result) : result;
   }, [knownHosts, deferredSearch, sortMode]);
 
   // Limit rendered items for performance
@@ -408,7 +476,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           knownHosts.map((h) => `${h.hostname}:${h.port}`),
         );
         const newHosts = parsed.filter(
-          (h) => !existingHostnames.has(`${h.hostname}:${h.port}`),
+          (h) => !existingHostnames.has(`${h.hostname}:${h.port}`) && !isPublicServiceHost(h.hostname),
         );
 
         if (newHosts.length > 0) {
@@ -444,9 +512,23 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
   // Memoized handlers to prevent re-renders
   const handleDelete = useCallback(
     (id: string) => {
-      onDelete(id);
+      setDeleteTargetId(id);
     },
-    [onDelete],
+    [],
+  );
+
+  const deleteTarget = useMemo(
+    () => knownHosts.find((knownHost) => knownHost.id === deleteTargetId) ?? null,
+    [deleteTargetId, knownHosts],
+  );
+
+  const confirmDelete = useCallback(
+    () => {
+      if (!deleteTargetId) return;
+      onDelete(deleteTargetId);
+      setDeleteTargetId(null);
+    },
+    [deleteTargetId, onDelete],
   );
 
   const handleConvertToHost = useCallback(
@@ -458,6 +540,18 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
 
   const openFilePicker = useCallback(() => fileInputRef.current?.click(), []);
 
+  const knownHostReorder = useVaultItemReorder({
+    containerRef: listRef,
+    viewMode,
+    dragType: "known-host-id",
+    targetAttribute: "data-known-host-id",
+    disabled: deferredSearch.trim().length > 0,
+    onReorder: (sourceId, targetId, position) => {
+      onReorder(reorderVaultItems(knownHosts, sourceId, targetId, position));
+      setSortMode("manual");
+    },
+  });
+
   // Memoize the rendered list to prevent re-renders
   const renderedItems = useMemo(() => {
     return displayedHosts.map((knownHost) => (
@@ -466,6 +560,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
         knownHost={knownHost}
         converted={convertedMap.get(knownHost.id) || false}
         viewMode={viewMode}
+        reorderProps={knownHostReorder.getItemReorderProps(knownHost.id, `known:${knownHost.id}`)}
         onDelete={handleDelete}
         onConvertToHost={handleConvertToHost}
       />
@@ -476,6 +571,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
     viewMode,
     handleDelete,
     handleConvertToHost,
+    knownHostReorder,
   ]);
 
   return (
@@ -524,6 +620,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           <SortDropdown
             value={sortMode}
             onChange={setSortMode}
+            modes={["manual", "az", "za", "newest", "oldest"]}
             className={vaultHeaderIconButtonClass}
           />
         </div>
@@ -562,12 +659,17 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
       {/* Content */}
       <ScrollArea className="flex-1">
         <div
+          ref={listRef}
           className={cn(
             "p-4",
             viewMode === "grid"
               ? "grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3"
               : "flex flex-col gap-0",
           )}
+          onDragOverCapture={knownHostReorder.handleDragOverCapture}
+          onDragOver={knownHostReorder.handleDragOver}
+          onDropCapture={knownHostReorder.handleDropCapture}
+          onDragEndCapture={knownHostReorder.handleDragEndCapture}
         >
           {displayedHosts.length === 0 ? (
             <div
@@ -623,6 +725,17 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           )}
         </div>
       </ScrollArea>
+      <VaultDeleteConfirmDialog
+        open={Boolean(deleteTargetId)}
+        title={t("vault.deleteConfirm.title", {
+          name: deleteTarget?.hostname ?? "",
+        })}
+        description={t("vault.deleteConfirm.desc")}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTargetId(null);
+        }}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 };

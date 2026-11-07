@@ -1,4 +1,5 @@
 import { Workspace,WorkspaceNode,WorkspaceViewMode } from './models';
+import { DEFAULT_WORKSPACE_TITLE } from './sessionTabTitle';
 
 export type SplitDirection = 'horizontal' | 'vertical';
 type SplitPosition = 'left' | 'right' | 'top' | 'bottom';
@@ -8,6 +9,30 @@ export type SplitHint = {
   position: SplitPosition;
   targetSessionId?: string;
 };
+
+export const invertSplitPosition = (position: SplitPosition): SplitPosition => {
+  switch (position) {
+    case 'left': return 'right';
+    case 'right': return 'left';
+    case 'top': return 'bottom';
+    case 'bottom': return 'top';
+  }
+};
+
+/**
+ * Root placeholder for a workspace whose member sessions have all closed.
+ * Issue #4098 phase 2 keeps the workspace entity (and its id) alive at zero
+ * members so restore re-links its AI chats; this empty split renders as a
+ * workspace tab with no panes until a session joins again.
+ */
+export const createEmptyWorkspaceRoot = (): WorkspaceNode => ({
+  id: crypto.randomUUID(),
+  type: 'split',
+  direction: 'vertical',
+  children: [],
+  sizes: [],
+});
+
 
 export const pruneWorkspaceNode = (node: WorkspaceNode, targetSessionId: string): WorkspaceNode | null => {
   if (node.type === 'pane') {
@@ -64,7 +89,10 @@ export const appendPaneToWorkspaceRoot = (
   sessionId: string,
   direction: SplitDirection = 'vertical',
 ): WorkspaceNode => {
+  if (collectSessionIds(root).includes(sessionId)) return root;
+
   const newPane: WorkspaceNode = { id: crypto.randomUUID(), type: 'pane', sessionId };
+  if (collectSessionIds(root).length === 0) return newPane;
 
   if (root.type === 'split' && root.direction === direction) {
     const nextChildren = [...root.children, newPane];
@@ -105,7 +133,10 @@ export const insertPaneIntoWorkspace = (
   sessionId: string,
   hint: SplitHint
 ): WorkspaceNode => {
+  if (collectSessionIds(root).includes(sessionId)) return root;
+
   const pane: WorkspaceNode = { id: crypto.randomUUID(), type: 'pane', sessionId };
+  if (collectSessionIds(root).length === 0) return pane;
 
   if (!hint.targetSessionId) {
     const children = (hint.position === 'left' || hint.position === 'top') ? [pane, root] : [root, pane];
@@ -131,6 +162,39 @@ export const insertPaneIntoWorkspace = (
   return insertPane(root);
 };
 
+/**
+ * Move an existing member pane to a new position inside the same workspace
+ * tree (issue #4037). The pane is pruned from its current spot (collapsing
+ * the emptied parent split per `pruneWorkspaceNode` rules) and re-inserted
+ * as a split sibling of the target pane on the hint's side, exactly like an
+ * orphan drop would land. Pure and immutable: session ids, node identity of
+ * untouched panes, focus fields and AI bindings are never touched — only the
+ * tree shape changes. Returns the same `root` reference for no-ops:
+ * unknown session/target, single-pane tree, or the pane dropped onto itself.
+ */
+export const movePaneInWorkspace = (
+  root: WorkspaceNode,
+  memberSessionId: string,
+  hint: SplitHint,
+): WorkspaceNode => {
+  const paneSessionIds = collectSessionIds(root);
+  if (!paneSessionIds.includes(memberSessionId)) return root;
+  // A lone pane has nowhere to move within its own workspace.
+  if (paneSessionIds.length <= 1) return root;
+  if (hint.targetSessionId === memberSessionId) return root;
+  // The target may have closed since the drag began. Validate it before
+  // pruning the source so a stale drop cannot remove the dragged terminal.
+  if (hint.targetSessionId && !paneSessionIds.includes(hint.targetSessionId)) return root;
+
+  // Prune before inserting so the dragged pane is out of the tree even when
+  // the drop target sits inside its old subtree. The pruned tree keeps the
+  // target pane (target !== source), so the insert below always lands.
+  const prunedRoot = pruneWorkspaceNode(root, memberSessionId);
+  if (!prunedRoot) return root;
+
+  return insertPaneIntoWorkspace(prunedRoot, memberSessionId, hint);
+};
+
 export const createWorkspaceFromSessions = (
   baseSessionId: string,
   joiningSessionId: string,
@@ -142,7 +206,7 @@ export const createWorkspaceFromSessions = (
 
   return {
     id: `ws-${crypto.randomUUID()}`,
-    title: 'Workspace',
+    title: DEFAULT_WORKSPACE_TITLE,
     focusedSessionId: baseSessionId, // Initialize with the base session focused
     focusSessionOrder: [baseSessionId, joiningSessionId],
     root: {
@@ -223,6 +287,8 @@ export const createWorkspaceFromSessionIds = (
     title: string;
     viewMode?: WorkspaceViewMode;
     snippetId?: string;
+    /** false = the title is an explicit name; omit for an auto default title. */
+    autoTitle?: boolean;
   }
 ): Workspace => {
   if (sessionIds.length === 0) {
@@ -234,6 +300,7 @@ export const createWorkspaceFromSessionIds = (
     return {
       id: `ws-${crypto.randomUUID()}`,
       title: options.title,
+      autoTitle: options.autoTitle,
       viewMode: options.viewMode,
       snippetId: options.snippetId,
       focusedSessionId: sessionIds[0],
@@ -256,6 +323,7 @@ export const createWorkspaceFromSessionIds = (
   return {
     id: `ws-${crypto.randomUUID()}`,
     title: options.title,
+    autoTitle: options.autoTitle,
     viewMode: options.viewMode,
     snippetId: options.snippetId,
     focusedSessionId: sessionIds[0],
@@ -271,8 +339,52 @@ export const createWorkspaceFromSessionIds = (
 };
 
 /**
+ * Deep-clone a workspace layout tree, minting fresh node ids and remapping
+ * every pane's sessionId via `sessionIdMap` (old id -> new id). Split
+ * `direction` and `sizes` are preserved. A sessionId absent from the map is
+ * kept as-is. Pure; does not mutate `node`.
+ */
+export const cloneWorkspaceTree = (
+  node: WorkspaceNode,
+  sessionIdMap: ReadonlyMap<string, string>,
+  nodeIdMap?: ReadonlyMap<string, string>,
+): WorkspaceNode => {
+  if (node.type === 'pane') {
+    return {
+      id: nodeIdMap?.get(node.id) ?? crypto.randomUUID(),
+      type: 'pane',
+      sessionId: sessionIdMap.get(node.sessionId) ?? node.sessionId,
+    };
+  }
+  return {
+    id: nodeIdMap?.get(node.id) ?? crypto.randomUUID(),
+    type: 'split',
+    direction: node.direction,
+    children: node.children.map(child => cloneWorkspaceTree(child, sessionIdMap, nodeIdMap)),
+    ...(node.sizes ? { sizes: [...node.sizes] } : {}),
+  };
+};
+
+/**
  * Collect all session IDs from a workspace node tree.
  */
+/**
+ * Point a workspace's focus at `sessionId`. Returns the same array when the
+ * workspace is missing or already focused there, so React state setters can
+ * bail out instead of re-rendering the whole shell on every pane click/focus.
+ */
+export const setWorkspaceFocusedSessionId = (
+  workspaces: Workspace[],
+  workspaceId: string,
+  sessionId: string,
+): Workspace[] => {
+  const index = workspaces.findIndex((ws) => ws.id === workspaceId);
+  if (index < 0 || workspaces[index].focusedSessionId === sessionId) return workspaces;
+  const next = workspaces.slice();
+  next[index] = { ...workspaces[index], focusedSessionId: sessionId };
+  return next;
+};
+
 export const collectSessionIds = (node: WorkspaceNode): string[] => {
   if (node.type === 'pane') {
     return [node.sessionId];

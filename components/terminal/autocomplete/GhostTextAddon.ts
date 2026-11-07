@@ -10,46 +10,91 @@
 import type { Terminal as XTerm, IDisposable } from "@xterm/xterm";
 import { getXTermCellDimensions, invalidateCellDimensionCache } from "./xtermUtils";
 import { lineHasUntrackedTrailingInput } from "./ghostTextConsistency";
+import { stringCellWidth } from "./terminalStringCellWidth";
 
-/**
- * Minimal East-Asian-Width-style classifier: returns 2 for wide glyphs
- * (CJK ideographs, fullwidth forms, most emoji, hangul syllables) and
- * 1 otherwise. Not full wcwidth — just enough to keep the predicted
- * ghost column from drifting by one cell per CJK char typed.
- */
-function codePointCellWidth(cp: number): number {
-  if (
-    (cp >= 0x1100 && cp <= 0x115f) ||   // Hangul Jamo
-    (cp >= 0x2e80 && cp <= 0x303e) ||   // CJK Radicals, Kangxi
-    (cp >= 0x3041 && cp <= 0x33ff) ||   // Hiragana, Katakana, CJK Compat
-    (cp >= 0x3400 && cp <= 0x4dbf) ||   // CJK Extension A
-    (cp >= 0x4e00 && cp <= 0x9fff) ||   // CJK Unified Ideographs
-    (cp >= 0xa000 && cp <= 0xa4cf) ||   // Yi
-    (cp >= 0xac00 && cp <= 0xd7a3) ||   // Hangul Syllables
-    (cp >= 0xf900 && cp <= 0xfaff) ||   // CJK Compat Ideographs
-    (cp >= 0xfe30 && cp <= 0xfe4f) ||   // CJK Compat Forms
-    (cp >= 0xff00 && cp <= 0xff60) ||   // Fullwidth forms
-    (cp >= 0xffe0 && cp <= 0xffe6) ||   // Fullwidth signs
-    (cp >= 0x1f300 && cp <= 0x1faff) || // Emoji blocks
-    (cp >= 0x20000 && cp <= 0x3fffd)    // CJK Extension B-F, G
-  ) {
-    return 2;
-  }
-  return 1;
+function commonPrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i += 1;
+  return i;
 }
 
-function stringCellWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) {
-    const cp = ch.codePointAt(0) ?? 0;
-    w += codePointCellWidth(cp);
+/** Longest prefix of `input` that is already a suffix of `beforeCursor`. */
+function echoedInputPrefixLength(beforeCursor: string, input: string): number {
+  let n = Math.min(beforeCursor.length, input.length);
+  while (n > 0 && !beforeCursor.endsWith(input.slice(0, n))) {
+    n -= 1;
   }
-  return w;
+  return n;
+}
+
+function hasVisibleGhostPrefix(ghostText: string, afterCursor: string): boolean {
+  if (!ghostText || !afterCursor) return false;
+  const visibleAfterCursor = afterCursor.trimEnd();
+  const overlap = commonPrefixLength(ghostText, visibleAfterCursor);
+  if (overlap <= 0) return false;
+  if (ghostText.slice(0, overlap).trim().length === 0) return false;
+  return (
+    overlap === ghostText.length ||
+    overlap === visibleAfterCursor.length ||
+    afterCursor[overlap] === " "
+  );
+}
+
+type BufferLineLike = {
+  isWrapped?: boolean;
+  translateToString?: (
+    trimRight?: boolean,
+    startColumn?: number,
+    endColumn?: number,
+  ) => string;
+};
+
+type ActiveBufferLike = {
+  baseY: number;
+  cursorY: number;
+  cursorX: number;
+  getLine?: (y: number) => BufferLineLike | undefined;
+};
+
+/**
+ * Text before the cursor across wrapped physical rows. `getLine` only returns
+ * one row, so a wrapped command's current row cannot end with the full
+ * `currentInput` — callers must reconstruct the logical line or they will
+ * treat already-echoed text as unechoed.
+ */
+function readBeforeCursorAcrossWraps(
+  buf: ActiveBufferLike,
+  cols: number,
+): string | null {
+  if (typeof buf.getLine !== "function") return null;
+  const absY = buf.baseY + buf.cursorY;
+  let line = buf.getLine(absY);
+  if (!line || typeof line.translateToString !== "function") return null;
+
+  // cursorX is a cell column, not a UTF-16 offset — slice() breaks on
+  // wide / multi-code-unit graphemes (emoji prompts, CJK).
+  let beforeCursor = line.translateToString(false, 0, buf.cursorX);
+  let y = absY;
+  while (line.isWrapped && y > 0) {
+    y -= 1;
+    line = buf.getLine(y);
+    if (!line || typeof line.translateToString !== "function") break;
+    // Keep wrap seams aligned with the terminal width (do not trimRight).
+    const rowCols = cols > 0 ? cols : undefined;
+    const rowText = rowCols === undefined
+      ? line.translateToString(false)
+      : line.translateToString(false, 0, rowCols);
+    beforeCursor = rowText + beforeCursor;
+  }
+  return beforeCursor;
 }
 
 export class GhostTextAddon implements IDisposable {
   private term: XTerm | null = null;
   private ghostElement: HTMLSpanElement | null = null;
+  private hintElement: HTMLSpanElement | null = null;
+  private hintActive = false;
   private containerElement: HTMLDivElement | null = null;
   private currentSuggestion: string = "";
   private currentInput: string = "";
@@ -104,6 +149,23 @@ export class GhostTextAddon implements IDisposable {
 
     this.containerElement.appendChild(this.ghostElement);
 
+    // Read-only inline hint (e.g. sudo "press Enter to paste password"). Shown
+    // independently of autocomplete suggestions and never accepted as input.
+    this.hintElement = document.createElement("span");
+    this.hintElement.className = "xterm-inline-hint";
+    Object.assign(this.hintElement.style, {
+      position: "absolute",
+      opacity: "0.4",
+      pointerEvents: "none",
+      whiteSpace: "pre",
+      fontFamily: "inherit",
+      fontSize: "inherit",
+      lineHeight: "inherit",
+      color: "inherit",
+      display: "none",
+    });
+    this.containerElement.appendChild(this.hintElement);
+
     const screenEl = termElement.querySelector(".xterm-screen");
     if (screenEl) {
       screenEl.appendChild(this.containerElement);
@@ -113,11 +175,12 @@ export class GhostTextAddon implements IDisposable {
 
     this.disposables.push(
       term.onRender(() => {
+        if (this.hintActive) this.updateHintPosition();
         if (!this.isVisible()) return;
         // Fail-safe: if the device echoed input we didn't track (some bastion
-        // hosts / network OS, #1013), hide rather than draw the ghost over
-        // already-typed text. Done here (post-echo render) rather than in
-        // show()/adjustToInput so it never fights the keystroke-time path.
+        // hosts / network OS, #1013/#1060), hide rather than draw the ghost
+        // over already-visible text. Done here (post-echo render) rather than
+        // in show()/adjustToInput so it never fights the keystroke-time path.
         if (this.realLineHasUntrackedInput()) {
           this.hide();
           return;
@@ -137,6 +200,7 @@ export class GhostTextAddon implements IDisposable {
         this.lastLeft = -1;
         this.lastTop = -1;
         if (this.isVisible()) this.updatePosition();
+        if (this.hintActive) this.updateHintPosition();
       }),
     );
   }
@@ -160,8 +224,36 @@ export class GhostTextAddon implements IDisposable {
 
     this.currentSuggestion = fullSuggestion;
     this.currentInput = currentInput;
-    this.anchorCursorX = this.term.buffer.active.cursorX;
-    this.anchorCursorY = this.term.buffer.active.cursorY;
+    const buf = this.term.buffer.active;
+    const liveX = buf.cursorX;
+    // When show() runs before the shell echoes `currentInput` (CJK IME /
+    // high-latency SSH), live cursorX is still at the prompt. Advance the
+    // anchor by the pending input's cell width so the ghost sits after it
+    // instead of painting over it. Skip the probe when getLine is unavailable
+    // (unit fakes) so those tests keep the legacy "cursor already at end"
+    // contract.
+    let anchorX = liveX;
+    if (
+      currentInput.length > 0 &&
+      typeof buf.getLine === "function"
+    ) {
+      const beforeCursor = readBeforeCursorAcrossWraps(
+        buf as ActiveBufferLike,
+        this.term.cols,
+      );
+      if (beforeCursor !== null && !beforeCursor.endsWith(currentInput)) {
+        // Shell may have echoed only a prefix (e.g. "$ doc" while
+        // currentInput is "docker"). Advance by the unechoed suffix only —
+        // adding the full input width on top of a partially-advanced liveX
+        // overshoots and Math.max self-heal cannot move the ghost left.
+        const unechoed = currentInput.slice(
+          echoedInputPrefixLength(beforeCursor, currentInput),
+        );
+        anchorX = liveX + stringCellWidth(unechoed, this.term);
+      }
+    }
+    this.anchorCursorX = anchorX;
+    this.anchorCursorY = buf.cursorY;
     this.anchorInputLength = currentInput.length;
     // Force position recalc since the text also changed.
     this.lastLeft = -1;
@@ -183,6 +275,40 @@ export class GhostTextAddon implements IDisposable {
     this.currentSuggestion = "";
     this.currentInput = "";
     this.anchorInputLength = 0;
+  }
+
+  /** Show a read-only inline hint at the cursor (e.g. a sudo password prompt
+   *  hint). Independent of autocomplete suggestions; never accepted as input. */
+  showHint(text: string): void {
+    if (this.disposed || !this.hintElement || !this.term) return;
+    this.hintActive = true;
+    this.hintElement.textContent = text;
+    this.hintElement.style.display = "block";
+    this.hintElement.style.fontSize = `${this.term.options.fontSize}px`;
+    this.hintElement.style.fontFamily = this.term.options.fontFamily || "inherit";
+    this.updateHintPosition();
+  }
+
+  hideHint(): void {
+    this.hintActive = false;
+    if (this.hintElement) {
+      this.hintElement.style.display = "none";
+      this.hintElement.textContent = "";
+    }
+  }
+
+  isHintActive(): boolean {
+    return this.hintActive;
+  }
+
+  private updateHintPosition(): void {
+    if (!this.term || !this.hintElement) return;
+    const dims = getXTermCellDimensions(this.term);
+    const buf = this.term.buffer.active;
+    this.hintElement.style.left = `${buf.cursorX * dims.width}px`;
+    this.hintElement.style.top = `${buf.cursorY * dims.height}px`;
+    this.hintElement.style.lineHeight = `${dims.height}px`;
+    this.hintElement.style.height = `${dims.height}px`;
   }
 
   /**
@@ -276,7 +402,7 @@ export class GhostTextAddon implements IDisposable {
   }
 
   getGhostText(): string {
-    if (!this.currentSuggestion || !this.currentInput) return "";
+    if (!this.currentSuggestion) return "";
     return this.currentSuggestion.startsWith(this.currentInput)
       ? this.currentSuggestion.substring(this.currentInput.length)
       : "";
@@ -300,33 +426,58 @@ export class GhostTextAddon implements IDisposable {
   }
 
   /**
-   * True when the real terminal line has more input than we tracked, so
-   * rendering the ghost would paint over already-typed characters. See
-   * ./ghostTextConsistency and issue #1013. Returns false on hosts/inputs
-   * we can't judge (non-ASCII, echo still catching up), so the ghost only
-   * gets suppressed when corruption is actually imminent.
+   * True when the real terminal line has input we did not track, or already
+   * visible text exactly matches the ghost we are about to paint. See
+   * ./ghostTextConsistency and issues #1013 and #1060. Returns false on
+   * hosts/inputs we can't judge (non-ASCII, echo still catching up), so the
+   * ghost only gets suppressed when corruption is actually imminent.
    */
   private realLineHasUntrackedInput(): boolean {
-    if (!this.term || !this.currentInput) return false;
+    if (!this.term) return false;
     const buf = this.term.buffer.active;
     if (typeof buf?.getLine !== "function") return false;
     const line = buf.getLine(buf.baseY + buf.cursorY);
     if (!line || typeof line.translateToString !== "function") return false;
-    const beforeCursor = line.translateToString(false).slice(0, buf.cursorX);
+    const lineText = line.translateToString(false);
+    const beforeCursor = lineText.slice(0, buf.cursorX);
+    const afterCursor = lineText.slice(buf.cursorX);
+    const ghostText = this.getGhostText();
+    if (hasVisibleGhostPrefix(ghostText, afterCursor)) return true;
+    if (!this.currentInput) return false;
     return lineHasUntrackedTrailingInput(this.currentInput, beforeCursor);
   }
 
   private updatePosition(): void {
     if (!this.term || !this.ghostElement) return;
 
-    // Self-heal a stale anchor: when show() fires during the SSH
-    // keystroke→echo gap, cursorX captured there is still the
+    // Self-heal a stale anchor: when show() fired during the SSH
+    // keystroke→echo gap without a line probe, cursorX may still be the
     // pre-echo column. While no adjustToInput has moved us from the
-    // show-time baseline, re-read live cursor on each render tick so
-    // the anchor snaps to the echoed position once it arrives.
+    // show-time baseline, adopt a live cursor that has advanced (echo
+    // caught up). Use max on the same row so a cell-width-predicted
+    // pre-echo anchor is not collapsed back onto the prompt before echo
+    // arrives. When the live row advances, the predicted X may already
+    // encode a wrap (column >= cols); adopting the live X/Y pair avoids
+    // counting that wrap again in the modulo math below.
+    // When the predicted wrap happens on the bottom row, the echo scrolls
+    // the buffer and Y stays put — adopt live X/Y once it matches the
+    // normalized wrap column so Math.max cannot keep the unnormalized X.
     if (this.currentInput.length === this.anchorInputLength) {
-      this.anchorCursorX = this.term.buffer.active.cursorX;
-      this.anchorCursorY = this.term.buffer.active.cursorY;
+      const liveX = this.term.buffer.active.cursorX;
+      const liveY = this.term.buffer.active.cursorY;
+      const cols = Math.max(1, this.term.cols);
+      if (liveY !== this.anchorCursorY) {
+        this.anchorCursorX = liveX;
+        this.anchorCursorY = liveY;
+      } else if (
+        this.anchorCursorX >= cols &&
+        liveX === this.anchorCursorX % cols
+      ) {
+        this.anchorCursorX = liveX;
+        this.anchorCursorY = liveY;
+      } else {
+        this.anchorCursorX = Math.max(this.anchorCursorX, liveX);
+      }
     }
 
     const dims = getXTermCellDimensions(this.term);
@@ -337,12 +488,13 @@ export class GhostTextAddon implements IDisposable {
     // advance by 2 cells instead of 1. Backspace / Ctrl-W produces a
     // negative delta by shrinking currentInput below anchorInputLength.
     const cellDelta = this.currentInput.length >= this.anchorInputLength
-      ? stringCellWidth(this.currentInput.slice(this.anchorInputLength))
+      ? stringCellWidth(this.currentInput.slice(this.anchorInputLength), this.term)
       : -stringCellWidth(
           // currentSuggestion[0..anchorInputLength] equals what was typed
           // when show() fired (prefix-match invariant), so its slice gives
           // the correct cell widths for the deleted glyphs.
           this.currentSuggestion.slice(this.currentInput.length, this.anchorInputLength),
+          this.term,
         );
     const cols = Math.max(1, this.term.cols);
     const targetCol = this.anchorCursorX + cellDelta;
@@ -379,6 +531,7 @@ export class GhostTextAddon implements IDisposable {
     this.containerElement?.remove();
     this.containerElement = null;
     this.ghostElement = null;
+    this.hintElement = null;
     this.term = null;
   }
 }

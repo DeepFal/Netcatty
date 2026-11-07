@@ -50,6 +50,9 @@ function emitLocalStorageAdapterChanged(key: string): void {
  */
 function safeSetItem(key: string, value: string): boolean {
   try {
+    if (localStorage.getItem(key) === value) {
+      return true;
+    }
     localStorage.setItem(key, value);
     emitLocalStorageAdapterChanged(key);
     return true;
@@ -72,7 +75,8 @@ export const localStorageAdapter = {
     return safeParse<T>(localStorage.getItem(key));
   },
   write<T>(key: string, value: T): boolean {
-    return safeSetItem(key, JSON.stringify(value));
+    const json = JSON.stringify(value);
+    return safeSetItem(key, json);
   },
   readString(key: string): string | null {
     return localStorage.getItem(key);
@@ -100,6 +104,7 @@ export const localStorageAdapter = {
     return safeSetItem(key, String(value));
   },
   remove(key: string) {
+    if (localStorage.getItem(key) === null) return;
     localStorage.removeItem(key);
     emitLocalStorageAdapterChanged(key);
   },

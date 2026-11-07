@@ -1,10 +1,10 @@
 import React from "react";
-import { ExternalLink, LogIn, LogOut, RefreshCw, X } from "lucide-react";
+import { ExternalLink, LogIn, LogOut, RefreshCw, RotateCcw, X } from "lucide-react";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Button } from "../../../ui/button";
+import { Switch } from "../../../ui/switch";
 import { cn } from "../../../../lib/utils";
-import type { AgentPathInfo, CodexIntegrationStatus, CodexLoginSession } from "./types";
-import { ProviderIconBadge } from "./ProviderIconBadge";
+import type { AgentPathInfo, CodexAppServerStatus, CodexIntegrationStatus, CodexLoginSession } from "./types";
 
 export const CodexConnectionCard: React.FC<{
   pathInfo: AgentPathInfo | null;
@@ -12,30 +12,40 @@ export const CodexConnectionCard: React.FC<{
   customPath: string;
   onCustomPathChange: (path: string) => void;
   onRecheckPath: () => void;
+  onResetPath: () => void;
   integration: CodexIntegrationStatus | null;
   loginSession: CodexLoginSession | null;
   isLoading: boolean;
+  hasPendingCustomPath?: boolean;
   error: string | null;
   onRefresh: () => void;
   onConnect: () => void;
   onCancel: () => void;
   onOpenUrl: () => void;
   onLogout: () => void;
+  appServerRuntime: 'sdk' | 'app-server';
+  appServerStatus: CodexAppServerStatus | null;
+  onAppServerRuntimeChange: (runtime: 'sdk' | 'app-server') => void;
 }> = ({
   pathInfo,
   isResolvingPath,
   customPath,
   onCustomPathChange,
   onRecheckPath,
+  onResetPath,
   integration,
   loginSession,
   isLoading,
+  hasPendingCustomPath = false,
   error,
   onRefresh,
   onConnect,
   onCancel,
   onOpenUrl,
   onLogout,
+  appServerRuntime,
+  appServerStatus,
+  onAppServerRuntimeChange,
 }) => {
   const { t } = useI18n();
   const found = pathInfo?.available;
@@ -87,54 +97,84 @@ export const CodexConnectionCard: React.FC<{
         : "";
 
   return (
-    <div className="rounded-lg border border-border/60 bg-muted/20 p-4 space-y-3">
+    <div className="rounded-lg border bg-card p-4 space-y-3">
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <ProviderIconBadge providerId="openai" size="sm" />
-            <span className="text-sm font-medium">{t('ai.codex.title')}</span>
-          </div>
-          <p className="text-xs text-muted-foreground mt-2 leading-5">
-            {t('ai.codex.description')}
-          </p>
-        </div>
+        <p className="min-w-0 text-xs text-muted-foreground leading-5">
+          {t('ai.codex.description')}
+        </p>
         <div className={cn("text-xs font-medium shrink-0", statusClassName)}>
           {status}
         </div>
       </div>
 
-      {/* Path detection info */}
-      {found ? (
-        <div className="flex items-center gap-2 text-xs">
-          <span className="text-muted-foreground">{t('ai.codex.path')}</span>
-          <span className="font-mono text-foreground truncate">{pathInfo.path}</span>
+      {found && (
+        <div className="flex items-center gap-2 text-xs min-w-0">
+          <span className="text-muted-foreground shrink-0">{t('ai.codex.path')}</span>
+          <span className="font-mono text-foreground min-w-0 flex-1 truncate" title={pathInfo.path ?? undefined}>{pathInfo.path}</span>
           {pathInfo.version && (
             <>
-              <span className="text-muted-foreground">|</span>
-              <span className="text-muted-foreground">{pathInfo.version}</span>
+              <span className="text-muted-foreground shrink-0">|</span>
+              <span className="text-muted-foreground shrink-0">{pathInfo.version}</span>
             </>
           )}
         </div>
-      ) : !isResolvingPath ? (
+      )}
+
+      {!isResolvingPath && (
         <div className="space-y-2">
-          <p className="text-xs text-amber-500">
-            {t('ai.codex.notFoundHint')}
-          </p>
+          {!found && (
+            <p className="text-xs text-amber-500">
+              {t('ai.codex.notFoundHint')}
+            </p>
+          )}
           <div className="flex items-center gap-2">
             <input
               type="text"
               value={customPath}
               onChange={(e) => onCustomPathChange(e.target.value)}
               placeholder={t('ai.codex.customPathPlaceholder')}
-              className="flex-1 h-8 rounded-md border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              className="flex-1 min-w-0 h-8 rounded-md border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             />
             <Button variant="outline" size="sm" onClick={onRecheckPath} disabled={!customPath.trim()}>
               <RefreshCw size={14} className="mr-1.5" />
               {t('ai.codex.check')}
             </Button>
+            <Button variant="ghost" size="sm" onClick={onResetPath} disabled={!customPath.trim()}>
+              <RotateCcw size={14} className="mr-1.5" />
+              {t('ai.codex.resetPath')}
+            </Button>
           </div>
         </div>
-      ) : null}
+      )}
+
+      {found && (
+        <div className="border-t border-border/40 pt-3 flex items-start justify-between gap-4">
+          <div className="min-w-0 space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">{t('ai.codex.appServer.title')}</span>
+              <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-500">
+                {t('ai.codex.appServer.experimental')}
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground leading-5">
+              {t('ai.codex.appServer.description')}
+            </p>
+            {appServerStatus?.checking ? (
+              <p className="text-xs text-muted-foreground">{t('ai.codex.appServer.checking')}</p>
+            ) : appServerStatus?.available ? (
+              <p className="text-xs text-emerald-500">{t('ai.codex.appServer.available')}</p>
+            ) : appServerStatus?.error ? (
+              <p className="text-xs text-amber-500">{appServerStatus.error}</p>
+            ) : null}
+          </div>
+          <Switch
+            checked={appServerRuntime === 'app-server'}
+            disabled={Boolean(appServerStatus?.checking) || (appServerRuntime === 'sdk' && appServerStatus?.available !== true)}
+            aria-label={t('ai.codex.appServer.title')}
+            onCheckedChange={(checked) => onAppServerRuntimeChange(checked ? 'app-server' : 'sdk')}
+          />
+        </div>
+      )}
 
       {/* Connection & login UI -- only when codex is detected */}
       {found && (
@@ -155,18 +195,18 @@ export const CodexConnectionCard: React.FC<{
               // Nothing to log out of; config.toml is user-owned state.
               null
             ) : integration?.isConnected ? (
-              <Button variant="outline" size="sm" onClick={onLogout}>
+              <Button variant="outline" size="sm" onClick={onLogout} disabled={hasPendingCustomPath}>
                 <LogOut size={14} className="mr-1.5" />
                 {t('ai.codex.logout')}
               </Button>
             ) : (
-              <Button variant="default" size="sm" onClick={onConnect}>
+              <Button variant="default" size="sm" onClick={onConnect} disabled={hasPendingCustomPath}>
                 <LogIn size={14} className="mr-1.5" />
                 {t('ai.codex.connectChatGPT')}
               </Button>
             )}
 
-            <Button variant="outline" size="sm" onClick={onRefresh} disabled={isLoading}>
+            <Button variant="outline" size="sm" onClick={onRefresh} disabled={isLoading || hasPendingCustomPath}>
               <RefreshCw size={14} className={cn("mr-1.5", isLoading && "animate-spin")} />
               {t('ai.codex.refreshStatus')}
             </Button>

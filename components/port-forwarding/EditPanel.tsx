@@ -4,17 +4,26 @@
  */
 import { ChevronDown,Copy,Trash2 } from 'lucide-react';
 import React from 'react';
+import { isPortForwardingAutoReconnectEnabled } from '../../domain/portForwardingReconnect';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { Host,PortForwardingRule } from '../../domain/models';
 import { DistroAvatar } from '../DistroAvatar';
 import { TrafficDiagram } from '../TrafficDiagram';
-import { AsideActionMenu,AsideActionMenuItem,AsidePanel,AsidePanelContent,AsidePanelFooter } from '../ui/aside-panel';
+import {
+    AsideActionMenu,
+    AsideActionMenuItem,
+    AsidePanel,
+    AsidePanelContent,
+    AsidePanelFooter,
+    type AsidePanelLayout,
+    type AsidePanelResizeProps,
+} from '../ui/aside-panel';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Switch } from '../ui/switch';
 
-export interface EditPanelProps {
+export interface EditPanelProps extends AsidePanelResizeProps {
     rule: PortForwardingRule;
     draft: Partial<PortForwardingRule>;
     hosts: Host[];
@@ -24,6 +33,7 @@ export interface EditPanelProps {
     onDuplicate: () => void;
     onDelete: () => void;
     onOpenHostSelector: () => void;
+    layout?: AsidePanelLayout;
 }
 
 export const EditPanel: React.FC<EditPanelProps> = ({
@@ -36,6 +46,10 @@ export const EditPanel: React.FC<EditPanelProps> = ({
     onDuplicate,
     onDelete,
     onOpenHostSelector,
+    layout = 'inline',
+    resizable = false,
+    persistWidthStorageKey,
+    resizeAriaLabel,
 }) => {
     const { t } = useI18n();
     const selectedHost = hosts.find(h => h.id === draft.hostId);
@@ -46,6 +60,10 @@ export const EditPanel: React.FC<EditPanelProps> = ({
             onClose={onClose}
             title={t('pf.wizard.editTitle')}
             width="w-[360px]"
+            layout={layout}
+            resizable={resizable}
+            persistWidthStorageKey={persistWidthStorageKey}
+            resizeAriaLabel={resizeAriaLabel}
             actions={
                 <AsideActionMenu>
                     <AsideActionMenuItem
@@ -116,8 +134,8 @@ export const EditPanel: React.FC<EditPanelProps> = ({
                             <div className="flex items-center gap-2">
                                 <DistroAvatar
                                     host={selectedHost}
-                                    fallback={selectedHost.os[0].toUpperCase()}
-                                    className="h-6 w-6"
+                                    fallback={(selectedHost.os || 'unknown').charAt(0).toUpperCase()}
+                                    size="tree"
                                 />
                                 <span>{selectedHost.label}</span>
                             </div>
@@ -163,6 +181,18 @@ export const EditPanel: React.FC<EditPanelProps> = ({
                     <Switch
                         checked={draft.autoStart ?? false}
                         onCheckedChange={checked => onDraftChange({ autoStart: checked })}
+                    />
+                </div>
+
+                {/* Auto Reconnect Toggle */}
+                <div className="flex items-center justify-between py-2">
+                    <div className="space-y-0.5">
+                        <Label className="text-sm font-medium">{t('pf.form.autoReconnect')}</Label>
+                        <p className="text-[10px] text-muted-foreground">{t('pf.form.autoReconnectDesc')}</p>
+                    </div>
+                    <Switch
+                        checked={isPortForwardingAutoReconnectEnabled(draft)}
+                        onCheckedChange={checked => onDraftChange({ autoReconnect: checked })}
                     />
                 </div>
             </AsidePanelContent>

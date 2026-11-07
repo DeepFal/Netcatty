@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { getAlignedPrompt } from "./autocomplete/promptDetector.ts";
+import { detectPrompt, getAlignedPrompt, isProgramInputPromptText } from "./autocomplete/promptDetector.ts";
+import { resolveAutocompleteQueryInput } from "./autocomplete/terminalAutocompletePrompt.ts";
+import { getSnippetSuggestions } from "./autocomplete/snippetCompleter.ts";
+import { stringCellWidth } from "./autocomplete/terminalStringCellWidth.ts";
 import { getCommandToRecordOnEnter } from "./autocomplete/useTerminalAutocomplete.ts";
 
 function createFakeTerm(lineText: string, cursorX: number) {
@@ -23,6 +26,13 @@ function createFakeTerm(lineText: string, cursorX: number) {
       },
     },
   };
+}
+
+/** Simulates xterm padding empty cells as trailing spaces after wide glyphs. */
+function createPaddedFakeTerm(content: string, cursorX: number, cols = 80) {
+  const pad = Math.max(0, cols - stringCellWidth(content));
+  const lineText = content + " ".repeat(pad);
+  return createFakeTerm(lineText, cursorX);
 }
 
 function createWrappedFakeTerm(rows: string[], cursorY: number, cursorX: number, cols: number) {
@@ -58,6 +68,62 @@ test("keeps raw input when a standard shell prompt echo is still behind", () => 
   assert.equal(result.prompt.userInput, "do");
   assert.equal(result.prompt.cursorOffset, 2);
   assert.equal(result.alignedTyped, null);
+});
+
+test("uses reliable typed buffer when prompt echo has not started (IME / high-latency commit)", () => {
+  const term = createFakeTerm("$ ", 2);
+
+  const result = getAlignedPrompt(term as never, "部署", true);
+
+  assert.equal(result.prompt.isAtPrompt, true);
+  assert.equal(result.prompt.promptText, "$ ");
+  assert.equal(result.prompt.userInput, "部署");
+  assert.equal(result.prompt.cursorOffset, 2);
+  // Pre-echo input is surfaced for alignment, but empty echo alone must not
+  // authorize history recording or third-party completion providers until echo
+  // validates the line. Local history/fig/snippet popups may still query from
+  // the keystroke buffer (#2830).
+  assert.equal(result.alignedTyped, null);
+  assert.equal(result.allowExternalProviders, false);
+});
+
+test("uses typed buffer before echo on padded themed prompts", () => {
+  // robbyrussell-style PS1 pads after the arrow: detectPrompt keeps the
+  // trailing space in userInput, which must still count as visually empty.
+  const term = createFakeTerm("➜  ", 3);
+
+  const result = getAlignedPrompt(term as never, "部署", true);
+
+  assert.equal(result.prompt.isAtPrompt, true);
+  assert.equal(result.prompt.userInput, "部署");
+  assert.equal(result.alignedTyped, null);
+  assert.equal(result.allowExternalProviders, false);
+});
+
+test("uses typed buffer before echo on Nerd Font themed terminators", () => {
+  const term = createFakeTerm(" ", 2);
+
+  const result = getAlignedPrompt(term as never, "部署", true);
+
+  assert.equal(result.prompt.isAtPrompt, true);
+  assert.equal(result.prompt.promptText, " ");
+  assert.equal(result.prompt.userInput, "部署");
+  assert.equal(result.alignedTyped, null);
+  assert.equal(result.allowExternalProviders, false);
+});
+
+test("does not treat empty-echo shell-shaped prompts as validated typed input", () => {
+  const term = createFakeTerm("$ ", 2);
+  const secret = "s3cret-token";
+
+  const result = getAlignedPrompt(term as never, secret, true);
+
+  assert.equal(result.prompt.isAtPrompt, true);
+  // Keystroke buffer is still visible on the prompt view, but empty echo
+  // must not authorize history recording or external providers.
+  assert.equal(result.prompt.userInput, secret);
+  assert.equal(result.alignedTyped, null);
+  assert.equal(result.allowExternalProviders, false);
 });
 test("still trims prompt decorations out of the detected input", () => {
   const term = createFakeTerm("➜  ~ do", 7);
@@ -204,6 +270,24 @@ test("does not treat common interactive program prompts as shell prompts", () =>
       true,
     );
 
+    assert.equal(result.prompt.isAtPrompt, false, lineText);
+    assert.equal(result.alignedTyped, null, lineText);
+  }
+});
+
+test("does not treat sensitive authentication challenges as shell prompts", () => {
+  for (const lineText of [
+    "OTP> 123456",
+    "Verification code> 123456",
+    "Duo passcode: 123456",
+    "验证码> 123456",
+  ]) {
+    const typedInput = lineText.slice(lineText.lastIndexOf(" ") + 1);
+    const result = getAlignedPrompt(
+      createFakeTerm(lineText, lineText.length) as never,
+      typedInput,
+      true,
+    );
     assert.equal(result.prompt.isAtPrompt, false, lineText);
     assert.equal(result.alignedTyped, null, lineText);
   }
@@ -670,4 +754,126 @@ test("does not record partial standard prompt input while reliable typed input i
     getCommandToRecordOnEnter(result.prompt, result.alignedTyped, typedInput, true),
     null,
   );
+});
+
+test("CMD path prompts keep pre-echo Chinese input usable for snippet matching (#2813)", () => {
+  const prompts = [
+    String.raw`C:\Users\foo>`,
+    String.raw`C:\Users\用户>`,
+    String.raw`PS C:\Users\foo> `,
+    String.raw`PS C:\Users\用户> `,
+  ];
+  const typedInput = "部署";
+  const snippet = { id: "zh", label: "部署服务", command: "echo deploy" };
+
+  for (const prompt of prompts) {
+    const term = createPaddedFakeTerm(prompt, stringCellWidth(prompt));
+    const raw = detectPrompt(term as never);
+    assert.equal(raw.isAtPrompt, true, prompt);
+    assert.equal(raw.userInput.trim(), "", prompt);
+
+    const aligned = getAlignedPrompt(term as never, typedInput, true);
+    assert.equal(aligned.prompt.isAtPrompt, true, prompt);
+    assert.equal(aligned.prompt.userInput, typedInput, prompt);
+    assert.equal(aligned.alignedTyped, null, prompt);
+    assert.equal(aligned.allowExternalProviders, false, prompt);
+
+    const query = resolveAutocompleteQueryInput(
+      aligned.prompt,
+      typedInput,
+      true,
+    );
+    assert.equal(query, typedInput, prompt);
+    assert.equal(
+      getSnippetSuggestions(query ?? "", [snippet as never], {})[0]?.snippet?.id,
+      "zh",
+      prompt,
+    );
+  }
+});
+
+test("CMD path prompts with CJK directories do not absorb padding into echoed Chinese input", () => {
+  const prompt = String.raw`C:\Users\用户>`;
+  const typedInput = "部署";
+  const content = `${prompt}${typedInput}`;
+  const term = createPaddedFakeTerm(content, stringCellWidth(content));
+
+  const raw = detectPrompt(term as never);
+  assert.equal(raw.isAtPrompt, true);
+  assert.equal(raw.promptText, prompt);
+  assert.equal(raw.userInput, typedInput);
+  assert.equal(raw.cursorOffset, typedInput.length);
+
+  // Unreliable typed buffer must still match snippets from the live line
+  // (fresh local CMD sessions often clear keystroke reliability on startup).
+  const query = resolveAutocompleteQueryInput(raw, "", false);
+  assert.equal(query, typedInput);
+  assert.equal(
+    getSnippetSuggestions(query ?? "", [{
+      id: "zh",
+      label: "部署服务",
+      command: "echo deploy",
+    } as never], {})[0]?.snippet?.id,
+    "zh",
+  );
+});
+
+test("program input prompts expose snippet text and stay out of shell history (#3622)", () => {
+  const line = "Email: use";
+  const term = createFakeTerm(line, line.length);
+  const snippet = { id: "mail", label: "邮箱", command: "user@example.com", noAutoRun: true };
+
+  assert.equal(detectPrompt(term as never).isAtPrompt, false);
+
+  const echoed = getAlignedPrompt(term as never, "use", true);
+  assert.equal(echoed.prompt.isAtPrompt, true);
+  assert.equal(echoed.prompt.promptText, "Email: ");
+  assert.equal(echoed.prompt.userInput, "use");
+  assert.equal(echoed.alignedTyped, null);
+  assert.equal(resolveAutocompleteQueryInput(echoed.prompt, "use", true), "use");
+  assert.equal(
+    getSnippetSuggestions(echoed.prompt.userInput, [snippet as never])[0]?.snippet?.command,
+    "user@example.com",
+  );
+  assert.equal(getCommandToRecordOnEnter(echoed.prompt, echoed.alignedTyped, "use", true), null);
+
+  const pending = getAlignedPrompt(createFakeTerm("Email: ", "Email: ".length) as never, "use", true);
+  assert.equal(pending.prompt.promptText, "Email: ");
+  assert.equal(resolveAutocompleteQueryInput(pending.prompt, "use", true), "use");
+  assert.equal(pending.alignedTyped, null);
+
+  const shell = "user@host:~$ git pull use";
+  const shellPrompt = getAlignedPrompt(createFakeTerm(shell, shell.length) as never, "git pull use", true);
+  assert.equal(shellPrompt.prompt.promptText, "user@host:~$ ");
+  assert.equal(shellPrompt.prompt.userInput, "git pull use");
+  assert.equal(shellPrompt.alignedTyped, "git pull use");
+});
+
+test("a colon shell prompt is not a program input prompt (#3622)", () => {
+  for (const prompt of ["dev: ", "development: ", "PS1: "]) {
+    assert.equal(isProgramInputPromptText(prompt), false, prompt);
+    const line = `${prompt}ls`;
+    const term = createFakeTerm(line, line.length);
+    const aligned = getAlignedPrompt(term as never, "ls", true);
+    assert.equal(aligned.prompt.isAtPrompt, true, prompt);
+    assert.equal(aligned.prompt.promptText, prompt, prompt);
+    assert.equal(aligned.prompt.userInput, "ls", prompt);
+    assert.equal(
+      getCommandToRecordOnEnter(aligned.prompt, aligned.alignedTyped, "ls", true),
+      "ls",
+      prompt,
+    );
+  }
+
+  assert.equal(isProgramInputPromptText("Email: "), true);
+  assert.equal(isProgramInputPromptText("Enter your username: "), true);
+  assert.equal(isProgramInputPromptText("用户名: "), true);
+});
+
+test("password, passphrase, PIN, and secret prompts stay uncompletable (#3622)", () => {
+  for (const line of ["Password: use", "Passphrase: use", "PIN: use", "Secret: use", "Enter secret: use"]) {
+    const result = getAlignedPrompt(createFakeTerm(line, line.length) as never, "use", true);
+    assert.equal(result.prompt.isAtPrompt, false, line);
+    assert.equal(resolveAutocompleteQueryInput(result.prompt, "use", true), null, line);
+  }
 });

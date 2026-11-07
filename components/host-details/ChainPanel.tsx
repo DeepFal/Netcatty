@@ -7,11 +7,15 @@ import React, { useMemo, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { Host } from '../../types';
 import { DistroAvatar } from '../DistroAvatar';
-import { AsidePanel, type AsidePanelLayout } from '../ui/aside-panel';
+import { AsidePanel, type AsidePanelLayout, type AsidePanelResizeProps } from '../ui/aside-panel';
 import { Button } from '../ui/button';
 import { Card } from '../ui/card';
+import { FixedSizeVirtualList } from '../ui/FixedSizeVirtualList';
 import { Input } from '../ui/input';
 import { ScrollArea } from '../ui/scroll-area';
+
+const CHAIN_HOST_ROW_HEIGHT = 52;
+const CHAIN_HOST_VIEWPORT_HEIGHT = 256;
 
 export interface ChainPanelProps {
     formLabel: string;
@@ -27,7 +31,9 @@ export interface ChainPanelProps {
     layout?: AsidePanelLayout;
 }
 
-export const ChainPanel: React.FC<ChainPanelProps> = ({
+export type ChainPanelPropsWithResize = ChainPanelProps & AsidePanelResizeProps;
+
+export const ChainPanel: React.FC<ChainPanelPropsWithResize> = ({
     formLabel,
     formHostname,
     form,
@@ -39,6 +45,9 @@ export const ChainPanel: React.FC<ChainPanelProps> = ({
     onBack,
     onCancel,
     layout = 'overlay',
+    resizable,
+    persistWidthStorageKey,
+    resizeAriaLabel,
 }) => {
     const { t } = useI18n();
     const [searchQuery, setSearchQuery] = useState('');
@@ -57,6 +66,9 @@ export const ChainPanel: React.FC<ChainPanelProps> = ({
             showBackButton={true}
             onBack={onBack}
             layout={layout}
+            resizable={resizable}
+            persistWidthStorageKey={persistWidthStorageKey}
+            resizeAriaLabel={resizeAriaLabel}
             actions={
                 <Button size="sm" onClick={onBack}>
                     {t('common.save')}
@@ -122,21 +134,35 @@ export const ChainPanel: React.FC<ChainPanelProps> = ({
                                     className="h-8 pl-8 text-sm"
                                 />
                             </div>
-                            <div className="space-y-1">
-                                {filteredHosts.map((host) => (
-                                    <button
-                                        key={host.id}
-                                        className="w-full flex items-center gap-2 p-2 rounded-md hover:bg-secondary transition-colors text-left overflow-hidden"
-                                        onClick={() => onAddHost(host.id)}
-                                    >
-                                        <DistroAvatar host={host} fallback={host.label.slice(0, 2).toUpperCase()} className="h-8 w-8" />
-                                        <div className="flex-1 min-w-0">
-                                            <div className="text-sm font-medium truncate">{host.label}</div>
-                                            <div className="text-xs text-muted-foreground truncate">{host.hostname}</div>
-                                        </div>
-                                        <Plus size={14} className="text-muted-foreground" />
-                                    </button>
-                                ))}
+                            <div
+                                className="max-h-64"
+                                style={{
+                                    height: Math.min(
+                                        filteredHosts.length * CHAIN_HOST_ROW_HEIGHT,
+                                        CHAIN_HOST_VIEWPORT_HEIGHT,
+                                    ),
+                                }}
+                            >
+                                <FixedSizeVirtualList
+                                    items={filteredHosts}
+                                    itemHeight={CHAIN_HOST_ROW_HEIGHT}
+                                    className="h-full"
+                                    getItemKey={(host) => host.id}
+                                    renderItem={(host, index) => (
+                                        <button
+                                            key={host.id}
+                                            className={`w-full flex items-center gap-2 p-2 rounded-md hover:bg-secondary transition-colors text-left overflow-hidden${index > 0 ? ' mt-1' : ''}`}
+                                            onClick={() => onAddHost(host.id)}
+                                        >
+                                            <DistroAvatar host={host} fallback={host.label.slice(0, 2).toUpperCase()} className="h-8 w-8" />
+                                            <div className="flex-1 min-w-0">
+                                                <div className="text-sm font-medium truncate">{host.label}</div>
+                                                <div className="text-xs text-muted-foreground truncate">{host.hostname}</div>
+                                            </div>
+                                            <Plus size={14} className="text-muted-foreground" />
+                                        </button>
+                                    )}
+                                />
                             </div>
                         </Card>
                     )}

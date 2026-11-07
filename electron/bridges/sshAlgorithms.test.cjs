@@ -23,9 +23,14 @@ function resetSupportCache() {
   sftpBridge._resetAlgorithmSupportCacheForTests?.();
 }
 
-function withAlgorithmRuntime({ unsupportedGroups = new Set(), hashes = ["sha1", "sha256", "sha512", "md5"] }, callback) {
+function withAlgorithmRuntime({
+  unsupportedGroups = new Set(),
+  hashes = ["sha1", "sha256", "sha512", "md5"],
+  ciphers = crypto.getCiphers(),
+}, callback) {
   const originalCreateGroup = crypto.createDiffieHellmanGroup;
   const originalGetHashes = crypto.getHashes;
+  const originalGetCiphers = crypto.getCiphers;
   const probedGroups = [];
 
   crypto.createDiffieHellmanGroup = (name) => {
@@ -36,6 +41,7 @@ function withAlgorithmRuntime({ unsupportedGroups = new Set(), hashes = ["sha1",
     return {};
   };
   crypto.getHashes = () => hashes;
+  crypto.getCiphers = () => ciphers;
 
   resetSupportCache();
   try {
@@ -43,6 +49,7 @@ function withAlgorithmRuntime({ unsupportedGroups = new Set(), hashes = ["sha1",
   } finally {
     crypto.createDiffieHellmanGroup = originalCreateGroup;
     crypto.getHashes = originalGetHashes;
+    crypto.getCiphers = originalGetCiphers;
     resetSupportCache();
   }
 }
@@ -126,6 +133,44 @@ for (const [label, buildAlgorithms] of [
   ["SSH", sshBridge.buildAlgorithms],
   ["SFTP", sftpBridge.buildSftpAlgorithms],
 ]) {
+  test(`${label} offers chacha20-poly1305 in modern defaults when the runtime supports it`, () => {
+    withAlgorithmRuntime({}, () => {
+      const algorithms = buildAlgorithms(false);
+
+      assert.ok(
+        algorithms.cipher.includes("chacha20-poly1305@openssh.com"),
+        "chacha20-poly1305@openssh.com should be offered",
+      );
+    });
+  });
+
+  test(`${label} retains chacha20-poly1305 through ssh2's fallback when the runtime lacks chacha20`, () => {
+    const ciphersWithoutChacha20 = crypto.getCiphers().filter((cipher) => cipher !== "chacha20");
+
+    withAlgorithmRuntime({ ciphers: ciphersWithoutChacha20 }, () => {
+      const algorithms = buildAlgorithms(false);
+
+      assert.equal(algorithms.cipher.includes("chacha20-poly1305@openssh.com"), true);
+    });
+  });
+
+  test(`${label} preserves explicit ChaCha20 and mixed cipher overrides without native crypto`, () => {
+    const ciphersWithoutChacha20 = crypto.getCiphers().filter((cipher) => cipher !== "chacha20");
+
+    withAlgorithmRuntime({ ciphers: ciphersWithoutChacha20 }, () => {
+      const algorithms = buildAlgorithms(false, {
+        algorithmOverrides: {
+          cipher: ["chacha20-poly1305@openssh.com", "aes256-ctr"],
+        },
+      });
+
+      assert.deepEqual(algorithms.cipher, ["chacha20-poly1305@openssh.com", "aes256-ctr"]);
+      assert.deepEqual(buildAlgorithms(false, {
+        algorithmOverrides: { cipher: ["chacha20-poly1305@openssh.com"] },
+      }).cipher, ["chacha20-poly1305@openssh.com"]);
+    });
+  });
+
   test(`${label} keeps standard DH groups without an expensive runtime probe`, () => {
     assert.equal(typeof buildAlgorithms, "function");
 
@@ -227,6 +272,19 @@ for (const [label, buildAlgorithms] of [
   ["SSH", sshBridge.buildAlgorithms],
   ["SFTP", sftpBridge.buildSftpAlgorithms],
 ]) {
+  test(`${label} legacy serverHostKey offers OpenSSH host certificates before plain keys`, () => {
+    withAlgorithmRuntime({}, () => {
+      const keys = buildAlgorithms(true).serverHostKey;
+      assert.ok(keys.includes("ssh-ed25519-cert-v01@openssh.com"));
+      assert.ok(keys.indexOf("ssh-ed25519-cert-v01@openssh.com") < keys.indexOf("ssh-ed25519"));
+      assert.ok(keys.includes("ecdsa-sha2-nistp256-cert-v01@openssh.com"));
+      assert.ok(keys.includes("rsa-sha2-512-cert-v01@openssh.com"));
+      assert.ok(keys.includes("rsa-sha2-256-cert-v01@openssh.com"));
+      assert.ok(keys.includes("ssh-rsa-cert-v01@openssh.com"));
+      assert.ok(keys.includes("ssh-dss"));
+    });
+  });
+
   test(`${label} skipEcdsaHostKey removes every ecdsa-sha2-* from serverHostKey (legacy on)`, () => {
     withAlgorithmRuntime({}, () => {
       const algorithms = buildAlgorithms(true, { skipEcdsaHostKey: true });
@@ -238,6 +296,9 @@ for (const [label, buildAlgorithms] of [
       assert.ok(algorithms.serverHostKey.includes("ssh-rsa"));
       assert.ok(algorithms.serverHostKey.includes("ssh-dss"));
       assert.ok(algorithms.serverHostKey.includes("ssh-ed25519"));
+      assert.ok(algorithms.serverHostKey.includes("ssh-ed25519-cert-v01@openssh.com"));
+      assert.ok(algorithms.serverHostKey.includes("rsa-sha2-512-cert-v01@openssh.com"));
+      assert.ok(algorithms.serverHostKey.includes("ssh-rsa-cert-v01@openssh.com"));
     });
   });
 
@@ -251,6 +312,10 @@ for (const [label, buildAlgorithms] of [
       for (const algo of algorithms.serverHostKey) {
         assert.ok(!algo.startsWith("ecdsa-sha2-"), `${algo} should be filtered out`);
       }
+      assert.ok(algorithms.serverHostKey.includes("ssh-ed25519-cert-v01@openssh.com"));
+      assert.ok(algorithms.serverHostKey.includes("rsa-sha2-512-cert-v01@openssh.com"));
+      assert.ok(algorithms.serverHostKey.includes("rsa-sha2-256-cert-v01@openssh.com"));
+      assert.ok(algorithms.serverHostKey.includes("ssh-rsa-cert-v01@openssh.com"));
     });
   });
 

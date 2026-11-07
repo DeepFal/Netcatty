@@ -1,4 +1,8 @@
 /* eslint-disable no-undef */
+const {
+  windowsFramelessContentChromeOptions,
+} = require("./windowsWindowChrome.cjs");
+
 function createSettingsWindowApi(ctx) {
   // The extracted window helpers intentionally share the parent window-manager state.
   with (ctx) {
@@ -125,6 +129,8 @@ function createSettingsWindowApi(ctx) {
         settingsHeight,
       });
     
+      const windowsChrome = !isMac ? windowsFramelessContentChromeOptions() : {};
+
       const win = new BrowserWindow({
         title: "netcatty Settings",
         width: settingsWidth,
@@ -133,6 +139,7 @@ function createSettingsWindowApi(ctx) {
         minWidth: 820,
         minHeight: 600,
         backgroundColor,
+        transparent: isMac,
         icon: appIcon,
         fullscreenable: !isMac,
         // NOTE: Do NOT set parent - on macOS this causes rendering issues when dragging
@@ -144,11 +151,14 @@ function createSettingsWindowApi(ctx) {
         frame: isMac,
         titleBarStyle: isMac ? "hiddenInset" : undefined,
         trafficLightPosition: isMac ? { x: 12, y: 12 } : undefined,
+        ...(isMac ? { visualEffectState: "active" } : {}),
+        ...windowsChrome,
         webPreferences: {
           preload,
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: false,
+          spellcheck: false,
           v8CacheOptions: V8_CACHE_OPTIONS,
         },
       });
@@ -158,7 +168,11 @@ function createSettingsWindowApi(ctx) {
       // Open external links in system browser by default, and allow only known OAuth hosts in-app.
       try {
         win.webContents?.setWindowOpenHandler?.(
-          createAppWindowOpenHandler(shell, { backgroundColor, appIcon })
+          createAppWindowOpenHandler(shell, {
+            backgroundColor,
+            appIcon,
+            getAppIcon: () => resolveLiveAppIcon(appIcon),
+          })
         );
       } catch {
         // ignore
@@ -233,6 +247,8 @@ function createSettingsWindowApi(ctx) {
       } catch {
         // ignore
       }
+
+      applyWindowOpacityToWindow(win);
     
       // Hide instead of close so the window can be reused instantly.
       // When the app is quitting, allow normal close/destroy.

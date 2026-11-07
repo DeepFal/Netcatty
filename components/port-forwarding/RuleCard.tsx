@@ -10,7 +10,8 @@ import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
 import { ContextMenu,ContextMenuContent,ContextMenuItem,ContextMenuSeparator,ContextMenuTrigger } from '../ui/context-menu';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip';
-import { getStatusColor,getTypeColor } from './utils';
+import { vaultEntityIconClass } from '../vault/VaultEntityIcon';
+import { buildRuleSummary,getStatusColor,getTypeColor } from './utils';
 
 export type ViewMode = 'grid' | 'list';
 
@@ -20,6 +21,8 @@ export interface RuleCardProps {
     viewMode: ViewMode;
     isSelected: boolean;
     isPending: boolean;
+    canStop: boolean;
+    reorderProps?: React.HTMLAttributes<HTMLDivElement>;
     onSelect: () => void;
     onEdit: () => void;
     onDuplicate: () => void;
@@ -34,6 +37,8 @@ export const RuleCard: React.FC<RuleCardProps> = ({
     viewMode,
     isSelected,
     isPending,
+    canStop,
+    reorderProps,
     onSelect,
     onEdit,
     onDuplicate,
@@ -43,24 +48,31 @@ export const RuleCard: React.FC<RuleCardProps> = ({
 }) => {
     const { t } = useI18n();
     const isActive = rule.status === 'active';
-    const isInactive = rule.status === 'inactive' || rule.status === 'error';
+    const isStoppable = canStop || rule.status === 'active' || rule.status === 'connecting';
+    // unknown/stale means we cannot trust inactive — do not offer Start until
+    // an authoritative snapshot confirms there is no runtime.
+    const isStartable = !isStoppable && (rule.status === 'inactive' || rule.status === 'error');
 
     return (
         <ContextMenu>
             <ContextMenuTrigger>
                 <div
+                    {...reorderProps}
                     className={cn(
+                        reorderProps && "vault-drop-indicator-row",
                         "group cursor-pointer",
                         viewMode === 'grid'
                             ? "soft-card elevate rounded-xl h-[68px] px-3 py-2"
                             : "h-14 px-3 py-2 hover:bg-secondary/60 rounded-lg transition-colors",
-                        isSelected && "ring-2 ring-primary"
+                        isSelected && "ring-2 ring-primary",
+                        reorderProps?.className,
                     )}
                     onClick={onSelect}
                 >
                     <div className="flex items-center gap-3 h-full">
                         <div className={cn(
-                            "h-11 w-11 rounded-xl flex items-center justify-center text-sm font-bold transition-colors",
+                            vaultEntityIconClass,
+                            "text-sm font-bold transition-colors",
                             getTypeColor(rule.type, isActive)
                         )}>
                             {rule.type[0].toUpperCase()}
@@ -94,10 +106,7 @@ export const RuleCard: React.FC<RuleCardProps> = ({
                                     <Tooltip>
                                         <TooltipTrigger asChild>
                                             <span className="truncate cursor-default">
-                                                {rule.type === 'dynamic'
-                                                    ? t('pf.rule.summary.dynamic', { bindAddress: rule.bindAddress, localPort: rule.localPort })
-                                                    : t('pf.rule.summary.default', { bindAddress: rule.bindAddress, localPort: rule.localPort, remoteHost: rule.remoteHost, remotePort: rule.remotePort })
-                                                }
+                                                {buildRuleSummary(t, rule)}
                                             </span>
                                         </TooltipTrigger>
                                         <TooltipContent side="bottom" align="start" className="max-w-xs">
@@ -135,7 +144,7 @@ export const RuleCard: React.FC<RuleCardProps> = ({
                                 >
                                     <Loader2 size={12} className="animate-spin" />
                                 </Button>
-                            ) : isInactive ? (
+                            ) : isStartable ? (
                                 <Button
                                     size="icon"
                                     variant="ghost"
@@ -147,7 +156,7 @@ export const RuleCard: React.FC<RuleCardProps> = ({
                                 >
                                     <Play size={12} />
                                 </Button>
-                            ) : (rule.status === 'active' || rule.status === 'connecting') ? (
+                            ) : isStoppable ? (
                                 <Button
                                     size="icon"
                                     variant="ghost"
@@ -172,12 +181,12 @@ export const RuleCard: React.FC<RuleCardProps> = ({
                     <Copy className="mr-2 h-4 w-4" /> {t('action.duplicate')}
                 </ContextMenuItem>
                 <ContextMenuSeparator />
-                {isInactive && (
+                {isStartable && (
                     <ContextMenuItem onClick={onStart}>
                         <Play className="mr-2 h-4 w-4" /> {t('action.start')}
                     </ContextMenuItem>
                 )}
-                {(rule.status === 'active' || rule.status === 'connecting') && (
+                {isStoppable && (
                     <ContextMenuItem onClick={onStop}>
                         <Square className="mr-2 h-4 w-4" /> {t('action.stop')}
                     </ContextMenuItem>

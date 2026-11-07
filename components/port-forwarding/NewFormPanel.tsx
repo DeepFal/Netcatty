@@ -4,12 +4,19 @@
  */
 import { ChevronDown,Zap } from 'lucide-react';
 import React from 'react';
+import { isPortForwardingAutoReconnectEnabled } from '../../domain/portForwardingReconnect';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { Host,PortForwardingRule,PortForwardingType } from '../../domain/models';
 import { cn } from '../../lib/utils';
 import { DistroAvatar } from '../DistroAvatar';
 import { TrafficDiagram } from '../TrafficDiagram';
-import { AsidePanel,AsidePanelContent,AsidePanelFooter } from '../ui/aside-panel';
+import {
+    AsidePanel,
+    AsidePanelContent,
+    AsidePanelFooter,
+    type AsidePanelLayout,
+    type AsidePanelResizeProps,
+} from '../ui/aside-panel';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
@@ -17,7 +24,7 @@ import { Label } from '../ui/label';
 import { Switch } from '../ui/switch';
 import { getTypeLabel } from './utils';
 
-export interface NewFormPanelProps {
+export interface NewFormPanelProps extends AsidePanelResizeProps {
     draft: Partial<PortForwardingRule>;
     hosts: Host[];
     onDraftChange: (updates: Partial<PortForwardingRule>) => void;
@@ -26,6 +33,7 @@ export interface NewFormPanelProps {
     onOpenHostSelector: () => void;
     onOpenWizard: () => void;
     isValid: boolean;
+    layout?: AsidePanelLayout;
 }
 
 export const NewFormPanel: React.FC<NewFormPanelProps> = ({
@@ -37,6 +45,10 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
     onOpenHostSelector,
     onOpenWizard,
     isValid,
+    layout = 'inline',
+    resizable = false,
+    persistWidthStorageKey,
+    resizeAriaLabel,
 }) => {
     const { t } = useI18n();
     const selectedHost = hosts.find(h => h.id === draft.hostId);
@@ -47,6 +59,10 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
             onClose={onClose}
             title={t('pf.wizard.newTitle')}
             width="w-[360px]"
+            layout={layout}
+            resizable={resizable}
+            persistWidthStorageKey={persistWidthStorageKey}
+            resizeAriaLabel={resizeAriaLabel}
         >
             <AsidePanelContent>
                 {/* Type Selector */}
@@ -118,8 +134,8 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
                             <div className="flex items-center gap-2">
                                 <DistroAvatar
                                     host={selectedHost}
-                                    fallback={selectedHost.os[0].toUpperCase()}
-                                    className="h-6 w-6"
+                                    fallback={(selectedHost.os || 'unknown').charAt(0).toUpperCase()}
+                                    size="tree"
                                 />
                                 <span>{selectedHost.label}</span>
                             </div>
@@ -165,6 +181,18 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
                     <Switch
                         checked={draft.autoStart ?? false}
                         onCheckedChange={checked => onDraftChange({ autoStart: checked })}
+                    />
+                </div>
+
+                {/* Auto Reconnect Toggle */}
+                <div className="flex items-center justify-between py-2">
+                    <div className="space-y-0.5">
+                        <Label className="text-sm font-medium">{t('pf.form.autoReconnect')}</Label>
+                        <p className="text-[10px] text-muted-foreground">{t('pf.form.autoReconnectDesc')}</p>
+                    </div>
+                    <Switch
+                        checked={isPortForwardingAutoReconnectEnabled(draft)}
+                        onCheckedChange={checked => onDraftChange({ autoReconnect: checked })}
                     />
                 </div>
             </AsidePanelContent>

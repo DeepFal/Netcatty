@@ -5,11 +5,13 @@
  * on tab-switch — we just toggle CSS visibility via the `isVisible` prop.
  */
 import type * as Monaco from 'monaco-editor';
-import React, { useCallback } from 'react';
+import React, { useCallback, useMemo } from 'react';
 
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { saveEditorTab } from '../../application/state/editorTabSave';
 import { editorTabStore, useEditorTab, type EditorTabId } from '../../application/state/editorTabStore';
+import { useIsEditorTabActive } from '../../application/state/activeTabStore';
+import { useTerminalHostTreeLayoutWidth } from '../../application/state/terminalHostTreeStore';
 import type { HotkeyScheme, KeyBinding } from '../../domain/models';
 import type { Host } from '../../types';
 import { toast } from '../ui/toast';
@@ -17,8 +19,6 @@ import { TextEditorPane } from './TextEditorPane';
 
 export interface TextEditorTabViewProps {
   tabId: EditorTabId;
-  /** When false the view is hidden via display:none so the Monaco instance persists. */
-  isVisible: boolean;
   hotkeyScheme: HotkeyScheme;
   keyBindings: KeyBinding[];
   /** Host lookup for building the `host:remotePath` subtitle next to the filename. */
@@ -26,18 +26,31 @@ export interface TextEditorTabViewProps {
   /** Routed into Monaco's Cmd/Ctrl+W command so closing the editor tab works
    * even when focus is inside the editor (Monaco otherwise swallows the event). */
   onRequestClose: (tabId: EditorTabId) => void;
+  onPopOut?: (tabId: EditorTabId) => void;
 }
 
-export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
+export function getTextEditorTabShellStyle(isVisible: boolean, hostTreeLayoutWidth: number): React.CSSProperties {
+  return {
+    ...(isVisible ? null : { pointerEvents: 'none', visibility: 'hidden' }),
+    zIndex: 20,
+    left: hostTreeLayoutWidth,
+  };
+}
+
+const TextEditorTabViewImpl: React.FC<TextEditorTabViewProps> = ({
   tabId,
-  isVisible,
   hotkeyScheme,
   keyBindings,
   hostById,
   onRequestClose,
+  onPopOut,
 }) => {
   const { t } = useI18n();
   const tab = useEditorTab(tabId);
+  // Self-subscribe visibility so switching tabs only re-renders this editor
+  // instance, not AppView/App.
+  const isVisible = useIsEditorTabActive(tabId);
+  const hostTreeLayoutWidth = useTerminalHostTreeLayoutWidth();
 
   const handleContentChange = useCallback(
     (content: string, viewState: Monaco.editor.ICodeEditorViewState | null) => {
@@ -51,6 +64,11 @@ export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
       editorTabStore.setLanguage(tabId, lang);
     },
     [tabId],
+  );
+
+  const handlePopOut = useMemo(
+    () => (onPopOut ? () => onPopOut(tabId) : undefined),
+    [onPopOut, tabId],
   );
 
   const handleToggleWordWrap = useCallback(() => {
@@ -69,6 +87,10 @@ export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
     }
   }, [tabId, t]);
 
+  const handleRequestClose = useCallback(() => {
+    onRequestClose(tabId);
+  }, [onRequestClose, tabId]);
+
   // Tab has been closed — render nothing (parent should remove this instance,
   // but guard here in case of a transient render before unmount).
   if (!tab) return null;
@@ -86,18 +108,17 @@ export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
     // all fill their flex-1 parent via `absolute inset-0`. Match that here so
     // an inactive editor tab doesn't collapse to zero height in normal flow,
     // and an active one fills the viewport instead of stacking beneath others.
-    // z-index high enough to stay above the TerminalLayer's inner `z-10` panels
-    // (TerminalLayer root is visibility:hidden when editor tabs are active, but
-    // its children's stacking contexts can still overlap without an explicit z.)
+    // z-index high enough to stay above the terminal workspace while leaving
+    // room for the shared host sidebar when it is open.
     <div
-      style={{ display: isVisible ? undefined : 'none', zIndex: 20 }}
-      className="absolute inset-0 min-h-0 flex flex-col bg-background"
+      style={getTextEditorTabShellStyle(isVisible, hostTreeLayoutWidth)}
+      className="absolute top-0 right-0 bottom-0 min-h-0 flex flex-col bg-background"
     >
       <TextEditorPane
         chrome="tab"
         fileName={`${tab.fileName}${isDirty ? ' *' : ''}`}
         subtitle={subtitle}
-        onRequestClose={() => onRequestClose(tabId)}
+        onRequestClose={handleRequestClose}
         content={tab.content}
         languageId={tab.languageId}
         wordWrap={tab.wordWrap}
@@ -110,9 +131,14 @@ export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
         onToggleWordWrap={handleToggleWordWrap}
         onSave={handleSave}
         initialViewState={tab.viewState}
+        onPopOut={handlePopOut}
       />
     </div>
   );
 };
+
+// Memoized: AppView re-renders for unrelated shell state; an editor tab only
+// needs to render when its own props or subscribed tab state change.
+export const TextEditorTabView = React.memo(TextEditorTabViewImpl);
 
 export default TextEditorTabView;

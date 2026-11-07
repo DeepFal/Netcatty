@@ -20,6 +20,7 @@ import {
   type SyncFileMeta,
   type SyncPayload,
 } from '../../domain/sync';
+import { validateConvergentSyncPayload } from '../../domain/convergentSync';
 
 // ============================================================================
 // Utility Functions
@@ -257,6 +258,13 @@ export const encryptPayload = async (
   appVersion: string,
   existingVersion?: number
 ): Promise<SyncedFile> => {
+  const syncSchemaVersion = payload.convergentSync?.schemaVersion;
+  if (syncSchemaVersion !== undefined) {
+    validateConvergentSyncPayload(
+      { syncSchemaVersion },
+      payload,
+    );
+  }
   // Generate new salt for each encryption
   const salt = generateRandomBytes(SYNC_CONSTANTS.SALT_LENGTH);
   
@@ -279,6 +287,7 @@ export const encryptPayload = async (
     algorithm: 'AES-256-GCM',
     kdf: 'PBKDF2',
     kdfIterations: SYNC_CONSTANTS.PBKDF2_ITERATIONS,
+    ...(syncSchemaVersion ? { syncSchemaVersion } : {}),
   };
 
   return {
@@ -318,7 +327,9 @@ export const decryptPayload = async (
     key
   );
   
-  return JSON.parse(decrypted) as SyncPayload;
+  const parsed = JSON.parse(decrypted) as SyncPayload;
+  validateConvergentSyncPayload(meta, parsed);
+  return parsed;
 };
 
 /**
@@ -374,21 +385,27 @@ export const unlockMasterKey = async (
   password: string,
   config: MasterKeyConfig
 ): Promise<UnlockedMasterKey | null> => {
-  const isValid = await verifyPassword(password, config);
-  if (!isValid) return null;
+  try {
+    const salt = base64ToUint8Array(config.salt);
+    const derivedKey = await deriveKey(
+      password,
+      salt,
+      config.kdfIterations || SYNC_CONSTANTS.PBKDF2_ITERATIONS
+    );
+    const hash = await createVerificationHash(derivedKey);
+    if (hash !== config.verificationHash) return null;
 
-  const salt = base64ToUint8Array(config.salt);
-  const derivedKey = await deriveKey(
-    password,
-    salt,
-    config.kdfIterations || SYNC_CONSTANTS.PBKDF2_ITERATIONS
-  );
-
-  return {
-    derivedKey,
-    salt,
-    unlockedAt: Date.now(),
-  };
+    // Return the exact key that passed verification, rather than deriving the
+    // same password/salt key again. Ownership remains with the unlock caller.
+    return {
+      derivedKey,
+      salt,
+      unlockedAt: Date.now(),
+    };
+  } catch {
+    // Match verifyPassword's failure contract for malformed data/crypto errors.
+    return null;
+  }
 };
 
 /**

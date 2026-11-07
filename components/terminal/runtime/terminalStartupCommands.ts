@@ -1,6 +1,57 @@
 import type { Terminal as XTerm } from "@xterm/xterm";
+import { normalizeLineEndings, wrapBracketedPaste } from "../../../lib/utils";
 import { markPromptLineBreakCommandPending } from "./promptLineBreak";
 import type { TerminalSessionStartersContext } from "./createTerminalSessionStarters.types";
+
+/**
+ * Host startup is scheduled only after the shell attaches. Restored SSH panes
+ * boot from the session fallback first; vault hydration (including group
+ * defaults) replaces `hostRef` while that dial is still in flight. `startSSH`
+ * keeps dialing the boot snapshot (`ctx.host`). The startup command may come
+ * from the live host only when that object is still this dial: same id,
+ * hostname, username, and dial port (`port || 22`), and the same protocol
+ * when the live host sets one. A missing protocol is a legacy SSH host.
+ * A saved host edited onto another endpoint since the workspace was saved
+ * keeps the snapshot, so its command is not typed into the old session.
+ *
+ * Serial preflight uses this same resolver to decide whether to wait for
+ * auto-login, then schedules again after the port opens. Non-SSH transports
+ * stay on the snapshot, so a command that appears on `hostRef` during the
+ * open is not typed into a saved username/password exchange.
+ * A ref that only carries a write-path toggle (no id) is not a host snapshot.
+ * A different host id is a later pane, not this dial, so keep the snapshot.
+ */
+const prefersLiveStartupHost = (protocol: string | undefined): boolean =>
+  protocol === "ssh" || protocol === undefined;
+
+const sshDialPort = (port: number | undefined): number => port || 22;
+
+const sameSshDialTarget = (
+  dial: TerminalSessionStartersContext["host"],
+  live: TerminalSessionStartersContext["host"],
+): boolean => {
+  if (live.hostname !== dial.hostname) return false;
+  if ((live.username ?? "") !== (dial.username ?? "")) return false;
+  if (sshDialPort(live.port) !== sshDialPort(dial.port)) return false;
+  // A live protocol, when set, must still be the protocol this dial used.
+  if (live.protocol !== undefined && live.protocol !== (dial.protocol || "ssh")) return false;
+  return true;
+};
+
+const resolveStartupHost = (
+  ctx: TerminalSessionStartersContext,
+): TerminalSessionStartersContext["host"] => {
+  const live = ctx.hostRef?.current;
+  if (
+    prefersLiveStartupHost(ctx.host.protocol)
+    && live
+    && live.id === ctx.host.id
+    && sameSshDialTarget(ctx.host, live)
+  ) {
+    return live;
+  }
+  return ctx.host;
+};
 
 const STARTUP_COMMAND_DEFAULT_DELAY_MS = 600;
 const STARTUP_COMMAND_MAX_DELAY_MS = 10000;
@@ -25,13 +76,34 @@ export function normalizeStartupCommandDelay(raw: number | undefined): number {
   return Math.max(0, Math.min(STARTUP_COMMAND_MAX_DELAY_MS, value));
 }
 
+const buildStartupPasteInput = (term: XTerm, commandText: string): string => {
+  let data = normalizeLineEndings(commandText);
+  if (data.includes("\n") && term.modes?.bracketedPasteMode && !term.options?.ignoreBracketedPasteMode) {
+    data = wrapBracketedPaste(data);
+  }
+  return `${data}\r`;
+};
+
+export const resolveStartupCommand = (
+  ctx: TerminalSessionStartersContext,
+  options?: { consumeSuppressHostStartupCommand?: boolean },
+): string | undefined => {
+  const command = ctx.startupCommand || (ctx.suppressHostStartupCommandRef?.current ? undefined : resolveStartupHost(ctx).startupCommand);
+  if (options?.consumeSuppressHostStartupCommand && ctx.suppressHostStartupCommandRef) {
+    ctx.suppressHostStartupCommandRef.current = false;
+  }
+  return command;
+};
+
 export const scheduleStartupCommand = (
   ctx: TerminalSessionStartersContext,
   term: XTerm,
   id: string,
   onSettled?: () => void,
+  isCurrentAttempt?: () => boolean,
 ): (() => void) | undefined => {
-  const commandToRun = ctx.startupCommand || ctx.host.startupCommand;
+  if (isCurrentAttempt && !isCurrentAttempt()) return undefined;
+  const commandToRun = resolveStartupCommand(ctx, { consumeSuppressHostStartupCommand: true });
   if (!commandToRun || ctx.hasRunStartupCommandRef.current) return undefined;
 
   ctx.hasRunStartupCommandRef.current = true;
@@ -42,7 +114,8 @@ export const scheduleStartupCommand = (
   let cancelled = false;
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const sessionIsCurrent = () =>
-    !!ctx.sessionRef.current && ctx.sessionRef.current === scheduledSessionId;
+    !!ctx.sessionRef.current && ctx.sessionRef.current === scheduledSessionId
+    && (!isCurrentAttempt || isCurrentAttempt());
 
   // noAutoRun (snippet "type but don't execute"): type the command as-is, no
   // Enter and no line-splitting — unchanged behavior.
@@ -54,6 +127,9 @@ export const scheduleStartupCommand = (
         return;
       }
       ctx.terminalBackend.writeToSession(ctx.sessionRef.current, commandToRun, { automated: true });
+      if (ctx.host.protocol === "serial" && !ctx.serialConfig?.lineMode) {
+        ctx.recordSerialSnippetInput?.(commandToRun);
+      }
       onSettled?.();
     }, delayMs);
     return () => {
@@ -62,15 +138,41 @@ export const scheduleStartupCommand = (
     };
   }
 
-  // Auto-run: send each non-empty line in sequence, waiting delayMs before the
-  // first and between each, so a line runs inside any sub-shell opened by a
-  // previous line (e.g. `sudo -i` then `alias ...`).
   const lines = splitStartupCommandLines(commandToRun);
   if (lines.length === 0) {
     onSettled?.();
     return undefined;
   }
 
+  const runMode = ctx.startupCommand
+    ? (ctx.multiLineRunMode ?? "paste")
+    : (resolveStartupHost(ctx).startupCommandRunMode ?? "paste");
+  if (runMode === "paste") {
+    timeoutId = setTimeout(() => {
+      if (cancelled) return;
+      if (!sessionIsCurrent()) {
+        onSettled?.();
+        return;
+      }
+      ctx.terminalBackend.writeToSession(
+        ctx.sessionRef.current,
+        buildStartupPasteInput(term, commandToRun),
+        { automated: true },
+      );
+      for (const line of lines) {
+        markPromptLineBreakCommandPending(ctx.promptLineBreakStateRef, term, line);
+        ctx.onCommandExecuted?.(line, ctx.host.id, ctx.host.label, ctx.sessionId);
+      }
+      onSettled?.();
+    }, delayMs);
+    return () => {
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }
+
+  // Line-by-line mode: wait before each line so prompt-driven sessions can
+  // react between steps.
   let index = 0;
   const runNext = () => {
     if (cancelled) return;
@@ -96,4 +198,3 @@ export const scheduleStartupCommand = (
     if (timeoutId) clearTimeout(timeoutId);
   };
 };
-

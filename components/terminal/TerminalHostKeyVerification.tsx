@@ -1,20 +1,12 @@
 import { AlertTriangle, Fingerprint } from 'lucide-react';
 import React from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
+import type { HostKeyInfo } from '../../domain/hostKey';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
 import { TerminalConnectionLogList } from './TerminalConnectionProgress';
 
-export interface HostKeyInfo {
-    hostname: string;
-    port: number;
-    keyType: string;
-    fingerprint: string;
-    publicKey?: string;
-    status?: 'unknown' | 'changed';
-    knownHostId?: string;
-    knownFingerprint?: string;
-}
+export type { HostKeyInfo } from '../../domain/hostKey';
 
 export interface TerminalHostKeyVerificationProps {
     hostKeyInfo: HostKeyInfo;
@@ -38,7 +30,7 @@ export const TerminalHostKeyVerification: React.FC<TerminalHostKeyVerificationPr
     const Icon = isChanged ? AlertTriangle : Fingerprint;
 
     return (
-        <div className="space-y-3 animate-in fade-in-0 slide-in-from-bottom-1 duration-200">
+        <div data-host-security-surface="" className="space-y-3 animate-in fade-in-0 slide-in-from-bottom-1 duration-200">
             <div
                 className={cn(
                     "rounded-xl border px-3 py-2.5",

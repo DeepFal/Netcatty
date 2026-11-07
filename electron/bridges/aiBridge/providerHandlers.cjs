@@ -1,4 +1,6 @@
 /* eslint-disable no-undef */
+const { existsSync } = require("node:fs");
+
 function registerProviderHandlers(ctx) {
   with (ctx) {
   ipcMain.handle("netcatty:ai:user-skills:status", async (event) => {
@@ -31,6 +33,22 @@ function registerProviderHandlers(ctx) {
     try {
       const { context, status } = await buildUserSkillsContext(electronModule?.app, prompt, selectedSkillSlugs);
       return { ok: true, context, status: toPublicUserSkillsStatus(status) };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle("netcatty:ai:skills-cli:invocation", async (event) => {
+    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    try {
+      const invocation = getSkillsCliInvocation();
+      return {
+        ok: true,
+        skillPath: existsSync(NETCATTY_TOOL_SKILL_PATH) ? NETCATTY_TOOL_SKILL_PATH : null,
+        commandPrefix: invocation.commandPrefix,
+        launcherPath: invocation.launcherPath,
+        usesLauncher: invocation.usesLauncher,
+      };
     } catch (err) {
       return { ok: false, error: err?.message || String(err) };
     }
@@ -319,7 +337,14 @@ function registerProviderHandlers(ctx) {
   }
 
   // Start a streaming chat request (proxied through main process)
-  ipcMain.handle("netcatty:ai:chat:stream", async (event, { requestId, url, headers, body, providerId }) => {
+  ipcMain.handle("netcatty:ai:chat:stream", async (event, {
+    requestId,
+    url,
+    headers,
+    body,
+    providerId,
+    idleTimeoutMs,
+  }) => {
     // Validate IPC sender (Issue #17)
     if (!validateSender(event)) {
       return { ok: false, error: "Unauthorized IPC sender" };
@@ -346,9 +371,18 @@ function registerProviderHandlers(ctx) {
       }
 
       const skipTLS = shouldSkipTLSVerify(providerId);
-      const { statusCode, statusText } = await streamRequest(resolvedUrl, { method: "POST", headers: resolvedHeaders, body }, event, requestId, skipTLS);
+      const { statusCode, statusText } = await streamRequest(
+        resolvedUrl,
+        { method: "POST", headers: resolvedHeaders, body, idleTimeoutMs },
+        event,
+        requestId,
+        skipTLS,
+      );
       return { ok: true, statusCode, statusText };
     } catch (err) {
+      if (err?.name === "AbortError") {
+        return { ok: false, aborted: true, error: "Aborted" };
+      }
       return { ok: false, error: err?.message || String(err) };
     }
   });
@@ -366,7 +400,7 @@ function registerProviderHandlers(ctx) {
   });
 
   // Non-streaming request (for model listing, validation, etc.)
-  ipcMain.handle("netcatty:ai:fetch", async (event, { url, method, headers, body, providerId, skipHostCheck, followRedirects, skipTLSVerify }) => {
+  ipcMain.handle("netcatty:ai:fetch", async (event, { url, method, headers, body, providerId, skipHostCheck, followRedirects, skipTLSVerify, requestId }) => {
     // Validate IPC sender — settings window needs this for model listing
     if (!validateSenderOrSettings(event)) {
       return { ok: false, status: 0, data: "", error: "Unauthorized IPC sender" };
@@ -394,17 +428,59 @@ function registerProviderHandlers(ctx) {
       return { ok: false, status: 0, data: "", error: "URL host is not in the allowed list" };
     }
 
-    const MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10MB safety limit
+    const delegated = typeof requestId === "string" && /^agent-model_([0-9a-f-]{36})_([0-9a-f-]{36})_fetch_/.exec(requestId);
+    if (requestId !== undefined && !delegated) return { ok: false, status: 0, data: "", error: "Delegated request identity invalid" };
+    const controller = delegated ? new AbortController() : null;
+    const delegatedBridge = delegated ? require("./mcpServerBridge.cjs") : null;
+    const assertDelegation = () => {
+      controller?.signal.throwIfAborted();
+      if (delegated) delegatedBridge.assertPluginAgentCaller(`plugin-agent:${delegated[1]}`, event.sender.id, delegated[2]);
+    };
+    let detach; let totalTimer;
+    if (delegated) {
+      try {
+        assertDelegation();
+        delegatedBridge.beginPluginAgentModelRequest(`plugin-agent:${delegated[1]}`, event.sender.id, delegated[2]);
+        detach = delegatedBridge.onPluginAgentRelease(`plugin-agent:${delegated[1]}`, delegated[2], () => controller.abort());
+        activeStreams.set(requestId, controller);
+        totalTimer = setTimeout(() => controller.abort(), 60_000);
+      } catch { return { ok: false, status: 0, data: "", error: "Delegated Agent unavailable" }; }
+    }
+    const MAX_RESPONSE_SIZE = delegated ? 131_072 : 10 * 1024 * 1024;
     const MAX_REDIRECTS = followRedirects ? 5 : 0;
 
-    function doFetch(fetchUrl, redirectsLeft) {
+    async function doFetch(fetchUrl, redirectsLeft) {
+      // ctx.require is bound from aiBridge.cjs, so this path is relative to that file.
+      const { resolveOutboundHttpAgent } = require("./httpNetworkProxyAgent.cjs");
+      const skipTLS = Boolean(skipTLSVerify || shouldSkipTLSVerify(providerId));
+      let proxyAgent;
+      try {
+        assertDelegation();
+        proxyAgent = await resolveOutboundHttpAgent(fetchUrl, {
+          session: electronModule?.session?.defaultSession,
+          rejectUnauthorized: skipTLS ? false : undefined,
+        });
+      } catch (error) {
+        if (delegated) throw error;
+        proxyAgent = undefined;
+      }
+
+      assertDelegation();
+
       return new Promise((resolve) => {
         const parsedUrl = new URL(fetchUrl);
         const isHttps = parsedUrl.protocol === "https:";
         const lib = isHttps ? https : http;
 
-        const fetchOpts = { method: method || "GET", headers: resolvedHeaders || {}, timeout: 30000 };
-        if ((skipTLSVerify || shouldSkipTLSVerify(providerId)) && isHttps) fetchOpts.rejectUnauthorized = false;
+        const fetchOpts = {
+          method: method || "GET",
+          headers: withContentLength(resolvedHeaders || {}, body),
+          timeout: 30000,
+        };
+        if (skipTLS && isHttps) fetchOpts.rejectUnauthorized = false;
+        if (proxyAgent) fetchOpts.agent = proxyAgent;
+        if (controller) fetchOpts.signal = controller.signal;
+        assertDelegation();
         const req = lib.request(parsedUrl, fetchOpts,
           (res) => {
             // Handle redirects
@@ -453,7 +529,9 @@ function registerProviderHandlers(ctx) {
       });
     }
 
-    return doFetch(resolvedUrl, MAX_REDIRECTS);
+    try { return await doFetch(resolvedUrl, MAX_REDIRECTS); }
+    catch (error) { if (!delegated) throw error; return { ok: false, status: 0, data: "", error: "Delegated Agent unavailable" }; }
+    finally { if (delegated) { clearTimeout(totalTimer); detach?.(); activeStreams.delete(requestId); } }
   });
 
   }
